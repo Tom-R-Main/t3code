@@ -88,6 +88,8 @@ import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as PullRequestService from "../src/pullRequest/PullRequestService.ts";
 
+import { makeSiftBridge } from "../src/sift/Bridge.ts";
+
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
 function runGit(cwd: string, args: ReadonlyArray<string>) {
@@ -181,6 +183,7 @@ const tryRuntimePromise = <A>(operation: string, run: () => Promise<A>) =>
   });
 
 export interface OrchestrationIntegrationHarness {
+  readonly siftBridge: Effect.Success<typeof makeSiftBridge>;
   readonly rootDir: string;
   readonly workspaceDir: string;
   readonly dbPath: string;
@@ -411,7 +414,7 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(orchestrationReactorLayer),
       Layer.provideMerge(providerRegistryLayer),
-      Layer.provide(persistenceLayer),
+      Layer.provideMerge(persistenceLayer),
       Layer.provideMerge(RepositoryIdentityResolver.layer),
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
@@ -424,6 +427,9 @@ export const makeOrchestrationIntegrationHarness = (
     const runtime = ManagedRuntime.make(layer);
     const engine = yield* tryRuntimePromise("load OrchestrationEngine service", () =>
       runtime.runPromise(Effect.service(OrchestrationEngineService)),
+    ).pipe(Effect.orDie);
+    const siftBridge = yield* tryRuntimePromise("load SiftBridge", () =>
+      runtime.runPromise(makeSiftBridge),
     ).pipe(Effect.orDie);
     const reactor = yield* tryRuntimePromise("load OrchestrationReactor service", () =>
       runtime.runPromise(Effect.service(OrchestrationReactor)),
@@ -585,6 +591,7 @@ export const makeOrchestrationIntegrationHarness = (
     });
 
     return {
+      siftBridge,
       rootDir,
       workspaceDir,
       dbPath,
