@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentPropsWithoutRef,
   type ComponentType,
   type KeyboardEvent,
 } from "react";
@@ -26,6 +27,7 @@ import { useLocation, useNavigate } from "@tanstack/react-router";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Kbd } from "../ui/kbd";
+import { cn } from "../../lib/utils";
 import {
   SidebarContent,
   SidebarFooter,
@@ -40,6 +42,7 @@ import {
 } from "../ui/sidebar";
 import { SidebarUtilityMenu } from "../sidebar/SidebarChrome";
 import { scrollToSettingsTarget } from "./settingsLayout";
+import { useSettingsSidebarListAnimation } from "./settingsSidebarListAnimation";
 import {
   searchSettings,
   SETTINGS_SECTION_LABELS,
@@ -114,17 +117,56 @@ function SettingsSectionIcon({ to }: { to: SettingsPath }) {
   return <Icon className="mt-0.5 size-3.5 shrink-0 text-sidebar-muted-foreground/60" />;
 }
 
+function SettingsMenuRegion({
+  visible,
+  className,
+  children,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { readonly visible: boolean }) {
+  return (
+    <div
+      {...props}
+      aria-hidden={visible ? undefined : true}
+      inert={visible ? undefined : true}
+      className={cn(
+        "grid transition-[grid-template-rows,opacity] duration-150 ease-out motion-reduce:transition-none",
+        visible ? "grid-rows-[1fr] opacity-100" : "pointer-events-none grid-rows-[0fr] opacity-0",
+        className,
+      )}
+    >
+      <div className="min-h-0 overflow-hidden">
+        <div
+          className={cn(
+            "pb-1 transition-transform duration-150 ease-out motion-reduce:transition-none",
+            visible ? "translate-y-0" : "-translate-y-1",
+          )}
+        >
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsSidebarNav({ pathname }: { pathname: string }) {
   const navigate = useNavigate();
   const currentHash = useLocation({ select: (location) => location.hash });
   const { isMobile, setOpenMobile, open, setOpen } = useSidebar();
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLUListElement>(null);
   const [query, setQuery] = useState("");
   const [activeResultIndex, setActiveResultIndex] = useState(0);
   const searchableItems = useAvailableSettingsSearchItems();
   const results = useMemo(() => searchSettings(query, searchableItems), [query, searchableItems]);
   const isSearching = query.trim().length > 0;
   const hasResults = results.length > 0;
+  const menuItemOrderKey = isSearching
+    ? `search:${results.map((item) => item.id).join("\0")}`
+    : "navigation";
+  const activeSettingsPath = SETTINGS_NAV_ITEMS.find(
+    (item) => pathname === item.to || pathname.startsWith(`${item.to}/`),
+  )?.to;
+  const prepareMenuAnimation = useSettingsSidebarListAnimation(menuRef, menuItemOrderKey);
 
   useEffect(() => {
     setActiveResultIndex((index) => Math.min(index, Math.max(results.length - 1, 0)));
@@ -203,9 +245,10 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
     [isMobile, navigate, pathname, setOpenMobile],
   );
   const clearSearch = useCallback(() => {
+    prepareMenuAnimation();
     setQuery("");
     setActiveResultIndex(0);
-  }, []);
+  }, [prepareMenuAnimation]);
   const handleSearchResultClick = useCallback(
     (item: SettingsSearchItem) => {
       clearSearch();
@@ -267,6 +310,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
               type="search"
               value={query}
               onChange={(event) => {
+                prepareMenuAnimation();
                 setQuery(event.currentTarget.value);
                 setActiveResultIndex(0);
               }}
@@ -302,83 +346,101 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
               <Kbd className="h-4 min-w-0 rounded-sm px-1.5 text-[10px]">/</Kbd>
             )}
           </div>
-          {isSearching && results.length === 0 ? (
-            <p
-              role="status"
-              className="px-2 py-6 text-center text-xs text-sidebar-muted-foreground"
-            >
-              No settings found
-            </p>
-          ) : null}
-          {isSearching ? (
+          <div className="ps-px">
             <SidebarMenu
-              className="ps-px"
-              id={hasResults ? "settings-search-results" : undefined}
-              role={hasResults ? "listbox" : undefined}
-              aria-label={hasResults ? "Settings search results" : undefined}
+              ref={menuRef}
+              className="relative"
+              id={isSearching && hasResults ? "settings-search-results" : undefined}
+              role={isSearching && hasResults ? "listbox" : undefined}
+              aria-label={isSearching && hasResults ? "Settings search results" : undefined}
             >
-              {results.map((item, index) => (
-                <SidebarMenuItem key={item.id} role="presentation">
-                  <SidebarMenuButton
-                    id={`settings-search-result-${item.id}`}
-                    role="option"
-                    aria-selected={index === activeResultIndex}
-                    tabIndex={-1}
-                    size="sm"
-                    isActive={index === activeResultIndex}
-                    className="h-auto min-h-10 items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
-                    onMouseMove={() => setActiveResultIndex(index)}
-                    onClick={() => handleSearchResultClick(item)}
-                  >
-                    <SettingsSectionIcon to={item.to} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium text-sidebar-foreground">
-                        {item.title}
-                      </span>
-                      <span className="block truncate text-[11px] text-sidebar-muted-foreground/75">
-                        {SETTINGS_SECTION_LABELS[item.to]}
-                      </span>
-                    </span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          ) : (
-            <SidebarMenu className="ps-px">
-              {SETTINGS_NAV_ITEMS.map((item) => {
-                const Icon = item.icon;
-                const isActive = pathname === item.to || pathname.startsWith(`${item.to}/`);
-                const pageSections = SETTINGS_PAGE_SECTIONS[item.to];
-                return (
-                  <SidebarMenuItem key={item.to}>
-                    <SidebarMenuButton
-                      isActive={isActive}
-                      onClick={() => handleSectionClick(item.to)}
+              {isSearching
+                ? results.map((item, index) => (
+                    <SidebarMenuItem
+                      key={item.id}
+                      role="presentation"
+                      data-settings-menu-key={`result:${item.id}`}
                     >
-                      <Icon />
-                      <span className="truncate">{item.label}</span>
-                    </SidebarMenuButton>
-                    {isActive && pageSections ? (
-                      <SidebarMenuSub className="border-l-0">
-                        {pageSections.map((section) => (
-                          <SidebarMenuSubItem key={section.targetId}>
-                            <SidebarMenuSubButton
-                              render={<button type="button" />}
-                              size="sm"
-                              className="w-full text-sidebar-muted-foreground/65"
-                              onClick={() => handlePageSectionClick(item.to, section.targetId)}
-                            >
-                              <span className="ms-0.5">{section.label}</span>
-                            </SidebarMenuSubButton>
-                          </SidebarMenuSubItem>
-                        ))}
-                      </SidebarMenuSub>
-                    ) : null}
-                  </SidebarMenuItem>
-                );
-              })}
+                      <SidebarMenuButton
+                        id={`settings-search-result-${item.id}`}
+                        role="option"
+                        aria-selected={index === activeResultIndex}
+                        tabIndex={-1}
+                        size="sm"
+                        isActive={index === activeResultIndex}
+                        className="h-auto min-h-10 items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+                        onMouseMove={() => setActiveResultIndex(index)}
+                        onClick={() => handleSearchResultClick(item)}
+                      >
+                        <SettingsSectionIcon to={item.to} />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-medium text-sidebar-foreground">
+                            {item.title}
+                          </span>
+                          <span className="block truncate text-[11px] text-sidebar-muted-foreground/75">
+                            {SETTINGS_SECTION_LABELS[item.to]}
+                          </span>
+                        </span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  ))
+                : SETTINGS_NAV_ITEMS.map((item) => {
+                    const Icon = item.icon;
+                    const isActive = activeSettingsPath === item.to;
+                    return (
+                      <SidebarMenuItem
+                        key={item.to}
+                        data-settings-menu-key={`navigation:${item.to}`}
+                      >
+                        <SidebarMenuButton
+                          isActive={isActive}
+                          onClick={() => handleSectionClick(item.to)}
+                        >
+                          <Icon />
+                          <span className="truncate">{item.label}</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    );
+                  })}
             </SidebarMenu>
-          )}
+            <SettingsMenuRegion visible={isSearching && !hasResults}>
+              <p
+                role="status"
+                className="px-2 py-6 text-center text-xs text-sidebar-muted-foreground"
+              >
+                No settings found
+              </p>
+            </SettingsMenuRegion>
+            {SETTINGS_NAV_ITEMS.map((item) => {
+              const pageSections = SETTINGS_PAGE_SECTIONS[item.to];
+              if (!pageSections) return null;
+              const isActive = !isSearching && activeSettingsPath === item.to;
+              return (
+                <SettingsMenuRegion key={item.to} visible={isActive}>
+                  <SidebarMenuSub aria-label={`${item.label} sections`} className="border-l-0 pt-1">
+                    <SidebarMenuSubItem
+                      aria-hidden
+                      className="h-5 px-2 text-[11px] font-medium text-sidebar-muted-foreground/55"
+                    >
+                      On this page
+                    </SidebarMenuSubItem>
+                    {pageSections.map((section) => (
+                      <SidebarMenuSubItem key={section.targetId}>
+                        <SidebarMenuSubButton
+                          render={<button type="button" />}
+                          size="sm"
+                          className="w-full text-sidebar-muted-foreground/65"
+                          onClick={() => handlePageSectionClick(item.to, section.targetId)}
+                        >
+                          <span className="ms-0.5">{section.label}</span>
+                        </SidebarMenuSubButton>
+                      </SidebarMenuSubItem>
+                    ))}
+                  </SidebarMenuSub>
+                </SettingsMenuRegion>
+              );
+            })}
+          </div>
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className="p-[var(--sidebar-content-inset)]">
