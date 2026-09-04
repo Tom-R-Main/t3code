@@ -22,7 +22,7 @@ import {
   Settings2Icon,
   XIcon,
 } from "lucide-react";
-import { useLocation, useNavigate } from "@tanstack/react-router";
+import { useLocation, useNavigate, useRouterState } from "@tanstack/react-router";
 
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -42,6 +42,7 @@ import {
 } from "../ui/sidebar";
 import { SidebarUtilityMenu } from "../sidebar/SidebarChrome";
 import { scrollToSettingsTarget } from "./settingsLayout";
+import { observeSettingsSectionVisibility } from "./settingsSectionVisibility";
 import { useSettingsSidebarListAnimation } from "./settingsSidebarListAnimation";
 import {
   searchSettings,
@@ -100,6 +101,7 @@ const SETTINGS_PAGE_SECTIONS: Partial<
   "/settings/appearance": [
     { label: "Colors & themes", targetId: "appearance" },
     { label: "Interface", targetId: "appearance-interface" },
+    { label: "Motion", targetId: "motion" },
     { label: "Typography", targetId: "typography" },
   ],
   "/settings/source-control": [
@@ -111,6 +113,8 @@ const SETTINGS_PAGE_SECTIONS: Partial<
     { label: "Remote environments", targetId: "remote-environments" },
   ],
 };
+
+const EMPTY_VISIBLE_SETTINGS_SECTION_IDS: ReadonlySet<string> = new Set();
 
 function SettingsSectionIcon({ to }: { to: SettingsPath }) {
   const Icon = SETTINGS_SECTION_ICONS[to];
@@ -151,11 +155,18 @@ function SettingsMenuRegion({
 export function SettingsSidebarNav({ pathname }: { pathname: string }) {
   const navigate = useNavigate();
   const currentHash = useLocation({ select: (location) => location.hash });
+  const resolvedPathname = useRouterState({
+    select: (state) => state.resolvedLocation?.pathname,
+  });
   const { isMobile, setOpenMobile, open, setOpen } = useSidebar();
   const searchInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLUListElement>(null);
   const [query, setQuery] = useState("");
   const [activeResultIndex, setActiveResultIndex] = useState(0);
+  const [sectionVisibility, setSectionVisibility] = useState<{
+    readonly path: SettingsPath;
+    readonly targetIds: ReadonlySet<string>;
+  } | null>(null);
   const searchableItems = useAvailableSettingsSearchItems();
   const results = useMemo(() => searchSettings(query, searchableItems), [query, searchableItems]);
   const isSearching = query.trim().length > 0;
@@ -166,7 +177,31 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
   const activeSettingsPath = SETTINGS_NAV_ITEMS.find(
     (item) => pathname === item.to || pathname.startsWith(`${item.to}/`),
   )?.to;
+  const observedSettingsPath = SETTINGS_NAV_ITEMS.find(
+    (item) => resolvedPathname === item.to || resolvedPathname?.startsWith(`${item.to}/`) === true,
+  )?.to;
+  const observedPageSections = observedSettingsPath
+    ? SETTINGS_PAGE_SECTIONS[observedSettingsPath]
+    : undefined;
+  const visiblePageSectionIds =
+    sectionVisibility && sectionVisibility.path === activeSettingsPath
+      ? sectionVisibility.targetIds
+      : EMPTY_VISIBLE_SETTINGS_SECTION_IDS;
   const prepareMenuAnimation = useSettingsSidebarListAnimation(menuRef, menuItemOrderKey);
+
+  useEffect(() => {
+    if (!observedSettingsPath || !observedPageSections) return;
+    const container = document.querySelector<HTMLElement>("[data-settings-page-layout]");
+    if (!container) return;
+
+    return observeSettingsSectionVisibility({
+      container,
+      targetIds: observedPageSections.map((section) => section.targetId),
+      onChange(targetIds) {
+        setSectionVisibility({ path: observedSettingsPath, targetIds: new Set(targetIds) });
+      },
+    });
+  }, [observedPageSections, observedSettingsPath]);
 
   useEffect(() => {
     setActiveResultIndex((index) => Math.min(index, Math.max(results.length - 1, 0)));
@@ -429,6 +464,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
                         <SidebarMenuSubButton
                           render={<button type="button" />}
                           size="sm"
+                          isActive={visiblePageSectionIds.has(section.targetId)}
                           className="w-full text-sidebar-muted-foreground/65"
                           onClick={() => handlePageSectionClick(item.to, section.targetId)}
                         >
