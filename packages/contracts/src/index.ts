@@ -28,6 +28,7 @@ export * from "./sourceControl.ts";
 export * from "./projectClone.ts";
 export * from "./pullRequest.ts";
 export * from "./orchestration.ts";
+export * from "./siftBridge.ts";
 export * from "./t3ProjectFile.ts";
 export * from "./editor.ts";
 export * from "./project.ts";
