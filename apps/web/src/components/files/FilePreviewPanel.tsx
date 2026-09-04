@@ -638,9 +638,8 @@ function useFileSaveCoordinator({
             environmentId,
             input: { cwd, relativePath, contents: nextContents },
           }),
-        onConfirmed: (confirmedContents) => {
-          confirmProjectFileQueryData(environmentId, cwd, relativePath, confirmedContents);
-        },
+        onConfirmed: (confirmedContents) =>
+          confirmProjectFileQueryData(environmentId, cwd, relativePath, confirmedContents),
       }),
     [cwd, environmentId, onPendingChange, relativePath, writeFile],
   );
@@ -1140,10 +1139,22 @@ export default function FilePreviewPanel({
         }),
       );
     })();
-  }, [absolutePath, canReadFiles, createAssetUrl, cwd, environmentHttpBaseUrl, openPreview, threadRef]);
+  }, [
+    absolutePath,
+    canReadFiles,
+    createAssetUrl,
+    cwd,
+    environmentHttpBaseUrl,
+    openPreview,
+    threadRef,
+  ]);
 
   if (attachment === undefined && !canReadFiles) {
-    return <div className="p-4 text-sm text-muted-foreground">This connection cannot read host files.</div>;
+    return (
+      <div className="p-4 text-sm text-muted-foreground">
+        This connection cannot read host files.
+      </div>
+    );
   }
 
   return (
