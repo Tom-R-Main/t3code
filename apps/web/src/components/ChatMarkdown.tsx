@@ -22,12 +22,13 @@ import {
   WrapTextIcon,
   type LucideIcon,
 } from "lucide-react";
-import type {
-  AssetResource,
-  EnvironmentId,
-  ScopedThreadRef,
-  ServerProviderSkill,
-  ThreadLinkedPullRequest,
+import {
+  AuthPreviewOperateScope,
+  type AssetResource,
+  type EnvironmentId,
+  type ScopedThreadRef,
+  type ServerProviderSkill,
+  type ThreadLinkedPullRequest,
 } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
@@ -147,7 +148,7 @@ import { readThreadShell, useProjects } from "../state/entities";
 import { serverEnvironment } from "../state/server";
 import { shellEnvironment } from "../state/shell";
 import { assetEnvironment } from "../state/assets";
-import { readEnvironmentScope, usePreparedConnection } from "../state/session";
+import { readEnvironmentScope, usePreparedConnection, useEnvironmentScope } from "../state/session";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
 import { useAtomQueryRunner } from "../state/use-atom-query-runner";
@@ -2014,6 +2015,7 @@ function useChatMarkdownState({
     reportFailure: false,
   });
   const environmentId = threadRef?.environmentId ?? explicitEnvironmentId ?? null;
+  const canOperatePreview = useEnvironmentScope(environmentId, AuthPreviewOperateScope);
   const remoteOpen = useRemoteOpenResolution(environmentId);
   const canUseShellActions = canUseMarkdownFileShellActions(
     environmentId,
@@ -2198,12 +2200,12 @@ function useChatMarkdownState({
   );
   const openExternalLinkInPreview = useCallback(
     (url: string) => {
-      if (!threadRef) {
+      if (!threadRef || !canOperatePreview) {
         return Promise.resolve(
           AsyncResult.failure<void, BrowserPreviewUnavailableError>(
             Cause.fail(
               new BrowserPreviewUnavailableError({
-                message: "Thread context is unavailable.",
+                message: "Preview access is unavailable for this client.",
               }),
             ),
           ),
@@ -2214,11 +2216,11 @@ function useChatMarkdownState({
         return result;
       });
     },
-    [openPreview, threadRef],
+    [canOperatePreview, openPreview, threadRef],
   );
   const openMarkdownFileInPreview = useCallback(
     (path: string) => {
-      if (!threadRef || preparedConnection._tag === "None") {
+      if (!threadRef || !canOperatePreview || preparedConnection._tag === "None") {
         return Promise.resolve(
           AsyncResult.failure<void, BrowserPreviewUnavailableError>(
             Cause.fail(
@@ -2238,7 +2240,7 @@ function useChatMarkdownState({
         openPreview,
       });
     },
-    [createAssetUrl, cwd, openPreview, preparedConnection, threadRef],
+    [canOperatePreview, createAssetUrl, cwd, openPreview, preparedConnection, threadRef],
   );
   const findWorkspaceBasenameMatch = useCallback(
     async (workspaceRelativePath: string) => {
@@ -2356,6 +2358,7 @@ function useChatMarkdownState({
           revealLabel={revealInFileManagerLabel}
           onOpenInBrowser={
             threadRef &&
+            canOperatePreview &&
             isPreviewSupportedInRuntime() &&
             isBrowserPreviewFile(fileLinkMeta.filePath)
               ? () => openMarkdownFileInPreview(fileLinkMeta.filePath)
@@ -2367,6 +2370,7 @@ function useChatMarkdownState({
     },
     [
       canUseShellActions,
+      canOperatePreview,
       fileLinkParentSuffixByPath,
       openFileInPanel,
       openInPreferredEditor,
@@ -2382,6 +2386,7 @@ function useChatMarkdownState({
 
   const componentState = useMemo(
     () => ({
+      canOperatePreview,
       cwd,
       diffThemeName,
       environmentId,
@@ -2408,6 +2413,7 @@ function useChatMarkdownState({
       updateThreadPullRequestLink,
     }),
     [
+      canOperatePreview,
       cwd,
       diffThemeName,
       environmentId,
@@ -2531,6 +2537,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
   },
   a: function MarkdownAnchor({ node, href, children, title: _title, ...props }) {
     const {
+      canOperatePreview,
       cwd,
       environmentId,
       imageBaseDir,
@@ -2596,7 +2603,8 @@ const CHAT_MARKDOWN_COMPONENTS = {
             };
       const isSameDocumentLink = href?.startsWith("#") ?? false;
       const onClick = props.onClick;
-      const canOpenInPreview = Boolean(threadRef) && isPreviewSupportedInRuntime();
+      const canOpenInPreview =
+        canOperatePreview && Boolean(threadRef) && isPreviewSupportedInRuntime();
       const linkChildren = <MarkdownLinkContext value>{children}</MarkdownLinkContext>;
       const link = (
         <a
