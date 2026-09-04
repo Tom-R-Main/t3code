@@ -2057,6 +2057,7 @@ export default function GitActionsControl({
               variant="outline"
               size="sm"
               onClick={continuePendingDefaultBranchAction}
+              disabled={!canWriteSourceControl}
             >
               {pendingDefaultBranchActionCopy?.continueLabel ?? "Continue"}
             </Button>
@@ -2064,6 +2065,7 @@ export default function GitActionsControl({
               className="min-h-8 w-full max-w-full whitespace-normal py-1.5 leading-snug sm:min-h-7 sm:w-auto"
               size="sm"
               onClick={checkoutFeatureBranchAndContinuePendingAction}
+              disabled={!canWriteSourceControl}
             >
               Checkout feature branch & continue
             </Button>
