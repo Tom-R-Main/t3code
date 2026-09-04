@@ -281,11 +281,18 @@ export function UsagePage() {
                 <UsageSkeleton />
               </>
             ) : !canReadDiagnostics ? (
-              <p className="py-12 text-center text-sm text-muted-foreground">
-                {environments.length === 0
-                  ? "Connect an environment to see usage."
-                  : "This connection does not have access to diagnostics and usage."}
-              </p>
+              <div className="space-y-2 py-12 text-center text-sm text-muted-foreground">
+                {environments.length === 0 ? (
+                  <p>Connect an environment to see usage.</p>
+                ) : (
+                  environments.map((environment) => (
+                    <p key={environment.environmentId}>
+                      {environments.length > 1 ? `${environment.label}: ` : null}
+                      {environment.error}
+                    </p>
+                  ))
+                )}
+              </div>
             ) : (
               <>
                 <UsageCoverageNotice
