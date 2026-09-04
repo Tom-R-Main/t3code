@@ -1,21 +1,20 @@
 import { useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId, UsageModelPriceOverride } from "@t3tools/contracts";
+import {
+  AuthSettingsWriteScope,
+  type EnvironmentId,
+  type UsageModelPriceOverride,
+} from "@t3tools/contracts";
 import { useState } from "react";
 
-import { isElectron } from "../../env";
 import {
   type EnvironmentPresentation,
   useEnvironments,
   usePrimaryEnvironmentId,
 } from "../../state/environments";
 import { serverEnvironment } from "../../state/server";
-import { useEnvironmentSessionState } from "../../state/session";
+import { readEnvironmentScope, useEnvironmentSessionState } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import type { EnvironmentUsageStatus } from "../../state/usage";
-import {
-  resolvePrimaryOperateAccess,
-  resolveRemoteOperateAccess,
-} from "../settings/ProviderSettingsPanel.logic";
 import { Button } from "../ui/button";
 import {
   Dialog,
@@ -129,20 +128,15 @@ function EnvironmentModelPrices({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const prices = settings?.usagePriceOverrides ?? {};
-  const isPrimary = environment.entry.target._tag === "PrimaryConnectionTarget";
-  const access = isPrimary
-    ? resolvePrimaryOperateAccess({
-        isPrimary,
-        hasDesktopBridge: isElectron,
-        session: session.data,
-        isPending: session.isPending,
-        hasError: session.hasError,
-      })
-    : resolveRemoteOperateAccess({
-        session: session.data,
-        isPending: session.isPending,
-        hasError: session.hasError,
-      });
+  const access = session.hasError
+    ? "denied"
+    : session.data === null
+      ? session.isPending
+        ? "pending"
+        : "denied"
+      : session.data.authenticated && session.data.scopes?.includes(AuthSettingsWriteScope)
+        ? "granted"
+        : "denied";
   const supportsOverrides =
     environment.serverConfig?.environment.capabilities.usagePriceOverrides === true;
   const unavailable =
@@ -167,7 +161,8 @@ function EnvironmentModelPrices({
     setError(null);
   };
   const save = async (model: string, price: UsageModelPriceOverride | null) => {
-    if (readOnly) return;
+    if (readOnly || !readEnvironmentScope(environment.environmentId, AuthSettingsWriteScope))
+      return;
     setPending(true);
     setError(null);
     try {
