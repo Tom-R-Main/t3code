@@ -127,6 +127,18 @@ pairing links and revoke client sessions. Revoking an unused link prevents new
 pairings; revoke a device's session to remove its existing access. Command-line
 management is available through `npx t3 auth --help`.
 
+To choose a token's permissions, pass `--scope` once for each scope you want:
+
+```sh
+npx t3 pair --scope orchestration:read --scope relay:read
+```
+
+The selected scopes replace the default permissions. The same option works with
+`npx t3 auth pairing create` and `npx t3 auth session issue`; each command's
+`--help` lists the available scopes. Without `--scope`, pairing tokens retain
+standard client permissions and issued bearer sessions retain administrative
+permissions.
+
 To remove an environment from T3 Connect, open your account menu's **T3 Connect**
 page, or **Settings → T3 Connect** on mobile, and choose **Deregister**. This
 revokes its cloud access and frees its host space even when the environment is
