@@ -12,10 +12,10 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
+import { resolveUsageAccess } from "@t3tools/client-runtime/state/usage-access";
 import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AuthEnvironmentMaintainScope,
-  AuthDiagnosticsReadScope,
   type ServerProcessDiagnosticsEntry,
   type ServerProcessResourceHistorySummary,
   type ServerProcessSignal,
@@ -28,7 +28,7 @@ import { ensureLocalApi } from "../../localApi";
 import { resolveAndPersistPreferredEditor } from "../../editorPreferences";
 import { formatRelativeTimeLabel, getRelativeTimeState } from "../../timestampFormat";
 import { useEnvironmentQuery } from "../../state/query";
-import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
+import { environmentSession, readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import {
   primaryServerAvailableEditorsAtom,
   primaryServerObservabilityAtom,
@@ -786,7 +786,15 @@ export function DiagnosticsSettingsPanel() {
   const primaryEnvironment = usePrimaryEnvironment();
   const environmentId = primaryEnvironment?.environmentId ?? null;
   const canMaintainEnvironment = useEnvironmentScope(environmentId, AuthEnvironmentMaintainScope);
-  const canReadDiagnostics = useEnvironmentScope(environmentId, AuthDiagnosticsReadScope);
+  const session = useEnvironmentQuery(
+    environmentId === null ? null : environmentSession.sessionStateAtom(environmentId),
+  );
+  const diagnosticsAccess = resolveUsageAccess({
+    connectionPhase: primaryEnvironment?.connection.phase ?? "available",
+    session: session.data,
+    hasSessionError: session.error !== null,
+  });
+  const canReadDiagnostics = diagnosticsAccess.canReadDiagnostics;
   const signalServerProcess = useAtomCommand(serverEnvironment.signalProcess, {
     reportFailure: false,
   });
@@ -979,7 +987,11 @@ export function DiagnosticsSettingsPanel() {
     return (
       <SettingsPageContainer>
         <p className="text-sm text-muted-foreground">
-          This connection does not have access to diagnostics.
+          {environmentId === null
+            ? "Connect an environment to see diagnostics."
+            : diagnosticsAccess.isPending
+              ? "Checking diagnostics access…"
+              : diagnosticsAccess.error}
         </p>
       </SettingsPageContainer>
     );
