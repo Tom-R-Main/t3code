@@ -5,7 +5,8 @@ import type {
   ResolvedKeybindingsConfig,
   ScopedThreadRef,
 } from "@t3tools/contracts";
-import { AuthFilesystemReadScope, AuthFilesystemWriteScope } from "@t3tools/contracts";
+import { AuthFilesystemWriteScope } from "@t3tools/contracts";
+import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
 import {
   isWorkspaceImagePreviewPath,
   isWorkspaceVideoPreviewPath,
@@ -48,6 +49,7 @@ import { buildFileReviewComment } from "~/reviewCommentContext";
 import { assetEnvironment } from "~/state/assets";
 import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
+import { useEnvironmentPresentation } from "~/state/presentation";
 import { projectEnvironment } from "~/state/projects";
 import { useEnvironmentQuery } from "~/state/query";
 import { environmentSession, readEnvironmentScope, useEnvironmentScope } from "~/state/session";
@@ -1033,10 +1035,13 @@ export default function FilePreviewPanel({
   const isHostFile =
     attachment !== undefined || (relativePath !== null && isAbsolutePath(relativePath));
   const fileAccessSession = useEnvironmentQuery(environmentSession.sessionStateAtom(environmentId));
-  const canReadFiles =
-    fileAccessSession.error === null &&
-    fileAccessSession.data?.authenticated === true &&
-    fileAccessSession.data.scopes?.includes(AuthFilesystemReadScope) === true;
+  const fileEnvironment = useEnvironmentPresentation(environmentId);
+  const fileAccess = resolveFilesystemReadAccess({
+    connection: fileEnvironment.presentation?.connection ?? null,
+    session: fileAccessSession.data,
+    sessionError: fileAccessSession.error,
+  });
+  const { canReadFiles } = fileAccess;
   const canWriteFiles = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
   const file = useProjectFileQuery(
     environmentId,
@@ -1155,7 +1160,7 @@ export default function FilePreviewPanel({
   ]);
 
   if (attachment === undefined && !canReadFiles) {
-    if (fileAccessSession.data === null && fileAccessSession.error === null) {
+    if (fileAccess.isPending) {
       return (
         <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
           <LoaderCircle className="size-4 animate-spin" aria-hidden />
@@ -1165,7 +1170,7 @@ export default function FilePreviewPanel({
     }
     return (
       <div className="p-4 text-sm text-muted-foreground">
-        {fileAccessSession.error ?? "This connection cannot read host files."}
+        {fileAccess.error ?? "This connection cannot read host files."}
       </div>
     );
   }
