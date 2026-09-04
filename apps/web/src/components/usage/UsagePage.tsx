@@ -78,6 +78,7 @@ export function UsagePage() {
   // totals while devices are still answering makes every number on the page
   // jump as each one lands.
   const settling = isPending || isPartial;
+  const canReadDiagnostics = environments.some((environment) => environment.canReadDiagnostics);
 
   const days = useMemo(
     () => enumerateDays(window.sinceDay, window.untilDay),
@@ -191,6 +192,7 @@ export function UsagePage() {
         </ToggleGroup>
         <Button
           onClick={refreshWindow}
+          disabled={!showingLimits && !canReadDiagnostics}
           aria-label={showingLimits ? "Refresh limits" : "Refresh usage"}
           size="icon-sm"
           variant="ghost"
@@ -248,6 +250,7 @@ export function UsagePage() {
         </Select>
         <Button
           onClick={refreshWindow}
+          disabled={!showingLimits && !canReadDiagnostics}
           aria-label={showingLimits ? "Refresh limits" : "Refresh usage"}
           size="icon-sm"
           variant="ghost"
@@ -277,6 +280,12 @@ export function UsagePage() {
                 {environments.length > 1 ? <UsageDeviceStrip environments={environments} /> : null}
                 <UsageSkeleton />
               </>
+            ) : !canReadDiagnostics ? (
+              <p className="py-12 text-center text-sm text-muted-foreground">
+                {environments.length === 0
+                  ? "Connect an environment to see usage."
+                  : "This connection does not have access to diagnostics and usage."}
+              </p>
             ) : (
               <>
                 <UsageCoverageNotice
@@ -575,7 +584,9 @@ function UsageCoverageNotice({
   return (
     <div className="flex flex-col gap-1 border border-border px-3 py-2 text-xs text-muted-foreground">
       {failed.map((environment) => (
-        <span key={environment.label}>{environment.label} could not report usage.</span>
+        <span key={environment.label}>
+          {environment.label}: {environment.error}
+        </span>
       ))}
       {stale.map((environment) => (
         <span key={environment.label}>

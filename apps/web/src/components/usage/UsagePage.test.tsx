@@ -128,7 +128,16 @@ beforeEach(() => {
         },
       ],
     },
-    environments: [],
+    environments: [
+      {
+        environmentId: "test-environment",
+        label: "Test environment",
+        isPending: false,
+        canReadDiagnostics: true,
+        error: null,
+        summary: null,
+      },
+    ],
     isPending: false,
     isPartial: false,
     refresh: vi.fn(),
