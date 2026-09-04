@@ -13,6 +13,8 @@ import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
   DEFAULT_SERVER_SETTINGS,
+  AuthSettingsWriteScope,
+  requiredScopesForServerSettingsPatch,
   type EnvironmentId,
   ServerSettings,
   type ServerSettingsPatch,
@@ -40,12 +42,15 @@ import {
   themeAllowsSidebarArtwork,
 } from "~/themePalette";
 import * as Struct from "effect/Struct";
+import * as Option from "effect/Option";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { toastManager } from "~/components/ui/toast";
 import { isHostedStaticApp } from "~/hostedPairing";
 import { primaryServerSettingsAtom, serverEnvironment } from "~/state/server";
 import { useEnvironments, usePrimaryEnvironment } from "~/state/environments";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useTheme } from "./useTheme";
+import { environmentSession, readEnvironmentScope, useEnvironmentScope } from "~/state/session";
 
 const CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE = "[CLIENT_SETTINGS]";
 
@@ -371,13 +376,22 @@ export function usePrimarySettingsAvailable(): boolean {
 /** Environments that can receive a shared settings write right now. */
 function useSharedSettingsSyncTargetIds(): ReadonlyArray<EnvironmentId> {
   const { environments } = useEnvironments();
-  return useMemo(
+  const writableTargetsAtom = useMemo(
     () =>
-      environments
-        .filter(supportsSharedSettingsSync)
-        .map((environment) => environment.environmentId),
+      Atom.make((get) =>
+        environments.filter(supportsSharedSettingsSync).flatMap((environment) => {
+          // Subscribe before offering sync so the first action sees each target's grant.
+          const result = get(environmentSession.sessionStateAtom(environment.environmentId));
+          const session =
+            result._tag === "Failure" ? null : Option.getOrNull(AsyncResult.value(result));
+          return session?.authenticated && session.scopes?.includes(AuthSettingsWriteScope)
+            ? [environment.environmentId]
+            : [];
+        }),
+      ),
     [environments],
   );
+  return useAtomValue(writableTargetsAtom);
 }
 
 /**
@@ -390,6 +404,8 @@ function useSharedSettingsSyncTargetIds(): ReadonlyArray<EnvironmentId> {
  * through client persistence.
  */
 function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
+  // Mount this session even on pages without a visible permission-gated control.
+  useEnvironmentScope(environmentId, AuthSettingsWriteScope);
   const persistServerSettings = useAtomCommand(
     serverEnvironment.updateSettings,
     "server settings update",
@@ -399,7 +415,19 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
     (patch: UnifiedSettingsPatch) => {
       const { serverPatch, clientPatch } = splitPatch(patch);
 
-      if (Object.keys(serverPatch).length > 0) {
+      const canWriteServerPatch =
+        environmentId === null ||
+        requiredScopesForServerSettingsPatch(serverPatch).every((scope) =>
+          readEnvironmentScope(environmentId, scope),
+        );
+      if (Object.keys(serverPatch).length > 0 && !canWriteServerPatch) {
+        toastManager.add({
+          type: "warning",
+          title: "Setting not saved",
+          description: "This connection does not have permission to change these settings.",
+        });
+      }
+      if (Object.keys(serverPatch).length > 0 && canWriteServerPatch) {
         const { sharedPatch, localPatch } = splitSharedServerPatch(serverPatch);
         // Dropping the write silently leaves the control looking saved.
         const warnUnsaved = () =>
@@ -427,6 +455,12 @@ function useUpdateSettingsTarget(environmentId: EnvironmentId | null) {
             warnUnsaved();
           }
           for (const targetId of targets) {
+            if (
+              !requiredScopesForServerSettingsPatch(sharedPatch).every((scope) =>
+                readEnvironmentScope(targetId, scope),
+              )
+            )
+              continue;
             void persistServerSettings({
               environmentId: targetId,
               input: { patch: sharedPatch },
@@ -462,6 +496,7 @@ export function useSharedSettingsSync() {
       ? (primaryEnvironment.serverConfig?.settings ?? null)
       : null;
   const { environments } = useEnvironments();
+  const writableTargetIds = useSharedSettingsSyncTargetIds();
   const persistServerSettings = useAtomCommand(
     serverEnvironment.updateSettings,
     "server settings update",
@@ -475,11 +510,13 @@ export function useSharedSettingsSync() {
         environments: environments.map((environment) => ({
           environmentId: environment.environmentId,
           label: environment.label,
-          syncEligible: supportsSharedSettingsSync(environment),
+          syncEligible:
+            supportsSharedSettingsSync(environment) &&
+            writableTargetIds.includes(environment.environmentId),
           settings: environment.serverConfig?.settings ?? null,
         })),
       }),
-    [environments, primaryEnvironmentId, primarySettings],
+    [environments, primaryEnvironmentId, primarySettings, writableTargetIds],
   );
 
   const applyToAll = useCallback(() => {
@@ -488,6 +525,12 @@ export function useSharedSettingsSync() {
     }
     const patch = pickSharedServerSettings(primarySettings);
     for (const mismatch of mismatches) {
+      if (
+        !requiredScopesForServerSettingsPatch(patch).every((scope) =>
+          readEnvironmentScope(mismatch.environmentId, scope),
+        )
+      )
+        continue;
       void persistServerSettings({
         environmentId: mismatch.environmentId,
         input: { patch },

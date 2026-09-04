@@ -114,6 +114,7 @@ interface ProviderModelsSectionProps {
    * removed) via `onChange`.
    */
   readonly customModels: ReadonlyArray<string>;
+  readonly canManageCustomModels: boolean;
   /** Server-returned model slugs hidden from the model picker. */
   readonly hiddenModels: ReadonlyArray<string>;
   /** Model slugs favorited for this provider instance. */
@@ -147,6 +148,7 @@ export function ProviderModelsSection({
   driverKind,
   models,
   customModels,
+  canManageCustomModels,
   hiddenModels,
   favoriteModels,
   modelOrder,
@@ -202,7 +204,7 @@ export function ProviderModelsSection({
   }, [displayModels]);
 
   const handleAdd = () => {
-    if (driverKind === "antigravity") return;
+    if (!canManageCustomModels || driverKind === "antigravity") return;
     const normalized = normalizeCustomModelSlug(input);
     if (!normalized) {
       setError("Enter a model slug.");
@@ -238,6 +240,7 @@ export function ProviderModelsSection({
   };
 
   const handleRemove = (slug: string) => {
+    if (!canManageCustomModels) return;
     onChange(customModels.filter((model) => model !== slug));
     onModelOrderChange(modelOrder.filter((model) => model !== slug));
     onFavoriteModelsChange(favoriteModels.filter((model) => model !== slug));
@@ -361,6 +364,7 @@ export function ProviderModelsSection({
               <Button
                 size="icon-micro"
                 variant="ghost-muted"
+                disabled={!canManageCustomModels}
                 aria-label={`Remove ${model.slug}`}
                 onClick={() => handleRemove(model.slug)}
               />
@@ -506,7 +510,7 @@ export function ProviderModelsSection({
         })}
       </div>
 
-      {driverKind === "antigravity" ? null : isAdding ? (
+      {driverKind === "antigravity" || !canManageCustomModels ? null : isAdding ? (
         <div className="mt-3 flex flex-col gap-2 sm:flex-row">
           <Input
             id={`provider-instance-${instanceId}-custom-model`}

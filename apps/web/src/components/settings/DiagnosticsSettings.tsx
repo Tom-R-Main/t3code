@@ -13,10 +13,11 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
-import type {
-  ServerProcessDiagnosticsEntry,
-  ServerProcessResourceHistorySummary,
-  ServerProcessSignal,
+import {
+  AuthEnvironmentMaintainScope,
+  type ServerProcessDiagnosticsEntry,
+  type ServerProcessResourceHistorySummary,
+  type ServerProcessSignal,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
@@ -26,6 +27,7 @@ import { ensureLocalApi } from "../../localApi";
 import { resolveAndPersistPreferredEditor } from "../../editorPreferences";
 import { formatRelativeTimeLabel, getRelativeTimeState } from "../../timestampFormat";
 import { useEnvironmentQuery } from "../../state/query";
+import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import {
   primaryServerAvailableEditorsAtom,
   primaryServerObservabilityAtom,
@@ -315,10 +317,12 @@ function ProcessNameCell({
 
 function ProcessSignalActions({
   process,
+  canMaintainEnvironment,
   isSignaling,
   onSignal,
 }: {
   process: ServerProcessDiagnosticsEntry;
+  canMaintainEnvironment: boolean;
   isSignaling: boolean;
   onSignal: (pid: number, signal: ServerProcessSignal) => void;
 }) {
@@ -329,7 +333,7 @@ function ProcessSignalActions({
           render={
             <button
               type="button"
-              disabled={isSignaling}
+              disabled={isSignaling || !canMaintainEnvironment}
               className="cursor-pointer text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:pointer-events-none disabled:opacity-50"
               onClick={() => onSignal(process.pid, "SIGINT")}
             >
@@ -337,14 +341,16 @@ function ProcessSignalActions({
             </button>
           }
         />
-        <TooltipPopup side="top">Send SIGINT</TooltipPopup>
+        <TooltipPopup side="top">
+          {canMaintainEnvironment ? "Send SIGINT" : "This connection cannot manage processes."}
+        </TooltipPopup>
       </Tooltip>
       <Tooltip>
         <TooltipTrigger
           render={
             <button
               type="button"
-              disabled={isSignaling}
+              disabled={isSignaling || !canMaintainEnvironment}
               className="cursor-pointer text-[11px] font-medium text-destructive underline-offset-2 hover:underline disabled:pointer-events-none disabled:opacity-50"
               onClick={() => onSignal(process.pid, "SIGKILL")}
             >
@@ -352,7 +358,9 @@ function ProcessSignalActions({
             </button>
           }
         />
-        <TooltipPopup side="top">Send SIGKILL</TooltipPopup>
+        <TooltipPopup side="top">
+          {canMaintainEnvironment ? "Send SIGKILL" : "This connection cannot manage processes."}
+        </TooltipPopup>
       </Tooltip>
     </div>
   );
@@ -360,11 +368,13 @@ function ProcessSignalActions({
 
 function ProcessDiagnosticsTable({
   processes,
+  canMaintainEnvironment,
   signalingPid,
   onSignal,
   emptyLabel,
 }: {
   processes: ReadonlyArray<ServerProcessDiagnosticsEntry>;
+  canMaintainEnvironment: boolean;
   signalingPid: number | null;
   onSignal: (pid: number, signal: ServerProcessSignal) => void;
   emptyLabel?: string;
@@ -474,6 +484,7 @@ function ProcessDiagnosticsTable({
               <td className="p-2 align-middle sm:pr-4">
                 <ProcessSignalActions
                   process={process}
+                  canMaintainEnvironment={canMaintainEnvironment}
                   isSignaling={signalingPid === process.pid}
                   onSignal={onSignal}
                 />
@@ -777,6 +788,7 @@ export function DiagnosticsSettingsPanel() {
   const availableEditors = useAtomValue(primaryServerAvailableEditorsAtom);
   const primaryEnvironment = usePrimaryEnvironment();
   const environmentId = primaryEnvironment?.environmentId ?? null;
+  const canMaintainEnvironment = useEnvironmentScope(environmentId, AuthEnvironmentMaintainScope);
   const signalServerProcess = useAtomCommand(serverEnvironment.signalProcess, {
     reportFailure: false,
   });
@@ -865,6 +877,12 @@ export function DiagnosticsSettingsPanel() {
   const isProcessInitialLoading = isProcessPending && processData === null;
   const signalProcess = useCallback(
     async (pid: number, signal: ServerProcessSignal) => {
+      const targetEnvironmentId = environmentIdRef.current;
+      if (
+        targetEnvironmentId === null ||
+        !readEnvironmentScope(targetEnvironmentId, AuthEnvironmentMaintainScope)
+      )
+        return;
       if (signalingPidRef.current !== null) return;
       signalingPidRef.current = pid;
       setSignalingPid(pid);
@@ -894,7 +912,11 @@ export function DiagnosticsSettingsPanel() {
         }
       }
       const currentEnvironmentId = environmentIdRef.current;
-      if (currentEnvironmentId === null) {
+      if (
+        currentEnvironmentId === null ||
+        currentEnvironmentId !== targetEnvironmentId ||
+        !readEnvironmentScope(currentEnvironmentId, AuthEnvironmentMaintainScope)
+      ) {
         clearSignaling();
         return;
       }
@@ -1010,6 +1032,7 @@ export function DiagnosticsSettingsPanel() {
         ) : null}
         <ProcessDiagnosticsTable
           processes={processData?.processes ?? []}
+          canMaintainEnvironment={canMaintainEnvironment}
           signalingPid={signalingPid}
           onSignal={signalProcess}
           emptyLabel={

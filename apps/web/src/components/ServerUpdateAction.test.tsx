@@ -9,6 +9,7 @@ const testState = vi.hoisted(() => ({
   updateServer: vi.fn(),
   toast: vi.fn(),
   continueThreadsAfterServerUpdate: false,
+  canMaintain: true,
 }));
 
 vi.mock("~/hooks/useCopyToClipboard", () => ({
@@ -18,6 +19,12 @@ vi.mock("~/hooks/useSettings", () => ({
   useClientSettings: (
     selector: (settings: { continueThreadsAfterServerUpdate: boolean }) => unknown,
   ) => selector({ continueThreadsAfterServerUpdate: testState.continueThreadsAfterServerUpdate }),
+}));
+vi.mock("~/state/session", () => ({
+  useEnvironmentScope: (environmentId: EnvironmentId, scope: string) =>
+    testState.canMaintain && environmentId === "env-test" && scope === "environment:maintain",
+  readEnvironmentScope: (environmentId: EnvironmentId, scope: string) =>
+    testState.canMaintain && environmentId === "env-test" && scope === "environment:maintain",
 }));
 vi.mock("~/state/server", () => ({
   serverEnvironment: { updateServer: Symbol("updateServer") },
@@ -54,6 +61,15 @@ describe("ServerUpdateAction", () => {
     testState.updateServer.mockReset();
     testState.toast.mockReset();
     testState.continueThreadsAfterServerUpdate = false;
+    testState.canMaintain = true;
+  });
+
+  it("does not dispatch an update after maintenance access is removed", async () => {
+    const action = renderAction();
+    testState.canMaintain = false;
+    action.props.onClick?.();
+    await flushPromises();
+    expect(testState.updateServer).not.toHaveBeenCalled();
   });
 
   it("reports success only after the shared update flow reconnects", async () => {
