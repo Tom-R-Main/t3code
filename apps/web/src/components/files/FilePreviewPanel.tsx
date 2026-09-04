@@ -5,6 +5,7 @@ import type {
   ResolvedKeybindingsConfig,
   ScopedThreadRef,
 } from "@t3tools/contracts";
+import { AuthFilesystemReadScope, AuthFilesystemWriteScope } from "@t3tools/contracts";
 import {
   isWorkspaceImagePreviewPath,
   isWorkspaceVideoPreviewPath,
@@ -48,6 +49,7 @@ import { assetEnvironment } from "~/state/assets";
 import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
 import { projectEnvironment } from "~/state/projects";
+import { readEnvironmentScope, useEnvironmentScope } from "~/state/session";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 
@@ -76,6 +78,7 @@ import { FileSaveCoordinator } from "./fileSaveCoordinator";
 import {
   confirmProjectFileQueryData,
   getOptimisticProjectFileQueryData,
+  getUnsavedProjectFileQueryData,
   setProjectFileQueryData,
   useProjectFileQuery,
 } from "./projectFilesQueryState";
@@ -622,11 +625,13 @@ function useFileSaveCoordinator({
   EditableFileSurfaceProps,
   "environmentId" | "cwd" | "relativePath" | "onPendingChange"
 >): FileSaveCoordinator {
+  const canWriteFiles = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
   const writeFile = useAtomCommand(projectEnvironment.writeFile);
   const coordinator = useMemo(
     () =>
       new FileSaveCoordinator({
         debounceMs: FILE_SAVE_DEBOUNCE_MS,
+        canPersist: () => readEnvironmentScope(environmentId, AuthFilesystemWriteScope),
         onPendingChange: (pending) => onPendingChange(relativePath, pending),
         persist: (nextContents) =>
           writeFile({
@@ -640,6 +645,11 @@ function useFileSaveCoordinator({
     [cwd, environmentId, onPendingChange, relativePath, writeFile],
   );
 
+  useEffect(() => {
+    if (!canWriteFiles) return;
+    const unsaved = getUnsavedProjectFileQueryData(environmentId, cwd, relativePath);
+    if (unsaved) coordinator.change(unsaved.contents);
+  }, [canWriteFiles, coordinator, cwd, environmentId, relativePath]);
   useEffect(() => () => coordinator.dispose(), [coordinator]);
   return coordinator;
 }
@@ -1022,6 +1032,8 @@ export default function FilePreviewPanel({
   // A file outside the workspace (an absolute path) is shown, never edited.
   const isHostFile =
     attachment !== undefined || (relativePath !== null && isAbsolutePath(relativePath));
+  const canReadFiles = useEnvironmentScope(environmentId, AuthFilesystemReadScope);
+  const canWriteFiles = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
   const file = useProjectFileQuery(
     environmentId,
     cwd,
@@ -1106,7 +1118,7 @@ export default function FilePreviewPanel({
   };
 
   const handleOpenInBrowser = useCallback(() => {
-    if (!absolutePath || !environmentHttpBaseUrl) return;
+    if (!canReadFiles || !absolutePath || !environmentHttpBaseUrl) return;
     void (async () => {
       const result = await openFileInPreview({
         threadRef,
@@ -1128,7 +1140,11 @@ export default function FilePreviewPanel({
         }),
       );
     })();
-  }, [absolutePath, createAssetUrl, cwd, environmentHttpBaseUrl, openPreview, threadRef]);
+  }, [absolutePath, canReadFiles, createAssetUrl, cwd, environmentHttpBaseUrl, openPreview, threadRef]);
+
+  if (attachment === undefined && !canReadFiles) {
+    return <div className="p-4 text-sm text-muted-foreground">This connection cannot read host files.</div>;
+  }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
@@ -1246,6 +1262,11 @@ export default function FilePreviewPanel({
           ) : null}
         </div>
       ) : null}
+      {relativePath && !attachment && !isHostFile && !canWriteFiles ? (
+        <div className="shrink-0 border-b px-3 py-1.5 text-[11px] text-muted-foreground">
+          Read-only connection. Unsaved edits are kept until write access returns.
+        </div>
+      ) : null}
       {relativePath && !isMedia && !renderBrowserFile && file.data?.truncated ? (
         <div className="shrink-0 border-b border-warning/20 bg-warning-surface px-3 py-1.5 text-[11px] text-warning-foreground">
           Preview limited to the first 1 MB of a {file.data.byteLength.toLocaleString()} byte file.
@@ -1306,10 +1327,10 @@ export default function FilePreviewPanel({
                 relativePath={relativePath}
                 threadRef={threadRef}
                 contents={file.data.contents}
-                readOnly={isHostFile}
+                readOnly={isHostFile || !canWriteFiles}
                 onPendingChange={onPendingChange}
               />
-            ) : file.data.truncated || isHostFile ? (
+            ) : file.data.truncated || isHostFile || !canWriteFiles ? (
               <DiffWorkerPoolProvider>
                 <Virtualizer
                   key={`${relativePath}:${resolvedTheme}:${file.data.byteLength}`}
