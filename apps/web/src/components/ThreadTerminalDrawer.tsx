@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import {
   AuthPreviewOperateScope,
+  AuthTerminalOperateScope,
   type ContextMenuItem,
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
@@ -81,6 +82,7 @@ import { serverEnvironment } from "../state/server";
 import { previewEnvironment } from "../state/preview";
 import { readEnvironmentScope } from "../state/session";
 import { terminalEnvironment } from "../state/terminal";
+import { useEnvironmentScope } from "../state/session";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
 import { useAtomCommand } from "../state/use-atom-command";
 import { preventTerminalCloseShortcut } from "../lib/terminalCloseShortcut";
@@ -250,13 +252,14 @@ export function terminalSelectionMenuItems(): ContextMenuItem<"add-to-chat" | "c
  */
 export function terminalContextMenuItems(options: {
   hasSelection: boolean;
+  readOnly?: boolean;
 }): ContextMenuItem<TerminalContextMenuAction>[] {
   return [
     ...terminalSelectionMenuItems().map((item) => ({
       ...item,
       disabled: !options.hasSelection,
     })),
-    { id: "paste", label: "Paste" },
+    { id: "paste", label: "Paste", ...(options.readOnly ? { disabled: true } : {}) },
   ];
 }
 
@@ -332,6 +335,8 @@ export function TerminalViewport({
   const terminalRef = useRef<GhosttyTerminalSurface | null>(null);
   const visibleRef = useRef(visible);
   const environmentId = threadRef.environmentId;
+  const canOperateTerminal = useEnvironmentScope(environmentId, AuthTerminalOperateScope);
+  const hasTerminalWriteAccess = useEffectEvent(() => canOperateTerminal);
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const openInPreferredEditor = useOpenInPreferredEditor(
     environmentId,
@@ -356,7 +361,7 @@ export function TerminalViewport({
   const keybindingsRef = useRef(keybindings);
   const runtimeEnvKey = useMemo(() => runtimeEnvSignature(runtimeEnv), [runtimeEnv]);
   const handleSessionExited = useEffectEvent(() => {
-    onSessionExited();
+    if (canOperateTerminal) onSessionExited();
   });
   const handleAddTerminalContext = useEffectEvent((selection: TerminalContextSelection) => {
     onAddTerminalContext(selection);
@@ -393,12 +398,13 @@ export function TerminalViewport({
       input: { threadId, terminalId, data },
     }),
   );
-  const resizeTerminal = useEffectEvent((cols: number, rows: number) =>
-    runTerminalResize({
+  const resizeTerminal = useEffectEvent((cols: number, rows: number) => {
+    if (!canOperateTerminal) return;
+    return runTerminalResize({
       environmentId,
       input: { threadId, terminalId, cols, rows },
-    }),
-  );
+    });
+  });
   const terminalOutput = terminalSession.output;
   const terminalError = terminalSession.error;
   const terminalStatus = terminalSession.status;
@@ -439,6 +445,10 @@ export function TerminalViewport({
   useEffect(() => {
     keybindingsRef.current = keybindings;
   }, [keybindings]);
+
+  useLayoutEffect(() => {
+    if (terminalRef.current) terminalRef.current.input.readOnly = !canOperateTerminal;
+  }, [canOperateTerminal]);
 
   useLayoutEffect(() => {
     visibleRef.current = visible;
@@ -494,6 +504,7 @@ export function TerminalViewport({
       terminal.setTheme(terminalThemeFromApp(mount));
       setupTerminal = terminal;
       terminalRef.current = terminal;
+      terminal.input.readOnly = !hasTerminalWriteAccess();
       // Client settings hydrate asynchronously; a font preference that landed
       // while the surface was loading found terminalRef null, so its setFont
       // was dropped. Re-apply whatever is current once the terminal exists.
@@ -604,6 +615,7 @@ export function TerminalViewport({
       };
 
       const pasteFromClipboard = async (requestId: number) => {
+        if (!hasTerminalWriteAccess()) return;
         const activeTerminal = terminalRef.current;
         if (!activeTerminal) return;
         try {
@@ -634,7 +646,10 @@ export function TerminalViewport({
         let clicked: TerminalContextMenuAction | null;
         try {
           clicked = await localApi.contextMenu.show(
-            terminalContextMenuItems({ hasSelection: selectionAction !== null }),
+            terminalContextMenuItems({
+              hasSelection: selectionAction !== null,
+              readOnly: !hasTerminalWriteAccess(),
+            }),
             { x: event.clientX, y: event.clientY },
           );
         } catch (error) {
@@ -694,6 +709,7 @@ export function TerminalViewport({
       };
 
       const sendTerminalInput = async (data: string, fallbackError: string) => {
+        if (!hasTerminalWriteAccess()) return;
         const activeTerminal = terminalRef.current;
         if (!activeTerminal) return;
         const result = await writeTerminal(data);
@@ -789,6 +805,7 @@ export function TerminalViewport({
       }
 
       function handleData(data: string): void {
+        if (!hasTerminalWriteAccess()) return;
         void (async () => {
           const result = await writeTerminal(data);
           if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
@@ -992,14 +1009,29 @@ interface TerminalActionButtonProps {
   className: string;
   onClick: () => void;
   children: ReactNode;
+  disabled?: boolean;
 }
 
-function TerminalActionButton({ label, className, onClick, children }: TerminalActionButtonProps) {
+function TerminalActionButton({
+  label,
+  className,
+  onClick,
+  children,
+  disabled,
+}: TerminalActionButtonProps) {
   return (
     <Popover>
       <PopoverTrigger
         openOnHover
-        render={<button type="button" className={className} onClick={onClick} aria-label={label} />}
+        render={
+          <button
+            type="button"
+            className={cn(className, "disabled:opacity-45 disabled:cursor-not-allowed")}
+            onClick={onClick}
+            aria-label={label}
+            disabled={disabled}
+          />
+        }
       >
         {children}
       </PopoverTrigger>
@@ -1045,6 +1077,7 @@ export default function ThreadTerminalDrawer({
   terminalLabelsById,
   terminalLaunchLocationsById,
 }: ThreadTerminalDrawerProps) {
+  const canOperateTerminal = useEnvironmentScope(threadRef.environmentId, AuthTerminalOperateScope);
   const isPanel = mode === "panel";
   const [advancedTypography] = useLocalStorage(
     TYPOGRAPHY_ADVANCED_STORAGE_KEY,
@@ -1236,24 +1269,26 @@ export default function ThreadTerminalDrawer({
     ? `Close Terminal (${closeShortcutLabel})`
     : "Close Terminal";
   const onSplitTerminalAction = useCallback(() => {
-    if (hasReachedSplitLimit) return;
+    if (!canOperateTerminal || hasReachedSplitLimit) return;
     onSplitTerminal();
-  }, [hasReachedSplitLimit, onSplitTerminal]);
+  }, [canOperateTerminal, hasReachedSplitLimit, onSplitTerminal]);
   const onSplitTerminalVerticalAction = useCallback(() => {
-    if (hasReachedSplitLimit) return;
+    if (!canOperateTerminal || hasReachedSplitLimit) return;
     onSplitTerminalVertical();
-  }, [hasReachedSplitLimit, onSplitTerminalVertical]);
+  }, [canOperateTerminal, hasReachedSplitLimit, onSplitTerminalVertical]);
   const onNewTerminalAction = useCallback(() => {
+    if (!canOperateTerminal) return;
     onNewTerminal();
-  }, [onNewTerminal]);
+  }, [canOperateTerminal, onNewTerminal]);
   const confirmCloseTerminal = useCallback(
     (terminalId: string) => {
+      if (!canOperateTerminal) return;
       const label = terminalLabelById.get(terminalId) ?? getTerminalLabel(terminalId);
       void confirmTerminalClose([label]).then((confirmed) => {
         if (confirmed) onCloseTerminal(terminalId);
       });
     },
-    [onCloseTerminal, terminalLabelById],
+    [canOperateTerminal, onCloseTerminal, terminalLabelById],
   );
 
   useEffect(() => {
@@ -1379,7 +1414,12 @@ export default function ThreadTerminalDrawer({
         ) : null}
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-4 py-6 text-center text-sm text-muted-foreground">
           <p>No terminal sessions for this thread yet.</p>
-          <Button size="xs" variant="outline" onClick={onNewTerminalAction}>
+          <Button
+            size="xs"
+            variant="outline"
+            onClick={onNewTerminalAction}
+            disabled={!canOperateTerminal}
+          >
             {newTerminalActionLabel}
           </Button>
         </div>
@@ -1412,6 +1452,7 @@ export default function ThreadTerminalDrawer({
         <div className="pointer-events-none absolute right-2 top-2 z-20">
           <div className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background shadow-xs">
             <TerminalActionButton
+              disabled={!canOperateTerminal}
               className={`p-1 text-foreground/90 transition-colors ${
                 hasReachedSplitLimit
                   ? "cursor-not-allowed opacity-45 hover:bg-transparent"
@@ -1424,6 +1465,7 @@ export default function ThreadTerminalDrawer({
             </TerminalActionButton>
             <div className="h-4 w-px bg-border/80" />
             <TerminalActionButton
+              disabled={!canOperateTerminal}
               className={`p-1 text-foreground/90 transition-colors ${
                 hasReachedSplitLimit
                   ? "cursor-not-allowed opacity-45 hover:bg-transparent"
@@ -1436,6 +1478,7 @@ export default function ThreadTerminalDrawer({
             </TerminalActionButton>
             <div className="h-4 w-px bg-border/80" />
             <TerminalActionButton
+              disabled={!canOperateTerminal}
               className="p-1 text-foreground/90 transition-colors hover:bg-accent"
               onClick={onNewTerminalAction}
               label={newTerminalActionLabel}
@@ -1444,6 +1487,7 @@ export default function ThreadTerminalDrawer({
             </TerminalActionButton>
             <div className="h-4 w-px bg-border/80" />
             <TerminalActionButton
+              disabled={!canOperateTerminal}
               className="p-1 text-foreground/90 transition-colors hover:bg-accent"
               onClick={() => confirmCloseTerminal(resolvedActiveTerminalId)}
               label={closeTerminalActionLabel}
@@ -1557,6 +1601,7 @@ export default function ThreadTerminalDrawer({
               <div className="flex h-[22px] items-stretch justify-end border-b border-border/70">
                 <div className="inline-flex h-full items-stretch">
                   <TerminalActionButton
+                    disabled={!canOperateTerminal}
                     className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors ${
                       hasReachedSplitLimit
                         ? "cursor-not-allowed opacity-45 hover:bg-transparent"
@@ -1568,6 +1613,7 @@ export default function ThreadTerminalDrawer({
                     <SquareSplitHorizontal className="size-3.25" />
                   </TerminalActionButton>
                   <TerminalActionButton
+                    disabled={!canOperateTerminal}
                     className={`inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors ${
                       hasReachedSplitLimit
                         ? "cursor-not-allowed opacity-45 hover:bg-transparent"
@@ -1579,6 +1625,7 @@ export default function ThreadTerminalDrawer({
                     <SquareSplitVertical className="size-3.25" />
                   </TerminalActionButton>
                   <TerminalActionButton
+                    disabled={!canOperateTerminal}
                     className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
                     onClick={onNewTerminalAction}
                     label={newTerminalActionLabel}
@@ -1586,6 +1633,7 @@ export default function ThreadTerminalDrawer({
                     <Plus className="size-3.25" />
                   </TerminalActionButton>
                   <TerminalActionButton
+                    disabled={!canOperateTerminal}
                     className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
                     onClick={() => confirmCloseTerminal(resolvedActiveTerminalId)}
                     label={closeTerminalActionLabel}
@@ -1652,13 +1700,17 @@ export default function ThreadTerminalDrawer({
                                   : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
                               )}
                             >
-                              <PanelTabCloseButton
-                                label={closeTerminalLabel}
-                                onClick={() => confirmCloseTerminal(terminalId)}
-                                tooltip={closeTerminalLabel}
-                              >
+                              {canOperateTerminal ? (
+                                <PanelTabCloseButton
+                                  label={closeTerminalLabel}
+                                  onClick={() => confirmCloseTerminal(terminalId)}
+                                  tooltip={closeTerminalLabel}
+                                >
+                                  <TerminalSquare className="size-3 shrink-0" />
+                                </PanelTabCloseButton>
+                              ) : (
                                 <TerminalSquare className="size-3 shrink-0" />
-                              </PanelTabCloseButton>
+                              )}
                               <button
                                 type="button"
                                 className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 text-left"
