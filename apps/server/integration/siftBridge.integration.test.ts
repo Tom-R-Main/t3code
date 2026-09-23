@@ -30,6 +30,7 @@ it.live(
         Effect.promise(
           () =>
             new Promise<Record<string, unknown>>((resolve, reject) => {
+              // @effect-diagnostics-next-line globalDate:off - wall-clock expiry signed like the host daemon does.
               const expiresAt = Date.now() + 30_000;
               const socket = NodeNet.createConnection(socketPath);
               let text = "";
@@ -144,6 +145,7 @@ it.live(
       assert.deepEqual(duplicate.result, accepted.result);
       const events = yield* send({ ...base, operation: "events", afterSequence: 0 });
       assert.equal(events.ok, true);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - substring check over the reply.
       assert.ok(JSON.stringify(events.result).includes("Verified fixture response."));
       const messageEvents = (events.result as { events: OrchestrationEvent[] }).events.filter(
         (event) => event.type === "thread.message-sent" && event.payload.role === "assistant",

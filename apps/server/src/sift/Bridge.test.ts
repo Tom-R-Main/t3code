@@ -80,6 +80,7 @@ it.effect("rejects authorization that expires while waiting for the bridge mutex
       const rejected = yield* Fiber.join(second);
       expect(!rejected.ok && rejected.error.code).toBe("AUTHORIZATION_FAILED");
       const events = yield* handle({ ...request, operation: "events", afterSequence: 0 });
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - substring check over the reply.
       expect(JSON.stringify(events)).not.toContain("Must not execute.");
     }).pipe(Effect.provide(testLayer(directory)));
   }).pipe(Effect.scoped),
@@ -253,6 +254,84 @@ it.effect("bounds replay bytes without skipping an oversized event", () =>
       });
       const result = yield* handle({ ...request, operation: "events", afterSequence: before });
       expect(!result.ok && result.error.code).toBe("EVENT_TOO_LARGE");
+    }).pipe(Effect.provide(testLayer(directory)));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("resolves each approval request once across clients and restarts", () =>
+  Effect.gen(function* () {
+    const directory = yield* Effect.acquireRelease(
+      Effect.promise(() => NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-approval-"))),
+      (directory) => Effect.promise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
+    );
+    yield* Effect.gen(function* () {
+      const handle = yield* makeSiftBridge;
+      const engine = yield* OrchestrationEngineService;
+      const bound = yield* handle({
+        ...request,
+        operation: "bind",
+        checkoutPath: directory,
+        modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        runtimeMode: "approval-required",
+      });
+      if (!bound.ok) throw new Error("Binding failed.");
+      const threadId = ThreadId.make(bound.result.threadId);
+      const appendActivity = (id: string, kind: string, payload: Record<string, unknown>) =>
+        engine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make(id),
+          threadId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          activity: {
+            id: EventId.make(id),
+            kind,
+            summary: kind,
+            tone: "approval",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            payload,
+          },
+        });
+      yield* appendActivity("requested-1", "approval.requested", { requestId: "request-1" });
+      const approve = (commandId: string, requestId: string, decision: string) =>
+        handle({ ...request, operation: "approve", commandId, requestId, decision });
+
+      const first = yield* approve("phone", "request-1", "accept");
+      expect(first.ok && first.result.state).toBe("accepted");
+      const second = yield* approve("browser", "request-1", "decline");
+      expect(second.ok && second.result).toEqual({
+        threadId,
+        state: "already_resolved",
+        decision: "accept",
+      });
+      expect(yield* approve("phone", "request-1", "accept")).toEqual(first);
+      const replay = yield* handle({ ...request, operation: "events", afterSequence: 0 });
+      if (!replay.ok || !("events" in replay.result)) throw new Error("Replay failed");
+      expect(
+        replay.result.events.filter((event) => event.type === "thread.approval-response-requested")
+          .length,
+      ).toBe(1);
+
+      const unknown = yield* approve("unknown", "missing-request", "accept");
+      expect(!unknown.ok && unknown.error.code).toBe("UNKNOWN_REQUEST");
+      // Standing approvals stay a native-client decision; the socket replies
+      // INVALID_REQUEST when decoding fails.
+      const standing = yield* Effect.flip(approve("standing", "request-1", "acceptForSession"));
+      expect(standing.code).toBe("INVALID_REQUEST");
+
+      // Provider callbacks do not survive a T3 restart: the reactor then closes
+      // the request as stale, and a later answer must not look answerable.
+      yield* appendActivity("requested-2", "approval.requested", { requestId: "request-2" });
+      yield* appendActivity("stale-2", "provider.approval.respond.failed", {
+        requestId: "request-2",
+        detail: "Stale pending approval request: request-2",
+      });
+      const stale = yield* approve("after-restart", "request-2", "accept");
+      expect(stale.ok && stale.result).toEqual({
+        threadId,
+        state: "already_resolved",
+        decision: null,
+      });
     }).pipe(Effect.provide(testLayer(directory)));
   }).pipe(Effect.scoped),
 );

@@ -51,6 +51,33 @@ human acceptance operations. Native approval forwarding accepts only one-time
 accept, decline, or cancel decisions. A provider approval is distinct from Sift
 authorization and acceptance of the resulting work.
 
+An `approve` with a new command identity is checked against T3's approval
+projection before dispatch. If another client already answered the request, the
+reply is `already_resolved` with the recorded decision and nothing reaches the
+provider. A `null` decision means T3 closed the request without one, for example
+because provider callbacks did not survive a restart; start a new turn instead.
+An ID that does not belong to this assignment's thread fails with
+`UNKNOWN_REQUEST`. A retry of the original command still replays its receipt. A
+native T3 client answering in the moment between this check and dispatch can
+still produce a second provider response, which T3 records as a stale failure.
+`answer` has no such projection and is not deduplicated across clients.
+
+## Keeping the fork current
+
+Fork changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
+`packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,
+the layer entry in `apps/server/src/server.ts`, and one harness hook. Merge
+`origin/main` into the fork branch before each image build, then run:
+
+```bash
+vp run --filter t3 typecheck
+vp run --filter @t3tools/contracts typecheck
+(cd apps/server && vp test run src/sift integration/siftBridge.integration.test.ts)
+```
+
+A conflict-free merge is not enough: upstream API changes surface only in the
+typecheck and tests.
+
 For cross-repository synthetic tests, run
 `node apps/server/integration/siftBridge.fixture.ts` with the public-key variable.
 It prints a ready record containing its PID, private socket, and temporary checkout.

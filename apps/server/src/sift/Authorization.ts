@@ -38,6 +38,7 @@ export const readSiftPublicKey = (encoded: string): NodeCrypto.KeyObject => {
 export const authenticateSiftRequest = (
   input: unknown,
   key: NodeCrypto.KeyObject,
+  // @effect-diagnostics-next-line globalDate:off - synchronous check run from socket callbacks and before each dispatch.
   now = Date.now(),
 ): unknown => {
   const envelope = decodeEnvelope(input, { onExcessProperty: "error" });

@@ -8,6 +8,7 @@ import {
   SIFT_BRIDGE_MAX_REQUEST_BYTES,
   SIFT_BRIDGE_MAX_RESPONSE_BYTES,
 } from "../../../../packages/contracts/src/siftBridge.ts";
+import * as Schema from "effect/Schema";
 import { makeSiftBridge } from "./Bridge.ts";
 import { ServerActivation } from "../serverActivation.ts";
 import * as NodeCrypto from "node:crypto";
@@ -129,9 +130,10 @@ export async function listenSiftSocket(path: string, handle: (input: unknown) =>
   };
 }
 
-export const listenEffectSiftSocket = (
+// A rejected handler becomes an INVALID_REQUEST reply in listenSiftSocket.
+export const listenEffectSiftSocket = <E>(
   path: string,
-  handle: (input: unknown, authorize?: () => void) => Effect.Effect<unknown, unknown>,
+  handle: (input: unknown, authorize?: () => void) => Effect.Effect<unknown, E>,
   publicKey: NodeCrypto.KeyObject,
 ) =>
   listenSiftSocket(path, async (input) => {
@@ -148,13 +150,20 @@ export const listenEffectSiftSocket = (
     );
   });
 
+class SiftBridgeConfigurationError extends Schema.TaggedError<SiftBridgeConfigurationError>()(
+  "SiftBridgeConfigurationError",
+  { message: Schema.String },
+) {}
+
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const path = process.env.T3_SIFT_BRIDGE_SOCKET;
     if (!path) return;
     const encodedPublicKey = process.env.T3_SIFT_BRIDGE_PUBLIC_KEY;
     if (!encodedPublicKey)
-      return yield* Effect.fail(new Error("Sift bridge host public key is required."));
+      return yield* new SiftBridgeConfigurationError({
+        message: "Sift bridge host public key is required.",
+      });
     const publicKey = yield* Effect.try(() => readSiftPublicKey(encodedPublicKey));
     const handle = yield* makeSiftBridge;
     const activation = yield* ServerActivation;

@@ -6,15 +6,18 @@ import {
   ApprovalRequestId,
   CommandId,
   MessageId,
+  ModelSelection,
   ProjectId,
   ThreadId,
   type OrchestrationCommand,
   type OrchestrationEvent,
 } from "@t3tools/contracts";
 import {
+  SiftBinding,
   SiftBridgeRequest,
   SIFT_BRIDGE_MAX_RESPONSE_BYTES,
 } from "../../../../packages/contracts/src/siftBridge.ts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -23,11 +26,20 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 
 const decodeRequest = Schema.decodeUnknownEffect(SiftBridgeRequest);
+const StoredBinding = Schema.Struct({
+  binding: SiftBinding,
+  checkoutPath: Schema.String,
+  modelSelection: ModelSelection,
+  runtimeMode: Schema.Literal("approval-required"),
+});
+const decodeStoredBinding = Schema.decodeUnknownEffect(Schema.fromJsonString(StoredBinding));
+const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
-class BridgeError extends Schema.TaggedErrorClass<BridgeError>()("SiftBridgeError", {
+class BridgeError extends Schema.TaggedError<BridgeError>()("SiftBridgeError", {
   code: Schema.String,
   message: Schema.String,
 }) {}
+const isBridgeError = Schema.is(BridgeError);
 const fail = (code: string, message: string) => new BridgeError({ code, message });
 const digest = (value: string) => NodeCrypto.createHash("sha256").update(value).digest("hex");
 const canonical = (value: unknown): string =>
@@ -97,7 +109,7 @@ export const makeSiftBridge = Effect.gen(function* () {
               commandId: CommandId.make(
                 `${prefix}-generation-${configuration.binding.leaseGeneration}-stop`,
               ),
-              createdAt: new Date().toISOString(),
+              createdAt: yield* nowIso,
             });
       yield* checkAuthorization;
       yield* sql`UPDATE sift_bridge_binding SET ready_generation = ${configuration.binding.leaseGeneration} WHERE slot = 1`;
@@ -123,20 +135,14 @@ export const makeSiftBridge = Effect.gen(function* () {
         runtimeMode: request.runtimeMode,
       });
       yield* checkAuthorization;
-      const now = new Date().toISOString();
+      const now = yield* nowIso;
       yield* sql`INSERT INTO sift_bridge_binding (slot, payload, created_at) VALUES (1, ${payload}, ${now}) ON CONFLICT(slot) DO NOTHING`;
       const rows = yield* sql<{
         payload: string;
         created_at: string;
       }>`SELECT payload, created_at FROM sift_bridge_binding WHERE slot = 1`;
       const stored = rows[0]!;
-      const previous = yield* decodeRequest({
-        ...JSON.parse(stored.payload),
-        id: "stored",
-        operation: "bind",
-      });
-      if (previous.operation !== "bind")
-        return yield* fail("BINDING_CONFLICT", "Invalid stored binding.");
+      const previous = yield* decodeStoredBinding(stored.payload);
       if (stored.payload !== payload) {
         const sameConfiguration =
           canonical({
@@ -174,12 +180,12 @@ export const makeSiftBridge = Effect.gen(function* () {
       ready_generation: number;
     }>`SELECT payload, created_at, ready_generation FROM sift_bridge_binding WHERE slot = 1`;
     if (!rows[0]) return yield* fail("NOT_BOUND", "Bind the assignment before sending commands.");
-    const binding = yield* decodeRequest({
-      ...JSON.parse(rows[0].payload),
+    const binding = {
+      ...(yield* decodeStoredBinding(rows[0].payload)),
       id: "stored",
-      operation: "bind",
-    });
-    if (binding.operation !== "bind" || canonical(binding.binding) !== identity)
+      operation: "bind" as const,
+    };
+    if (canonical(binding.binding) !== identity)
       return yield* fail(
         "BINDING_CONFLICT",
         "Assignment identity or lease generation does not match.",
@@ -202,6 +208,7 @@ export const makeSiftBridge = Effect.gen(function* () {
       const events: OrchestrationEvent[] = [];
       let bytes = 4096;
       for (const event of page) {
+        // @effect-diagnostics-next-line preferSchemaOverJson:off - measures the serialized reply size, not a decode.
         const size = Buffer.byteLength(JSON.stringify(event)) + 1;
         if (events.length === limit || bytes + size > SIFT_BRIDGE_MAX_RESPONSE_BYTES) break;
         events.push(event);
@@ -224,7 +231,28 @@ export const makeSiftBridge = Effect.gen(function* () {
     const commandId = CommandId.make(`${prefix}-${digest(request.commandId)}`);
     const { id: _id, ...content } = request;
     const payload = canonical(content);
-    const createdAt = new Date().toISOString();
+    if (request.operation === "approve") {
+      const prior = yield* sql<{
+        command_id: string;
+      }>`SELECT command_id FROM sift_bridge_commands WHERE command_id = ${commandId}`;
+      // A new command for a request that another client already answered must
+      // not reach the provider twice. Retries of the original command skip this
+      // check so they replay its receipt. The approval projection commits in the
+      // same transaction as each dispatch, so a recorded response is visible here.
+      if (prior.length === 0) {
+        const approvals = yield* sql<{
+          thread_id: string;
+          status: string;
+          decision: string | null;
+        }>`SELECT thread_id, status, decision FROM projection_pending_approvals WHERE request_id = ${request.requestId}`;
+        const approval = approvals[0];
+        if (!approval || approval.thread_id !== threadId)
+          return yield* fail("UNKNOWN_REQUEST", "No approval request with this ID is open here.");
+        if (approval.status === "resolved")
+          return { threadId, state: "already_resolved", decision: approval.decision };
+      }
+    }
+    const createdAt = yield* nowIso;
     yield* sql`INSERT INTO sift_bridge_commands (command_id, payload, created_at) VALUES (${commandId}, ${payload}, ${createdAt}) ON CONFLICT(command_id) DO NOTHING`;
     const receipts = yield* sql<{
       payload: string;
@@ -290,13 +318,12 @@ export const makeSiftBridge = Effect.gen(function* () {
         Effect.succeed({
           id: request.id,
           ok: false as const,
-          error:
-            error instanceof BridgeError
-              ? { code: error.code, message: error.message }
-              : {
-                  code: "COMMAND_FAILED",
-                  message: "The operation failed; inspect local runtime diagnostics.",
-                },
+          error: isBridgeError(error)
+            ? { code: error.code, message: error.message }
+            : {
+                code: "COMMAND_FAILED",
+                message: "The operation failed; inspect local runtime diagnostics.",
+              },
         }),
       ),
     );

@@ -5,6 +5,7 @@
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EventId, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { SiftBridgeRequest } from "../../../packages/contracts/src/siftBridge.ts";
@@ -31,12 +32,13 @@ const program = Effect.gen(function* () {
     const request = yield* decodeRequest(input);
     if (request.operation === "turn" && threadId && !queued.has(request.commandId)) {
       queued.add(request.commandId);
+      const createdAt = DateTime.formatIso(yield* DateTime.now);
       const base = (id: string) => ({
         eventId: EventId.make(`${request.commandId}-${id}`),
         provider: ProviderDriverKind.make("codex"),
         threadId: threadId!,
         turnId: "fixture-turn",
-        createdAt: new Date().toISOString(),
+        createdAt,
       });
       const response = {
         events: [
@@ -87,6 +89,7 @@ const program = Effect.gen(function* () {
   );
   yield* Effect.sync(() =>
     process.stdout.write(
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - one-line ready record read by the cross-repo test harness.
       JSON.stringify({
         type: "ready",
         pid: process.pid,
@@ -95,6 +98,6 @@ const program = Effect.gen(function* () {
       }) + "\n",
     ),
   );
-  yield* Effect.never;
+  return yield* Effect.never;
 });
 program.pipe(Effect.scoped, Effect.provide(NodeServices.layer), NodeRuntime.runMain);
