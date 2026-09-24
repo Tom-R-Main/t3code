@@ -40,6 +40,7 @@ import {
   makeHttpGate,
   makeRpcGuard,
   parseManagedSubject,
+  redirectingGitVariables,
   type ManagedAttempt,
 } from "./ManagedAccess.ts";
 
@@ -478,7 +479,11 @@ it.effect("refuses VCS reads when the checkout is not its repository root", () =
     // Subdirectories of the root are refused: the diff service would widen to the root anyway.
     yield* Effect.promise(() => NodeFSP.mkdir(NodePath.join(checkout, "sub")));
     expect(
-      yield* allowed(WS_METHODS.subscribeVcsStatus, { cwd: NodePath.join(checkout, "sub") }, root),
+      yield* allowed(
+        WS_METHODS.reviewGetDiffPreview,
+        { cwd: NodePath.join(checkout, "sub") },
+        root,
+      ),
     ).toBe(false);
   }).pipe(Effect.scoped),
 );
@@ -650,3 +655,103 @@ it.effect("accepts managed subjects only from sessions redeemed from a bridge at
     }).pipe(Effect.provide(testLayer(directory)));
   }).pipe(Effect.scoped),
 );
+
+const withEnv = (key: string, value: string) =>
+  Effect.acquireRelease(
+    Effect.sync(() => {
+      const previous = process.env[key];
+      process.env[key] = value;
+      return previous;
+    }),
+    (previous) =>
+      Effect.sync(() => {
+        if (previous === undefined) delete process.env[key];
+        else process.env[key] = previous;
+      }),
+  );
+
+it.effect("never lets a managed role reach VCS status, which can auto-pull the checkout", () =>
+  Effect.gen(function* () {
+    yield* managedMode(true);
+    const directory = yield* tempDirectory("sift-managed-pull-");
+    const base = yield* Effect.promise(() => NodeFSP.realpath(directory));
+    const origin = NodePath.join(base, "origin");
+    const checkout = NodePath.join(base, "checkout");
+    yield* Effect.promise(() => NodeFSP.mkdir(origin));
+    git(origin, "init", "-q", "-b", "main");
+    yield* Effect.promise(() => NodeFSP.writeFile(NodePath.join(origin, "a.txt"), "1"));
+    git(origin, "add", ".");
+    git(origin, "commit", "-q", "-m", "one");
+    git(base, "clone", "-q", origin, checkout);
+    yield* Effect.promise(() => NodeFSP.writeFile(NodePath.join(origin, "a.txt"), "2"));
+    git(origin, "commit", "-q", "-am", "two");
+    git(checkout, "fetch", "-q");
+    const head = () => git(checkout, "rev-parse", "HEAD").toString().trim();
+    const before = head();
+
+    yield* Effect.gen(function* () {
+      for (const role of ["reviewer", "operator"] as const) {
+        const { session } = yield* bindAndAttach(checkout, role);
+        const guard = (yield* makeRpcGuard(session))!;
+        // Stand-ins for the status handlers with auto-pull enabled: a behind,
+        // clean default branch is fast-forwarded when status refreshes.
+        const autoPull = () => {
+          git(checkout, "pull", "-q", "--ff-only");
+        };
+        const handlers = guardRpcHandlers(guard, {
+          [WS_METHODS.vcsRefreshStatus]: (_payload: unknown) => Effect.sync(autoPull),
+          [WS_METHODS.subscribeVcsStatus]: (_payload: unknown) =>
+            Stream.fromEffect(Effect.sync(autoPull)),
+        });
+        const refreshed = yield* handlers[WS_METHODS.vcsRefreshStatus]({ cwd: checkout }).pipe(
+          Effect.exit,
+        );
+        const subscribed = yield* handlers[WS_METHODS.subscribeVcsStatus]({ cwd: checkout }).pipe(
+          Stream.runDrain,
+          Effect.exit,
+        );
+        expect(Exit.isFailure(refreshed)).toBe(true);
+        expect(Exit.isFailure(subscribed)).toBe(true);
+        expect(head()).toBe(before);
+      }
+    }).pipe(Effect.provide(testLayer(directory)));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("fails closed when the server environment redirects git", () =>
+  Effect.gen(function* () {
+    yield* managedMode(true);
+    const directory = yield* tempDirectory("sift-managed-gitenv-");
+    yield* Effect.gen(function* () {
+      const { handle, token, auth } = yield* bindAndAttach(directory, "reviewer");
+      yield* withEnv("GIT_DIR", NodePath.join(directory, "elsewhere.git"));
+      // Startup refuses managed mode outright.
+      expect(Exit.isFailure(yield* makeHttpGate.pipe(Effect.exit))).toBe(true);
+      // An already-running server denies requests and refuses to mint credentials.
+      const request_ = yield* auth
+        .authenticateHttpRequest(httpRequest(token, "GET", "/api/auth/session"))
+        .pipe(Effect.exit);
+      expect(Exit.isFailure(request_)).toBe(true);
+      const attached = yield* handle({
+        ...request,
+        operation: "attach",
+        role: "reviewer",
+        ttlSeconds: 60,
+      });
+      expect(!attached.ok && attached.error.code).toBe("MANAGED_ACCESS_UNSAFE_ENVIRONMENT");
+    }).pipe(Effect.provide(testLayer(directory)));
+  }).pipe(Effect.scoped),
+);
+
+it("detects injected configuration that moves the work tree", () => {
+  expect(redirectingGitVariables({ GIT_WORK_TREE: "/elsewhere" })).toEqual(["GIT_WORK_TREE"]);
+  expect(
+    redirectingGitVariables({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.worktree" }),
+  ).toEqual(["GIT_CONFIG_KEY_0"]);
+  expect(redirectingGitVariables({ GIT_CONFIG_PARAMETERS: "'core.bare'='true'" })).toEqual([
+    "GIT_CONFIG_PARAMETERS",
+  ]);
+  expect(
+    redirectingGitVariables({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "safe.directory" }),
+  ).toEqual([]);
+});

@@ -38,6 +38,7 @@ import {
   isManagedAccessEnabled,
   isManagedSubject,
   recordManagedGrant,
+  redirectingGitVariables,
 } from "./ManagedAccess.ts";
 
 const decodeRequest = Schema.decodeUnknownEffect(SiftBridgeRequest);
@@ -248,6 +249,11 @@ export const makeSiftBridge = Effect.gen(function* () {
         return yield* fail("MANAGED_ACCESS_DISABLED", "Managed access is not enabled here.");
       if (Option.isNone(environmentAuth))
         return yield* fail("MANAGED_ACCESS_UNAVAILABLE", "Client credentials are unavailable.");
+      if (redirectingGitVariables().length > 0)
+        return yield* fail(
+          "MANAGED_ACCESS_UNSAFE_ENVIRONMENT",
+          "The server environment redirects git; managed access is refused.",
+        );
       yield* checkAuthorization;
       const notAfterMs = (yield* Clock.currentTimeMillis) + request.ttlSeconds * 1000;
       const issued = yield* environmentAuth.value.createPairingLink({

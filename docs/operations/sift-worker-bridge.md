@@ -100,13 +100,14 @@ is marked ready. Revocation and the deadline also end open subscription streams.
 Roles:
 
 - `reviewer` (scopes `orchestration:read`, `review:write`): the shell, the bound
-  thread's subscription and diffs, server config and lifecycle streams, VCS
-  status, review diff previews, and file listing, search, and reads inside the
-  checkout. Paths must be relative, and reads resolve symlinks and must stay
-  inside the checkout. VCS status and review diffs require `cwd` to be the
-  checkout and the checkout to be its own Git top level, because those services
-  read the whole repository from its root; a checkout nested in a larger
-  repository gets no VCS access. Review refs must be plain branch names or
+  thread's subscription and diffs, server config and lifecycle streams, review
+  diff previews, and file listing, search, and reads inside the checkout. Paths
+  must be relative, and reads resolve symlinks and must stay inside the
+  checkout. Review diffs require `cwd` to be the checkout and the checkout to be
+  its own Git top level, because the service reads the whole repository from
+  its root; a checkout nested in a larger repository gets no review diffs. VCS
+  status (`subscribeVcsStatus`, `vcsRefreshStatus`) is refused for both roles:
+  refreshing it pulls the checkout when the project's auto-pull setting is on. Review refs must be plain branch names or
   hashes (no leading `-`, `..`, `@{`, or other revision syntax).
 - `operator` (adds `orchestration:operate`): everything a reviewer has, plus
   `orchestration.dispatchCommand` for the bound thread only, limited to
@@ -124,6 +125,14 @@ management. An RPC that upstream adds later is refused until it is listed. Over
 HTTP a managed session may reach only `GET /api/auth/session`,
 `POST /api/auth/websocket-ticket`, `GET /ws`, and
 `GET /api/orchestration/threads/<bound thread>`.
+
+Managed mode refuses to start, and a running server refuses managed requests
+and `attach`, while the server environment sets `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_COMMON_DIR`, or `GIT_NAMESPACE`, or injects `core.worktree` or `core.bare`
+through `GIT_CONFIG_PARAMETERS` or `GIT_CONFIG_KEY_<n>`. T3's git operations
+inherit that environment, so they could otherwise read a repository other than
+the checkout the policy validated.
 
 Managed access trusts the SQLite state database. A process running as the T3
 user can write that database or the server's signing secret directly and forge

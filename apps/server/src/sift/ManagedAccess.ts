@@ -40,6 +40,36 @@ export const MANAGED_ACCESS_ENV = "T3_SIFT_MANAGED_ACCESS";
 export const isManagedAccessEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
   env[MANAGED_ACCESS_ENV] === "1";
 
+/**
+ * Variables that make git operate on a repository, work tree, index, or object
+ * store other than the one found from `cwd`. T3's VCS and review services
+ * inherit the server environment, so any of these would let the containment
+ * check validate the checkout while the operation reads elsewhere. Managed mode
+ * refuses to run with them set, or with injected configuration that moves the
+ * work tree. Other injected configuration (such as test `safe.directory`
+ * entries) is allowed.
+ */
+const REDIRECTING_GIT_VARIABLES = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+] as const;
+const REDIRECTING_GIT_CONFIG = /core\.(worktree|bare)/i;
+export const redirectingGitVariables = (env: NodeJS.ProcessEnv = process.env): string[] => {
+  const found: string[] = REDIRECTING_GIT_VARIABLES.filter((key) => env[key] !== undefined);
+  if (REDIRECTING_GIT_CONFIG.test(env.GIT_CONFIG_PARAMETERS ?? ""))
+    found.push("GIT_CONFIG_PARAMETERS");
+  const count = Number(env.GIT_CONFIG_COUNT ?? "0");
+  for (let index = 0; Number.isInteger(count) && index < count; index++)
+    if (REDIRECTING_GIT_CONFIG.test(env[`GIT_CONFIG_KEY_${index}`] ?? ""))
+      found.push(`GIT_CONFIG_KEY_${index}`);
+  return found;
+};
+
 export const ManagedRole = Schema.Literals(["reviewer", "operator"]);
 export type ManagedRole = typeof ManagedRole.Type;
 
@@ -342,8 +372,6 @@ const always: RpcRule = () => allow;
 const boundThread: RpcRule = requireBoundThread;
 const workspaceCwd: RpcRule = (attempt, payload) =>
   requireWorkspaceCwd(attempt, field(payload, "cwd"));
-const repositoryRoot: RpcRule = (attempt, payload) =>
-  requireRepositoryRoot(attempt, field(payload, "cwd"));
 
 const REVIEWER_RULES: Readonly<Record<string, RpcRule>> = {
   [ORCHESTRATION_WS_METHODS.subscribeShell]: always,
@@ -357,8 +385,8 @@ const REVIEWER_RULES: Readonly<Record<string, RpcRule>> = {
   [WS_METHODS.serverReportClientActivity]: always,
   [WS_METHODS.serverGetBackgroundPolicy]: always,
   [WS_METHODS.subscribeBackgroundPolicy]: always,
-  [WS_METHODS.subscribeVcsStatus]: repositoryRoot,
-  [WS_METHODS.vcsRefreshStatus]: repositoryRoot,
+  // VCS status is not available: refreshing it can auto-pull the checkout when
+  // the project's auto-pull setting is on, which no managed role may do.
   [WS_METHODS.projectsSearchEntries]: workspaceCwd,
   [WS_METHODS.projectsSearchContents]: workspaceCwd,
   [WS_METHODS.projectsListEntries]: (attempt, payload) => {
@@ -426,6 +454,8 @@ const resolvePrincipal = (session: ManagedSessionIdentity) =>
   Effect.gen(function* () {
     const subject = parseManagedSubject(session.subject);
     if (!subject) return yield* deny("managed mode accepts only Sift-issued credentials");
+    if (redirectingGitVariables().length > 0)
+      return yield* deny("the server environment redirects git");
     if (!(yield* isRecordedSession(session)))
       return yield* deny("the session was not issued through the Sift bridge");
     if ((yield* Clock.currentTimeMillis) >= subject.notAfterMs)
@@ -476,6 +506,11 @@ export interface ManagedHttpGate {
  */
 export const makeHttpGate = Effect.gen(function* () {
   if (!isManagedAccessEnabled()) return undefined;
+  const redirecting = redirectingGitVariables();
+  if (redirecting.length > 0)
+    return yield* Effect.die(
+      new Error(`Managed access refuses to start with ${redirecting.join(", ")} set.`),
+    );
   const sql = yield* SqlClient.SqlClient;
   const claim: ManagedHttpGate["claim"] = (credential, subject, sessionId) =>
     isManagedSubject(subject)
