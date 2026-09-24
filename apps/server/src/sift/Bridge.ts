@@ -7,8 +7,6 @@ import {
   CommandId,
   MessageId,
   ModelSelection,
-  ProjectId,
-  ThreadId,
   type OrchestrationCommand,
   type OrchestrationEvent,
 } from "@t3tools/contracts";
@@ -17,13 +15,25 @@ import {
   SiftBridgeRequest,
   SIFT_BRIDGE_MAX_RESPONSE_BYTES,
 } from "../../../../packages/contracts/src/siftBridge.ts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
+import {
+  MANAGED_ROLE_SCOPES,
+  assignmentIds,
+  attemptKey,
+  encodeManagedSubject,
+  isManagedAccessEnabled,
+  isManagedSubject,
+} from "./ManagedAccess.ts";
 
 const decodeRequest = Schema.decodeUnknownEffect(SiftBridgeRequest);
 const StoredBinding = Schema.Struct({
@@ -55,6 +65,23 @@ export const makeSiftBridge = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const engine = yield* OrchestrationEngineService;
   const mutex = yield* Semaphore.make(1);
+  // Present in the server; absent in engine-only harnesses, where attach fails.
+  const environmentAuth = yield* Effect.serviceOption(EnvironmentAuth);
+  const revokeManagedCredentials = Effect.gen(function* () {
+    if (Option.isNone(environmentAuth)) return { revokedPairingLinks: 0, revokedSessions: 0 };
+    const auth = environmentAuth.value;
+    const links = (yield* auth.listPairingLinks({ excludeSubjects: [] })).filter((link) =>
+      isManagedSubject(link.subject),
+    );
+    yield* Effect.forEach(links, (link) => auth.revokePairingLink(link.id), { discard: true });
+    const sessions = (yield* auth.listSessions()).filter((session) =>
+      isManagedSubject(session.subject),
+    );
+    yield* Effect.forEach(sessions, (session) => auth.revokeSession(session.sessionId), {
+      discard: true,
+    });
+    return { revokedPairingLinks: links.length, revokedSessions: sessions.length };
+  });
   yield* sql`CREATE TABLE IF NOT EXISTS sift_bridge_binding (slot INTEGER PRIMARY KEY CHECK (slot = 1), payload TEXT NOT NULL, created_at TEXT NOT NULL, ready_generation INTEGER NOT NULL DEFAULT 0)`;
   yield* sql`CREATE TABLE IF NOT EXISTS sift_bridge_commands (command_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
 
@@ -70,9 +97,8 @@ export const makeSiftBridge = Effect.gen(function* () {
     const dispatch = (command: OrchestrationCommand) =>
       checkAuthorization.pipe(Effect.andThen(engine.dispatch(command)));
     const identity = canonical(request.binding);
-    const prefix = `sift-${digest(canonical({ runtimeId: request.binding.runtimeId, workItemId: request.binding.workItemId }))}`;
-    const threadId = ThreadId.make(prefix);
-    const projectId = ProjectId.make(prefix);
+    const { threadId, projectId } = assignmentIds(request.binding);
+    const prefix: string = threadId;
     const ensureReady = Effect.fn("SiftBridge.ensureReady")(function* (
       configuration: Extract<SiftBridgeRequest, { operation: "bind" }>,
       createdAt: string,
@@ -111,6 +137,14 @@ export const makeSiftBridge = Effect.gen(function* () {
               ),
               createdAt: yield* nowIso,
             });
+      // Credentials minted for an earlier attempt must not survive a rebind.
+      // Replayed with the rest of this barrier until the generation is ready,
+      // so an idempotent bind retry leaves current attachments alone.
+      const ready = yield* sql<{
+        ready_generation: number;
+      }>`SELECT ready_generation FROM sift_bridge_binding WHERE slot = 1`;
+      if (ready[0]?.ready_generation !== configuration.binding.leaseGeneration)
+        yield* revokeManagedCredentials;
       yield* checkAuthorization;
       yield* sql`UPDATE sift_bridge_binding SET ready_generation = ${configuration.binding.leaseGeneration} WHERE slot = 1`;
       return stopped;
@@ -192,6 +226,41 @@ export const makeSiftBridge = Effect.gen(function* () {
       );
     if (rows[0].ready_generation !== binding.binding.leaseGeneration)
       yield* ensureReady(binding, rows[0].created_at);
+    if (request.operation === "detach") {
+      yield* checkAuthorization;
+      return { threadId, state: "detached", ...(yield* revokeManagedCredentials) };
+    }
+    if (request.operation === "attach") {
+      // Outside managed mode these scopes would be environment-wide, so refuse.
+      if (!isManagedAccessEnabled())
+        return yield* fail("MANAGED_ACCESS_DISABLED", "Managed access is not enabled here.");
+      if (Option.isNone(environmentAuth))
+        return yield* fail("MANAGED_ACCESS_UNAVAILABLE", "Client credentials are unavailable.");
+      yield* checkAuthorization;
+      const notAfterMs = (yield* Clock.currentTimeMillis) + request.ttlSeconds * 1000;
+      const issued = yield* environmentAuth.value.createPairingLink({
+        // The one-time credential only has to reach a client; the session it
+        // creates is bounded by the deadline in its subject.
+        ttl: Duration.seconds(Math.min(request.ttlSeconds, 15 * 60)),
+        scopes: MANAGED_ROLE_SCOPES[request.role],
+        subject: encodeManagedSubject({
+          role: request.role,
+          attemptKey: attemptKey(request.binding),
+          notAfterMs,
+        }),
+        label: request.label ?? `Sift ${request.role}`,
+      });
+      return {
+        threadId,
+        projectId,
+        role: request.role,
+        scopes: issued.scopes,
+        credential: issued.credential,
+        pairingLinkId: issued.id,
+        redeemBy: DateTime.formatIso(issued.expiresAt),
+        expiresAt: DateTime.formatIso(DateTime.makeUnsafe(notAfterMs)),
+      };
+    }
     if (request.operation === "events") {
       const headSequence = yield* engine.latestSequence;
       if (request.afterSequence > headSequence)
