@@ -80,10 +80,19 @@ of the runtime ID, work item ID, lease generation, and an access epoch. `attach`
 `MANAGED_ACCESS_DISABLED` when managed mode is off, because the same scopes
 would otherwise apply to the whole environment.
 
-Each HTTP request and RPC checks that the subject parses, that its deadline has
+The bridge records each credential it issues (a hash of the credential and its
+subject) in `sift_managed_access_grants`. Redeeming a pairing credential whose
+subject starts with `sift-managed:` binds the new session to that record, or
+revokes the session if no unclaimed record matches. A managed subject is
+therefore honoured only on the one session produced from a bridge `attach`;
+sessions or pairing links that the auth CLI signs with a copied or edited
+subject are rejected.
+
+Each HTTP request and RPC checks that the session is bound to a bridge record
+with the same subject, that the subject parses, that its deadline has
 not passed, that its attempt is the ready binding, and, for RPCs, that the
 session has not been revoked. `detach` revokes every managed pairing link and
-session. It first advances the access epoch, so a link redeemed while revocation
+session. It first advances the access epoch and clears the bridge records, so a link redeemed while revocation
 is in progress yields a session for a superseded attempt that every check
 rejects. A rebind to a new lease generation does the same before the generation
 is marked ready. Revocation and the deadline also end open subscription streams.
@@ -116,6 +125,11 @@ HTTP a managed session may reach only `GET /api/auth/session`,
 `POST /api/auth/websocket-ticket`, `GET /ws`, and
 `GET /api/orchestration/threads/<bound thread>`.
 
+Managed access trusts the SQLite state database. A process running as the T3
+user can write that database or the server's signing secret directly and forge
+any record; this is an accepted limit, and the host must keep worker tools from
+running as that user if it needs a stronger boundary.
+
 The environment is expected to hold only the bridge's project and thread. The
 shell subscription is not filtered, so any other project or thread created
 before managed mode was enabled remains visible in it. Attachment uploads and
@@ -128,7 +142,8 @@ Fork changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridg
 the layer entry in `apps/server/src/server.ts`, and one harness hook. Managed
 access adds two hooks in upstream files: `makeHttpGate` in
 `apps/server/src/auth/EnvironmentAuth.ts` (applied after token verification and
-WebSocket ticket verification) and `withRpcGuard` around the handler object in
+WebSocket ticket verification, and after session issuance in the two
+pairing-credential redemption paths) and `withRpcGuard` around the handler object in
 `apps/server/src/ws.ts`. The guard calls each handler before authorizing it and
 relies on handlers building their effects lazily, as they do today. Merge
 `origin/main` into the fork branch before each image build, then run:

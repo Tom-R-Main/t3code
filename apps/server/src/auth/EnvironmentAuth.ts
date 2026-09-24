@@ -616,7 +616,7 @@ export const make = Effect.gen(function* () {
   ): Effect.Effect<AuthenticatedSession, ServerAuthInvalidCredentialError> =>
     managedAccessGate === undefined
       ? Effect.succeed(session)
-      : managedAccessGate(session, { method: request.method, url: request.url }).pipe(
+      : managedAccessGate.authorize(session, { method: request.method, url: request.url }).pipe(
           Effect.flatMap((denial) =>
             denial === undefined
               ? Effect.succeed(session)
@@ -624,6 +624,31 @@ export const make = Effect.gen(function* () {
                   new ServerAuthInvalidCredentialError({
                     diagnostic: `Managed access: ${denial}.`,
                   }),
+                ),
+          ),
+        );
+  // Binds a session redeemed from a pairing credential to its bridge record;
+  // a managed subject from any other issuer is revoked on the spot.
+  const claimManagedSession = <S extends { readonly sessionId: AuthSessionId }>(
+    credential: string,
+    subject: string,
+    session: S,
+  ): Effect.Effect<S, ServerAuthInvalidCredentialError> =>
+    managedAccessGate === undefined
+      ? Effect.succeed(session)
+      : managedAccessGate.claim(credential, subject, session.sessionId).pipe(
+          Effect.flatMap((denial) =>
+            denial === undefined
+              ? Effect.succeed(session)
+              : sessions.revoke(session.sessionId).pipe(
+                  Effect.ignore,
+                  Effect.andThen(
+                    Effect.fail(
+                      new ServerAuthInvalidCredentialError({
+                        diagnostic: `Managed access: ${denial}.`,
+                      }),
+                    ),
+                  ),
                 ),
           ),
         );
@@ -773,6 +798,7 @@ export const make = Effect.gen(function* () {
           })
           .pipe(
             Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
+            Effect.flatMap((session) => claimManagedSession(credential, grant.subject, session)),
           ),
       ),
       Effect.map(
@@ -853,6 +879,9 @@ export const make = Effect.gen(function* () {
               .pipe(
                 Effect.mapError(
                   (cause) => new ServerAuthAuthenticatedAccessTokenIssueError({ cause }),
+                ),
+                Effect.flatMap((session) =>
+                  claimManagedSession(credential, grant.subject, session),
                 ),
               );
           }),

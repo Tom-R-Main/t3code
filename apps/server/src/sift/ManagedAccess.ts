@@ -79,9 +79,28 @@ export const attemptKey = (binding: typeof SiftBinding.Type, accessEpoch: number
     }),
   );
 
-export const ensureAccessEpochTable = Effect.gen(function* () {
+export const ensureManagedAccessTables = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`CREATE TABLE IF NOT EXISTS sift_managed_access_epoch (slot INTEGER PRIMARY KEY CHECK (slot = 1), epoch INTEGER NOT NULL)`;
+  // One row per attach. The session id is recorded when the one-time credential
+  // is redeemed, so a managed subject is honoured only on the session the
+  // bridge's own credential produced, never on one signed by another path.
+  yield* sql`CREATE TABLE IF NOT EXISTS sift_managed_access_grants (credential_hash TEXT PRIMARY KEY, subject TEXT NOT NULL, session_id TEXT UNIQUE, created_at TEXT NOT NULL)`;
+});
+
+export const credentialHash = (credential: string) =>
+  digest(`sift-managed-credential:${credential}`);
+
+/** Records a bridge-issued credential; called by the bridge under its mutex. */
+export const recordManagedGrant = (credential: string, subject: string, createdAt: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`INSERT INTO sift_managed_access_grants (credential_hash, subject, created_at) VALUES (${credentialHash(credential)}, ${subject}, ${createdAt})`;
+  });
+
+export const clearManagedGrants = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`DELETE FROM sift_managed_access_grants`;
 });
 
 export const readAccessEpoch = Effect.gen(function* () {
@@ -389,11 +408,26 @@ interface ManagedSessionIdentity {
   readonly subject: string;
 }
 
-/** Validates a session against managed mode: its subject, deadline, and the current attempt. */
-const resolvePrincipal = (session: Pick<ManagedSessionIdentity, "subject">) =>
+const isRecordedSession = (session: ManagedSessionIdentity) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<{
+      subject: string;
+    }>`SELECT subject FROM sift_managed_access_grants WHERE session_id = ${session.sessionId}`;
+    return rows.length === 1 && rows[0]!.subject === session.subject;
+  }).pipe(Effect.orElseSucceed(() => false));
+
+/**
+ * Validates a session against managed mode: it was redeemed from a bridge
+ * attach with this exact subject, its deadline has not passed, and it names
+ * the current attempt.
+ */
+const resolvePrincipal = (session: ManagedSessionIdentity) =>
   Effect.gen(function* () {
     const subject = parseManagedSubject(session.subject);
     if (!subject) return yield* deny("managed mode accepts only Sift-issued credentials");
+    if (!(yield* isRecordedSession(session)))
+      return yield* deny("the session was not issued through the Sift bridge");
     if ((yield* Clock.currentTimeMillis) >= subject.notAfterMs)
       return yield* deny("the managed credential expired");
     const attempt = yield* readCurrentAttempt;
@@ -419,17 +453,44 @@ const allowedHttpRoute = (attempt: ManagedAttempt, method: string, pathname: str
   return false;
 };
 
+export interface ManagedHttpGate {
+  /** Yields a denial reason, or undefined to allow. */
+  readonly authorize: (
+    session: ManagedSessionIdentity,
+    route: { readonly method: string; readonly url: string },
+  ) => Effect.Effect<Denial | undefined>;
+  /**
+   * Binds a freshly redeemed session to the bridge record for its credential.
+   * Yields a denial reason for a managed subject without a matching, unclaimed
+   * record; other subjects are left to `authorize`.
+   */
+  readonly claim: (
+    credential: string,
+    subject: string,
+    sessionId: AuthSessionId,
+  ) => Effect.Effect<Denial | undefined>;
+}
+
 /**
- * Returns undefined outside managed mode, so EnvironmentAuth is unchanged. In
- * managed mode, returns a check yielding a denial reason, or undefined to allow.
+ * Returns undefined outside managed mode, so EnvironmentAuth is unchanged.
  */
 export const makeHttpGate = Effect.gen(function* () {
   if (!isManagedAccessEnabled()) return undefined;
   const sql = yield* SqlClient.SqlClient;
-  return (
-    session: Pick<ManagedSessionIdentity, "subject">,
-    route: { readonly method: string; readonly url: string },
-  ): Effect.Effect<Denial | undefined> =>
+  const claim: ManagedHttpGate["claim"] = (credential, subject, sessionId) =>
+    isManagedSubject(subject)
+      ? Effect.gen(function* () {
+          const hash = credentialHash(credential);
+          yield* sql`UPDATE sift_managed_access_grants SET session_id = ${sessionId} WHERE credential_hash = ${hash} AND subject = ${subject} AND session_id IS NULL`;
+          const rows = yield* sql<{
+            session_id: string | null;
+          }>`SELECT session_id FROM sift_managed_access_grants WHERE credential_hash = ${hash}`;
+          return rows[0]?.session_id === sessionId
+            ? undefined
+            : "the credential was not issued through the Sift bridge";
+        }).pipe(Effect.orElseSucceed(() => "the credential could not be verified"))
+      : Effect.succeed(undefined);
+  const authorize: ManagedHttpGate["authorize"] = (session, route) =>
     resolvePrincipal(session).pipe(
       Effect.flatMap(({ attempt }) => {
         let pathname: string;
@@ -445,6 +506,7 @@ export const makeHttpGate = Effect.gen(function* () {
       Effect.catch((reason: Denial) => Effect.succeed(reason)),
       Effect.provideService(SqlClient.SqlClient, sql),
     );
+  return { authorize, claim } satisfies ManagedHttpGate;
 });
 
 export interface ManagedRpcGuard {

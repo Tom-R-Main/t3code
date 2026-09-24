@@ -546,6 +546,7 @@ it.effect("rejects a session redeemed from a listed link while detach is revokin
       // after the session list was read: the list it returns omits that session.
       const sessions = yield* SessionStore.SessionStore;
       let raced: { readonly token: string; readonly sessionId: string } | undefined;
+      let redemptionAttempted = false;
       const racingAuth: typeof auth = {
         ...auth,
         listPairingLinks: (input) =>
@@ -561,7 +562,13 @@ it.effect("rejects a session redeemed from a listed link while detach is revokin
                       }),
                     ),
                   ),
-                  Effect.orDie,
+                  // Refusing the redemption outright is also a correct outcome.
+                  Effect.ignore,
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      redemptionAttempted = true;
+                    }),
+                  ),
                 ),
             ),
           ),
@@ -579,12 +586,67 @@ it.effect("rejects a session redeemed from a listed link while detach is revokin
       );
       const detached = yield* handle({ ...request, operation: "detach" });
       expect(detached.ok).toBe(true);
-      if (raced === undefined) throw new Error("The race did not run");
+      expect(redemptionAttempted).toBe(true);
+      if (raced !== undefined) {
+        const session = yield* auth
+          .authenticateHttpRequest(httpRequest(raced.token, "GET", "/api/auth/session"))
+          .pipe(Effect.exit);
+        expect(Exit.isFailure(session)).toBe(true);
+      }
+    }).pipe(Effect.provide(testLayer(directory)));
+  }).pipe(Effect.scoped),
+);
 
-      const session = yield* auth
-        .authenticateHttpRequest(httpRequest(raced.token, "GET", "/api/auth/session"))
-        .pipe(Effect.exit);
-      expect(Exit.isFailure(session)).toBe(true);
+it.effect("accepts managed subjects only from sessions redeemed from a bridge attach", () =>
+  Effect.gen(function* () {
+    yield* managedMode(true);
+    const directory = yield* tempDirectory("sift-managed-forged-");
+    yield* Effect.gen(function* () {
+      const { auth, token, session } = yield* bindAndAttach(directory, "reviewer", 60);
+      const subject = parseManagedSubject(session.subject)!;
+      const authenticates = (bearer: string) =>
+        auth
+          .authenticateHttpRequest(httpRequest(bearer, "GET", "/api/auth/session"))
+          .pipe(Effect.exit, Effect.map(Exit.isSuccess));
+      const rpcAllowed = (sessionId: AuthSessionId, forgedSubject: string) =>
+        makeRpcGuard({ sessionId, subject: forgedSubject }).pipe(
+          Effect.flatMap((guard) =>
+            guard!.authorize(ORCHESTRATION_WS_METHODS.subscribeThread, { threadId }),
+          ),
+          Effect.exit,
+          Effect.map(Exit.isSuccess),
+        );
+
+      // The bridge-issued session keeps working.
+      expect(yield* authenticates(token)).toBe(true);
+      expect(yield* rpcAllowed(session.sessionId, session.subject)).toBe(true);
+
+      // The auth CLI can sign a session with any subject. Copy the attempt key,
+      // escalate the role, and extend the deadline, or copy the subject verbatim.
+      const escalated = encodeManagedSubject({
+        role: "operator",
+        attemptKey: subject.attemptKey,
+        notAfterMs: subject.notAfterMs + 24 * 60 * 60 * 1000,
+      });
+      for (const forgedSubject of [escalated, session.subject]) {
+        const forged = yield* auth.issueSession({
+          subject: forgedSubject,
+          scopes: ["orchestration:read", "orchestration:operate", "review:write"],
+        });
+        expect(yield* authenticates(forged.token)).toBe(false);
+        expect(yield* rpcAllowed(forged.sessionId, forgedSubject)).toBe(false);
+
+        // A pairing link minted outside the bridge cannot be redeemed into one either.
+        const link = yield* auth.createPairingLink({
+          subject: forgedSubject,
+          scopes: ["orchestration:read", "orchestration:operate", "review:write"],
+        });
+        const redeemed = yield* auth
+          .exchangeBootstrapCredentialForAccessToken(link.credential, undefined, requestMetadata)
+          .pipe(Effect.exit);
+        if (Exit.isSuccess(redeemed))
+          expect(yield* authenticates(redeemed.value.access_token)).toBe(false);
+      }
     }).pipe(Effect.provide(testLayer(directory)));
   }).pipe(Effect.scoped),
 );
