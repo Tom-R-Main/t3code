@@ -38,6 +38,7 @@ import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
+import { makeHttpGate as makeManagedAccessGate } from "../sift/ManagedAccess.ts";
 import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
@@ -607,6 +608,25 @@ export const make = Effect.gen(function* () {
   const descriptor = yield* policy.getDescriptor();
   const config = yield* ServerConfig.ServerConfig;
   const devAuth = resolveReusableDevAuth(config);
+  // Fork: Sift managed access. Undefined unless T3_SIFT_MANAGED_ACCESS=1.
+  const managedAccessGate = yield* makeManagedAccessGate;
+  const enforceManagedAccess = (
+    request: HttpServerRequest.HttpServerRequest,
+    session: AuthenticatedSession,
+  ): Effect.Effect<AuthenticatedSession, ServerAuthInvalidCredentialError> =>
+    managedAccessGate === undefined
+      ? Effect.succeed(session)
+      : managedAccessGate(session, { method: request.method, url: request.url }).pipe(
+          Effect.flatMap((denial) =>
+            denial === undefined
+              ? Effect.succeed(session)
+              : Effect.fail(
+                  new ServerAuthInvalidCredentialError({
+                    diagnostic: `Managed access: ${denial}.`,
+                  }),
+                ),
+          ),
+        );
 
   const authenticateToken = (
     token: string,
@@ -685,6 +705,7 @@ export const make = Effect.gen(function* () {
         }
         return Effect.succeed(session);
       }),
+      Effect.flatMap((session) => enforceManagedAccess(request, session)),
     );
   };
 
@@ -1087,6 +1108,7 @@ export const make = Effect.gen(function* () {
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
             })),
             mapSessionVerificationErrors,
+            Effect.flatMap((session) => enforceManagedAccess(request, session)),
           );
         }
       }
