@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt } from "./baseSchemas.ts";
 import { ModelSelection, ProviderUserInputAnswers } from "./orchestration.ts";
 
+export const SIFT_MANAGED_ACCESS_MAX_TTL_SECONDS = 12 * 60 * 60;
 const Identifier = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128));
 export const SiftBinding = Schema.Struct({
   runtimeId: Identifier,
@@ -38,6 +39,17 @@ export const SiftBridgeRequest = Schema.Union([
     requestId: Identifier,
     answers: ProviderUserInputAnswers,
   }),
+  // Mints a one-time pairing credential for a T3 client limited to this attempt.
+  // The server must run with T3_SIFT_MANAGED_ACCESS=1 or the bridge refuses.
+  Schema.Struct({
+    ...Base,
+    operation: Schema.Literal("attach"),
+    role: Schema.Literals(["reviewer", "operator"]),
+    ttlSeconds: PositiveInt.check(Schema.isLessThanOrEqualTo(SIFT_MANAGED_ACCESS_MAX_TTL_SECONDS)),
+    label: Schema.optional(Identifier),
+  }),
+  // Revokes every managed credential and session in this environment.
+  Schema.Struct({ ...Base, operation: Schema.Literal("detach") }),
   Schema.Struct({
     ...Base,
     operation: Schema.Literal("events"),

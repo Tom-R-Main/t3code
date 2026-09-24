@@ -38,6 +38,7 @@ import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
+import { makeHttpGate as makeManagedAccessGate } from "../sift/ManagedAccess.ts";
 import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
@@ -607,6 +608,50 @@ export const make = Effect.gen(function* () {
   const descriptor = yield* policy.getDescriptor();
   const config = yield* ServerConfig.ServerConfig;
   const devAuth = resolveReusableDevAuth(config);
+  // Fork: Sift managed access. Undefined unless T3_SIFT_MANAGED_ACCESS=1.
+  const managedAccessGate = yield* makeManagedAccessGate;
+  const enforceManagedAccess = (
+    request: HttpServerRequest.HttpServerRequest,
+    session: AuthenticatedSession,
+  ): Effect.Effect<AuthenticatedSession, ServerAuthInvalidCredentialError> =>
+    managedAccessGate === undefined
+      ? Effect.succeed(session)
+      : managedAccessGate.authorize(session, { method: request.method, url: request.url }).pipe(
+          Effect.flatMap((denial) =>
+            denial === undefined
+              ? Effect.succeed(session)
+              : Effect.fail(
+                  new ServerAuthInvalidCredentialError({
+                    diagnostic: `Managed access: ${denial}.`,
+                  }),
+                ),
+          ),
+        );
+  // Binds a session redeemed from a pairing credential to its bridge record;
+  // a managed subject from any other issuer is revoked on the spot.
+  const claimManagedSession = <S extends { readonly sessionId: AuthSessionId }>(
+    credential: string,
+    subject: string,
+    session: S,
+  ): Effect.Effect<S, ServerAuthInvalidCredentialError> =>
+    managedAccessGate === undefined
+      ? Effect.succeed(session)
+      : managedAccessGate.claim(credential, subject, session.sessionId).pipe(
+          Effect.flatMap((denial) =>
+            denial === undefined
+              ? Effect.succeed(session)
+              : sessions.revoke(session.sessionId).pipe(
+                  Effect.ignore,
+                  Effect.andThen(
+                    Effect.fail(
+                      new ServerAuthInvalidCredentialError({
+                        diagnostic: `Managed access: ${denial}.`,
+                      }),
+                    ),
+                  ),
+                ),
+          ),
+        );
 
   const authenticateToken = (
     token: string,
@@ -685,6 +730,7 @@ export const make = Effect.gen(function* () {
         }
         return Effect.succeed(session);
       }),
+      Effect.flatMap((session) => enforceManagedAccess(request, session)),
     );
   };
 
@@ -752,6 +798,7 @@ export const make = Effect.gen(function* () {
           })
           .pipe(
             Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })),
+            Effect.flatMap((session) => claimManagedSession(credential, grant.subject, session)),
           ),
       ),
       Effect.map(
@@ -832,6 +879,9 @@ export const make = Effect.gen(function* () {
               .pipe(
                 Effect.mapError(
                   (cause) => new ServerAuthAuthenticatedAccessTokenIssueError({ cause }),
+                ),
+                Effect.flatMap((session) =>
+                  claimManagedSession(credential, grant.subject, session),
                 ),
               );
           }),
@@ -1087,6 +1137,7 @@ export const make = Effect.gen(function* () {
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
             })),
             mapSessionVerificationErrors,
+            Effect.flatMap((session) => enforceManagedAccess(request, session)),
           );
         }
       }

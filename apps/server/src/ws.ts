@@ -150,6 +150,7 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { requiredScopeForRpcMethod, requiredScopeForDeviceList } from "./auth/RpcAuthorization.ts";
+import * as SiftManagedAccess from "./sift/ManagedAccess.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -3783,7 +3784,8 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "server" },
           ),
       });
-    }),
+      // Fork: Sift managed access. Leaves the handlers unchanged unless enabled.
+    }).pipe(SiftManagedAccess.withRpcGuard(currentSession)),
   );
 
 export const websocketRpcRouteLayer = Layer.unwrap(
