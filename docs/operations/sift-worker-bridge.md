@@ -62,17 +62,75 @@ native T3 client answering in the moment between this check and dispatch can
 still produce a second provider response, which T3 records as a stale failure.
 `answer` has no such projection and is not deduplicated across clients.
 
+## Managed access
+
+Set `T3_SIFT_MANAGED_ACCESS=1` when the host provisions the environment for one
+assignment. Without it, nothing below runs and T3 authentication is unchanged.
+With it, T3 serves only clients holding a credential the host minted for the
+current attempt; every other session, including administrative and CLI-issued
+ones, is rejected at authentication and at each RPC.
+
+`attach` (`role`, `ttlSeconds` up to 12 hours, optional `label`) returns a
+one-time T3 pairing credential. Any client redeems it through the normal pairing
+flow (`/pair?token=`, `/api/auth/browser-session`, or `/oauth/token`). The
+credential expires after `min(ttlSeconds, 15 minutes)` if unused. The session it
+creates carries a signed subject of the form
+`sift-managed:v1:<role>:<attempt>:<deadline>`, where `<attempt>` is the SHA-256
+of the runtime ID, work item ID, and lease generation. `attach` fails with
+`MANAGED_ACCESS_DISABLED` when managed mode is off, because the same scopes
+would otherwise apply to the whole environment.
+
+Each HTTP request and RPC checks that the subject parses, that its deadline has
+not passed, that its attempt is the ready binding, and, for RPCs, that the
+session has not been revoked. `detach` revokes every managed pairing link and
+session. A rebind to a new lease generation does the same before the generation
+is marked ready. Revocation and the deadline also end open subscription streams.
+
+Roles:
+
+- `reviewer` (scopes `orchestration:read`, `review:write`): the shell, the bound
+  thread's subscription and diffs, server config and lifecycle streams, VCS
+  status, review diff previews, and file listing, search, and reads inside the
+  checkout. Paths must be relative, and reads resolve symlinks and must stay
+  inside the checkout.
+- `operator` (adds `orchestration:operate`): everything a reviewer has, plus
+  `orchestration.dispatchCommand` for the bound thread only, limited to
+  `thread.turn.start`, `thread.turn.interrupt`, `thread.approval.respond`,
+  `thread.user-input.respond`, `thread.user-input.dismiss`, and
+  `thread.session.stop`. A turn must keep the bound runtime mode and model and
+  cannot carry attachments, a bootstrap (thread or worktree creation), or a plan
+  from another thread.
+
+Every other RPC is refused for both roles, including terminals, provider
+install, update, and authentication, settings and keybindings, process signals,
+project, thread, and worktree creation, file writes, filesystem browsing,
+source control and pull request actions, previews, devices, and access
+management. An RPC that upstream adds later is refused until it is listed. Over
+HTTP a managed session may reach only `GET /api/auth/session`,
+`POST /api/auth/websocket-ticket`, `GET /ws`, and
+`GET /api/orchestration/threads/<bound thread>`.
+
+The environment is expected to hold only the bridge's project and thread. The
+shell subscription is not filtered, so any other project or thread created
+before managed mode was enabled remains visible in it. Attachment uploads and
+images served over HTTP are unavailable to managed clients.
+
 ## Keeping the fork current
 
 Fork changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,
-the layer entry in `apps/server/src/server.ts`, and one harness hook. Merge
+the layer entry in `apps/server/src/server.ts`, and one harness hook. Managed
+access adds two hooks in upstream files: `makeHttpGate` in
+`apps/server/src/auth/EnvironmentAuth.ts` (applied after token verification and
+WebSocket ticket verification) and `withRpcGuard` around the handler object in
+`apps/server/src/ws.ts`. The guard calls each handler before authorizing it and
+relies on handlers building their effects lazily, as they do today. Merge
 `origin/main` into the fork branch before each image build, then run:
 
 ```bash
 vp run --filter t3 typecheck
 vp run --filter @t3tools/contracts typecheck
-(cd apps/server && vp test run src/sift integration/siftBridge.integration.test.ts)
+(cd apps/server && vp test run src/auth src/sift integration/siftBridge.integration.test.ts)
 ```
 
 A conflict-free merge is not enough: upstream API changes surface only in the
