@@ -28,6 +28,9 @@ import { OrchestrationEngineService } from "../orchestration/Services/Orchestrat
 import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
 import {
   MANAGED_ROLE_SCOPES,
+  advanceAccessEpoch,
+  ensureAccessEpochTable,
+  readAccessEpoch,
   assignmentIds,
   attemptKey,
   encodeManagedSubject,
@@ -67,7 +70,11 @@ export const makeSiftBridge = Effect.gen(function* () {
   const mutex = yield* Semaphore.make(1);
   // Present in the server; absent in engine-only harnesses, where attach fails.
   const environmentAuth = yield* Effect.serviceOption(EnvironmentAuth);
+  yield* ensureAccessEpochTable;
   const revokeManagedCredentials = Effect.gen(function* () {
+    // Invalidate first: a link redeemed while the lists below are read yields a
+    // session for a superseded epoch, which every check already rejects.
+    yield* advanceAccessEpoch.pipe(Effect.provideService(SqlClient.SqlClient, sql));
     if (Option.isNone(environmentAuth)) return { revokedPairingLinks: 0, revokedSessions: 0 };
     const auth = environmentAuth.value;
     const links = (yield* auth.listPairingLinks({ excludeSubjects: [] })).filter((link) =>
@@ -245,7 +252,10 @@ export const makeSiftBridge = Effect.gen(function* () {
         scopes: MANAGED_ROLE_SCOPES[request.role],
         subject: encodeManagedSubject({
           role: request.role,
-          attemptKey: attemptKey(request.binding),
+          attemptKey: attemptKey(
+            request.binding,
+            yield* readAccessEpoch.pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+          ),
           notAfterMs,
         }),
         label: request.label ?? `Sift ${request.role}`,

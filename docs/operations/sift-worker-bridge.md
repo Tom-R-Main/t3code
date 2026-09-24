@@ -76,14 +76,16 @@ flow (`/pair?token=`, `/api/auth/browser-session`, or `/oauth/token`). The
 credential expires after `min(ttlSeconds, 15 minutes)` if unused. The session it
 creates carries a signed subject of the form
 `sift-managed:v1:<role>:<attempt>:<deadline>`, where `<attempt>` is the SHA-256
-of the runtime ID, work item ID, and lease generation. `attach` fails with
+of the runtime ID, work item ID, lease generation, and an access epoch. `attach` fails with
 `MANAGED_ACCESS_DISABLED` when managed mode is off, because the same scopes
 would otherwise apply to the whole environment.
 
 Each HTTP request and RPC checks that the subject parses, that its deadline has
 not passed, that its attempt is the ready binding, and, for RPCs, that the
 session has not been revoked. `detach` revokes every managed pairing link and
-session. A rebind to a new lease generation does the same before the generation
+session. It first advances the access epoch, so a link redeemed while revocation
+is in progress yields a session for a superseded attempt that every check
+rejects. A rebind to a new lease generation does the same before the generation
 is marked ready. Revocation and the deadline also end open subscription streams.
 
 Roles:
@@ -92,7 +94,11 @@ Roles:
   thread's subscription and diffs, server config and lifecycle streams, VCS
   status, review diff previews, and file listing, search, and reads inside the
   checkout. Paths must be relative, and reads resolve symlinks and must stay
-  inside the checkout.
+  inside the checkout. VCS status and review diffs require `cwd` to be the
+  checkout and the checkout to be its own Git top level, because those services
+  read the whole repository from its root; a checkout nested in a larger
+  repository gets no VCS access. Review refs must be plain branch names or
+  hashes (no leading `-`, `..`, `@{`, or other revision syntax).
 - `operator` (adds `orchestration:operate`): everything a reviewer has, plus
   `orchestration.dispatchCommand` for the bound thread only, limited to
   `thread.turn.start`, `thread.turn.interrupt`, `thread.approval.respond`,

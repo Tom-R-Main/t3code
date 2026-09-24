@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -24,6 +25,7 @@ import { ServerConfig } from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
@@ -160,6 +162,8 @@ it.effect("confines each role to its methods, the bound thread, and the checkout
       await NodeFSP.symlink(NodePath.join(outside, "secret.txt"), NodePath.join(checkout, "link"));
       return checkout;
     });
+    // Review diffs require the checkout to be its own repository root.
+    git(checkout, "init", "-q");
     const attempt: ManagedAttempt = {
       attemptKey: "a".repeat(64),
       threadId,
@@ -402,6 +406,185 @@ it.effect("rejects managed RPCs after expiry, detach, and rebind", () =>
         ttlSeconds: 60,
       });
       expect(!staleAttach.ok && staleAttach.error.code).toBe("BINDING_CONFLICT");
+    }).pipe(Effect.provide(testLayer(directory)));
+  }).pipe(Effect.scoped),
+);
+
+const git = (cwd: string, ...args: ReadonlyArray<string>) =>
+  NodeChildProcess.execFileSync("git", ["-c", "commit.gpgsign=false", ...args], {
+    cwd,
+    stdio: "pipe",
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t",
+      GIT_AUTHOR_EMAIL: "t@example.invalid",
+      GIT_COMMITTER_NAME: "t",
+      GIT_COMMITTER_EMAIL: "t@example.invalid",
+    },
+  });
+
+const policyAttempt = (checkoutPath: string): ManagedAttempt => ({
+  attemptKey: "a".repeat(64),
+  threadId,
+  projectId: ProjectId.make(threadId),
+  checkoutPath,
+  // Same shape as the decoded value; the instance id brand is type-level only.
+  modelSelection: modelSelection as unknown as ManagedAttempt["modelSelection"],
+  runtimeMode: "approval-required",
+});
+
+it.effect("refuses VCS reads when the checkout is not its repository root", () =>
+  Effect.gen(function* () {
+    const outer = yield* tempDirectory("sift-managed-nested-");
+    const repo = yield* Effect.promise(() => NodeFSP.realpath(outer));
+    const checkout = NodePath.join(repo, "checkout");
+    yield* Effect.promise(async () => {
+      await NodeFSP.mkdir(checkout);
+      await NodeFSP.writeFile(NodePath.join(checkout, "inside.txt"), "a");
+      await NodeFSP.writeFile(NodePath.join(repo, "outside.txt"), "a");
+    });
+    git(repo, "init", "-q");
+    git(repo, "add", ".");
+    git(repo, "commit", "-q", "-m", "init");
+    yield* Effect.promise(() => NodeFSP.writeFile(NodePath.join(repo, "outside.txt"), "secret"));
+    const nested = policyAttempt(checkout);
+    const allowed = (method: string, payload: unknown, attempt = nested) =>
+      authorizeManagedRpc("reviewer", attempt, method, payload).pipe(
+        Effect.exit,
+        Effect.map(Exit.isSuccess),
+      );
+    for (const method of [
+      WS_METHODS.reviewGetDiffPreview,
+      WS_METHODS.subscribeVcsStatus,
+      WS_METHODS.vcsRefreshStatus,
+    ])
+      expect(yield* allowed(method, { cwd: checkout })).toBe(false);
+    expect(
+      yield* allowed(WS_METHODS.reviewGetDiffFileContents, {
+        cwd: checkout,
+        sourceKind: "working-tree",
+        changeType: "change",
+        baseRef: null,
+        headRef: null,
+        oldPath: "inside.txt",
+        newPath: "inside.txt",
+      }),
+    ).toBe(false);
+
+    // A checkout that is its own repository root keeps review access.
+    git(checkout, "init", "-q");
+    const root = policyAttempt(checkout);
+    expect(yield* allowed(WS_METHODS.reviewGetDiffPreview, { cwd: checkout }, root)).toBe(true);
+    // Subdirectories of the root are refused: the diff service would widen to the root anyway.
+    yield* Effect.promise(() => NodeFSP.mkdir(NodePath.join(checkout, "sub")));
+    expect(
+      yield* allowed(WS_METHODS.subscribeVcsStatus, { cwd: NodePath.join(checkout, "sub") }, root),
+    ).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("refuses review refs that git could parse as options or revision expressions", () =>
+  Effect.gen(function* () {
+    const directory = yield* tempDirectory("sift-managed-refs-");
+    const checkout = yield* Effect.promise(() => NodeFSP.realpath(directory));
+    git(checkout, "init", "-q");
+    const attempt = policyAttempt(checkout);
+    const allowed = (method: string, payload: unknown) =>
+      authorizeManagedRpc("reviewer", attempt, method, payload).pipe(
+        Effect.exit,
+        Effect.map(Exit.isSuccess),
+      );
+    const target = NodePath.join(checkout, "overwritten");
+    for (const baseRef of [`--output=${target}`, "-p", "main..other", "HEAD@{1}", "a b", "x:y"]) {
+      expect(yield* allowed(WS_METHODS.reviewGetDiffPreview, { cwd: checkout, baseRef })).toBe(
+        false,
+      );
+      expect(
+        yield* allowed(WS_METHODS.reviewGetDiffFileContents, {
+          cwd: checkout,
+          sourceKind: "branch-range",
+          changeType: "change",
+          baseRef: "main",
+          headRef: baseRef,
+          oldPath: "a",
+          newPath: "a",
+        }),
+      ).toBe(false);
+    }
+    for (const baseRef of ["main", "origin/main", "release-1.2", "0123abcd"])
+      expect(yield* allowed(WS_METHODS.reviewGetDiffPreview, { cwd: checkout, baseRef })).toBe(
+        true,
+      );
+  }).pipe(Effect.scoped),
+);
+
+it.effect("rejects a session redeemed from a listed link while detach is revoking", () =>
+  Effect.gen(function* () {
+    yield* managedMode(true);
+    const directory = yield* tempDirectory("sift-managed-race-");
+    yield* Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const setup = yield* makeSiftBridge;
+      yield* setup({
+        ...request,
+        operation: "bind",
+        checkoutPath: directory,
+        modelSelection,
+        runtimeMode: "approval-required",
+      });
+      const attached = yield* setup({
+        ...request,
+        operation: "attach",
+        role: "operator",
+        ttlSeconds: 600,
+      });
+      if (!attached.ok || !("credential" in attached.result)) throw new Error("Attach failed");
+      const credential = attached.result.credential;
+
+      // Detach lists links, revokes them, then lists sessions. Model a client that
+      // consumes a listed link before its revocation and whose session row lands
+      // after the session list was read: the list it returns omits that session.
+      const sessions = yield* SessionStore.SessionStore;
+      let raced: { readonly token: string; readonly sessionId: string } | undefined;
+      const racingAuth: typeof auth = {
+        ...auth,
+        listPairingLinks: (input) =>
+          auth.listPairingLinks(input).pipe(
+            Effect.tap(() =>
+              auth
+                .exchangeBootstrapCredentialForAccessToken(credential, undefined, requestMetadata)
+                .pipe(
+                  Effect.flatMap((token) =>
+                    sessions.verify(token.access_token).pipe(
+                      Effect.map((session) => {
+                        raced = { token: token.access_token, sessionId: session.sessionId };
+                      }),
+                    ),
+                  ),
+                  Effect.orDie,
+                ),
+            ),
+          ),
+        listSessions: () =>
+          auth
+            .listSessions()
+            .pipe(
+              Effect.map((listed) =>
+                listed.filter((session) => session.sessionId !== raced?.sessionId),
+              ),
+            ),
+      };
+      const handle = yield* makeSiftBridge.pipe(
+        Effect.provideService(EnvironmentAuth.EnvironmentAuth, racingAuth),
+      );
+      const detached = yield* handle({ ...request, operation: "detach" });
+      expect(detached.ok).toBe(true);
+      if (raced === undefined) throw new Error("The race did not run");
+
+      const session = yield* auth
+        .authenticateHttpRequest(httpRequest(raced.token, "GET", "/api/auth/session"))
+        .pipe(Effect.exit);
+      expect(Exit.isFailure(session)).toBe(true);
     }).pipe(Effect.provide(testLayer(directory)));
   }).pipe(Effect.scoped),
 );

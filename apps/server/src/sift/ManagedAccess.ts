@@ -1,7 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -62,15 +64,38 @@ export const assignmentIds = (binding: { runtimeId: string; workItemId: string }
   return { threadId: ThreadId.make(prefix), projectId: ProjectId.make(prefix) };
 };
 
-/** One attempt is one lease generation of one assignment. */
-export const attemptKey = (binding: typeof SiftBinding.Type): string =>
+/**
+ * One attempt is one lease generation of one assignment. The access epoch
+ * advances on every revocation, before any credential is revoked, so a session
+ * redeemed from a pre-revocation link can never name the current attempt.
+ */
+export const attemptKey = (binding: typeof SiftBinding.Type, accessEpoch: number): string =>
   digest(
     canonical({
       runtimeId: binding.runtimeId,
       workItemId: binding.workItemId,
       leaseGeneration: binding.leaseGeneration,
+      accessEpoch,
     }),
   );
+
+export const ensureAccessEpochTable = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`CREATE TABLE IF NOT EXISTS sift_managed_access_epoch (slot INTEGER PRIMARY KEY CHECK (slot = 1), epoch INTEGER NOT NULL)`;
+});
+
+export const readAccessEpoch = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{
+    epoch: number;
+  }>`SELECT epoch FROM sift_managed_access_epoch WHERE slot = 1`;
+  return rows[0]?.epoch ?? 0;
+});
+
+export const advanceAccessEpoch = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO sift_managed_access_epoch (slot, epoch) VALUES (1, 1) ON CONFLICT(slot) DO UPDATE SET epoch = epoch + 1`;
+});
 
 // The session subject is covered by the session token's signature, and pairing
 // grants copy it into every session they create, so it carries the attempt and
@@ -128,8 +153,9 @@ export const readCurrentAttempt: Effect.Effect<
   if (!row) return Option.none<ManagedAttempt>();
   const stored = yield* decodeStoredBinding(row.payload);
   if (row.ready_generation !== stored.binding.leaseGeneration) return Option.none<ManagedAttempt>();
+  const epoch = yield* readAccessEpoch;
   return Option.some({
-    attemptKey: attemptKey(stored.binding),
+    attemptKey: attemptKey(stored.binding, epoch),
     ...assignmentIds(stored.binding),
     checkoutPath: stored.checkoutPath,
     modelSelection: stored.modelSelection,
@@ -186,6 +212,55 @@ const requireWorkspaceFile = (attempt: ManagedAttempt, cwd: unknown, path: unkno
         : deny("path is outside the assignment checkout"),
     ),
   );
+
+const execFile = NodeUtil.promisify(NodeChildProcess.execFile);
+// Ambient GIT_* variables could point git at another repository.
+const gitEnvironment = () =>
+  Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+
+/**
+ * VCS services resolve the repository root from `cwd` and read the whole
+ * repository from there, so a checkout nested in a larger repository would
+ * expose changes outside it. Only the checkout itself is accepted, and only
+ * when it is its own repository's top level.
+ */
+const requireRepositoryRoot = (attempt: ManagedAttempt, cwd: unknown) =>
+  typeof cwd === "string" && NodePath.isAbsolute(cwd)
+    ? Effect.tryPromise(async () => {
+        if ((await NodeFSP.realpath(cwd)) !== attempt.checkoutPath) return false;
+        const { stdout } = await execFile(
+          "git",
+          ["-C", attempt.checkoutPath, "rev-parse", "--show-toplevel"],
+          { env: gitEnvironment(), timeout: 10_000 },
+        );
+        return (await NodeFSP.realpath(stdout.trim())) === attempt.checkoutPath;
+      }).pipe(
+        Effect.orElseSucceed(() => false),
+        Effect.flatMap((isRoot) =>
+          isRoot ? allow : deny("VCS access requires the checkout to be its repository root"),
+        ),
+      )
+    : deny("cwd is outside the assignment checkout");
+
+/**
+ * Refs reach git as arguments before `--`, so anything git could read as an
+ * option or a revision expression is refused: branch-like names and hashes only.
+ */
+const isPlainRef = (ref: string) =>
+  ref.length <= 255 &&
+  /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(ref) &&
+  !ref.includes("..") &&
+  !ref.includes("//") &&
+  !ref.endsWith("/") &&
+  !ref.endsWith(".") &&
+  !ref.endsWith(".lock");
+
+const requirePlainRefs = (...refs: ReadonlyArray<unknown>) =>
+  refs.every(
+    (ref) => ref === null || ref === undefined || (typeof ref === "string" && isPlainRef(ref)),
+  )
+    ? allow
+    : deny("refs must be plain branch names or commit hashes");
 
 const requireRelativePaths = (...paths: ReadonlyArray<unknown>) =>
   paths.every((path) => path === null || path === undefined || isRelativeInside(path))
@@ -248,6 +323,8 @@ const always: RpcRule = () => allow;
 const boundThread: RpcRule = requireBoundThread;
 const workspaceCwd: RpcRule = (attempt, payload) =>
   requireWorkspaceCwd(attempt, field(payload, "cwd"));
+const repositoryRoot: RpcRule = (attempt, payload) =>
+  requireRepositoryRoot(attempt, field(payload, "cwd"));
 
 const REVIEWER_RULES: Readonly<Record<string, RpcRule>> = {
   [ORCHESTRATION_WS_METHODS.subscribeShell]: always,
@@ -261,8 +338,8 @@ const REVIEWER_RULES: Readonly<Record<string, RpcRule>> = {
   [WS_METHODS.serverReportClientActivity]: always,
   [WS_METHODS.serverGetBackgroundPolicy]: always,
   [WS_METHODS.subscribeBackgroundPolicy]: always,
-  [WS_METHODS.subscribeVcsStatus]: workspaceCwd,
-  [WS_METHODS.vcsRefreshStatus]: workspaceCwd,
+  [WS_METHODS.subscribeVcsStatus]: repositoryRoot,
+  [WS_METHODS.vcsRefreshStatus]: repositoryRoot,
   [WS_METHODS.projectsSearchEntries]: workspaceCwd,
   [WS_METHODS.projectsSearchContents]: workspaceCwd,
   [WS_METHODS.projectsListEntries]: (attempt, payload) => {
@@ -275,13 +352,15 @@ const REVIEWER_RULES: Readonly<Record<string, RpcRule>> = {
     requireWorkspaceFile(attempt, field(payload, "cwd"), field(payload, "relativePath")),
   [WS_METHODS.reviewGetDiffPreview]: (attempt, payload) => {
     const file = field(payload, "file");
-    return requireWorkspaceCwd(attempt, field(payload, "cwd")).pipe(
+    return requirePlainRefs(field(payload, "baseRef")).pipe(
       Effect.andThen(requireRelativePaths(field(file, "path"), field(file, "previousPath"))),
+      Effect.andThen(requireRepositoryRoot(attempt, field(payload, "cwd"))),
     );
   },
   [WS_METHODS.reviewGetDiffFileContents]: (attempt, payload) =>
-    requireWorkspaceCwd(attempt, field(payload, "cwd")).pipe(
+    requirePlainRefs(field(payload, "baseRef"), field(payload, "headRef")).pipe(
       Effect.andThen(requireRelativePaths(field(payload, "oldPath"), field(payload, "newPath"))),
+      Effect.andThen(requireRepositoryRoot(attempt, field(payload, "cwd"))),
     ),
 };
 
