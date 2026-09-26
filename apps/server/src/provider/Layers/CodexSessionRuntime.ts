@@ -37,6 +37,7 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
+import { makeManagedCommandOwnership } from "./CodexManagedInterrupt.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -175,6 +176,8 @@ export interface CodexSessionRuntimeOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly cwd: string;
   readonly runtimeMode: RuntimeMode;
+  /** Sift requires command cleanup in addition to Codex's native turn interruption. */
+  readonly managedInterrupt?: boolean;
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
@@ -1379,6 +1382,12 @@ export const makeCodexSessionRuntime = (
       updatedAt: sessionCreatedAt,
     } satisfies ProviderSession;
     const sessionRef = yield* Ref.make<ProviderSession>(initialSession);
+    const managedOwnership = makeManagedCommandOwnership();
+    let managedInterruptActive = false;
+    let managedInterruptUnconfirmed = false;
+    let managedAdmissionEpoch = 0;
+    const managedInterruptedTurns = new Set<string>();
+    const managedTurnCompletions = new Map<string, CodexServerNotification>();
     const offerEvent = (event: ProviderEvent) => Queue.offer(events, event).pipe(Effect.asVoid);
 
     const emitEvent = (event: Omit<ProviderEvent, "id" | "provider" | "createdAt">) =>
@@ -1862,6 +1871,23 @@ export const makeCodexSessionRuntime = (
 
     const handleRawNotification = (notification: CodexServerNotification) =>
       Effect.gen(function* () {
+        if (options.managedInterrupt) {
+          const root = currentProviderThreadId(yield* Ref.get(sessionRef));
+          if (
+            notification.method === "turn/completed" &&
+            notification.params.threadId === root &&
+            managedInterruptedTurns.has(notification.params.turn.id)
+          ) {
+            managedTurnCompletions.set(notification.params.turn.id, notification);
+            return;
+          }
+          if (
+            (managedInterruptActive || managedInterruptUnconfirmed) &&
+            notification.method === "thread/status/changed" &&
+            notification.params.threadId === root
+          )
+            return;
+        }
         const isMemoryConsolidationNotification =
           suppressMemoryConsolidationNotification(notification);
 
@@ -2023,6 +2049,8 @@ export const makeCodexSessionRuntime = (
           if (providerThreadId && payload.threadId !== providerThreadId) {
             return Effect.void;
           }
+          if (options.managedInterrupt && managedInterruptedTurns.has(payload.turn.id))
+            return Effect.void;
           const lastError =
             payload.turn.status === "failed" && "error" in payload.turn && payload.turn.error
               ? payload.turn.error.message
@@ -2351,9 +2379,20 @@ export const makeCodexSessionRuntime = (
 
     const registerServerNotification = <M extends CodexRpc.ServerNotificationMethod>(method: M) =>
       client.handleServerNotification(method, (params) =>
-        Queue.offer(serverNotifications, makeCodexServerNotification(method, params)).pipe(
-          Effect.asVoid,
-        ),
+        Effect.gen(function* () {
+          if (options.managedInterrupt) {
+            const notification = makeCodexServerNotification(method, params);
+            const root = currentProviderThreadId(yield* Ref.get(sessionRef));
+            if (
+              notification.method === "turn/completed" &&
+              notification.params.threadId === root &&
+              managedInterruptedTurns.has(notification.params.turn.id)
+            )
+              managedTurnCompletions.set(notification.params.turn.id, notification);
+            managedOwnership.observe(method, params);
+          }
+          yield* Queue.offer(serverNotifications, makeCodexServerNotification(method, params));
+        }),
       );
 
     yield* Effect.forEach(
@@ -2500,6 +2539,14 @@ export const makeCodexSessionRuntime = (
       }),
       sendTurn: (input) =>
         Effect.gen(function* () {
+          const admissionEpoch = managedAdmissionEpoch;
+          if (managedInterruptActive || managedInterruptUnconfirmed) {
+            return yield* CodexErrors.CodexAppServerRequestError.internalError(
+              "Managed command termination is pending or unconfirmed; stop or reconcile the session before sending another turn.",
+              undefined,
+              { method: "turn/start" },
+            );
+          }
           const providerThreadId = yield* readProviderThreadId;
           if (hasConfiguredMcpServer(options.appServerArgs)) {
             yield* client.request("config/mcpServer/reload", undefined).pipe(
@@ -2530,6 +2577,17 @@ export const makeCodexSessionRuntime = (
               options.mcpCapabilities,
             ),
           });
+          if (
+            managedInterruptActive ||
+            managedInterruptUnconfirmed ||
+            admissionEpoch !== managedAdmissionEpoch
+          ) {
+            return yield* CodexErrors.CodexAppServerRequestError.internalError(
+              "Turn submission crossed a managed interruption; submit again after termination is confirmed.",
+              undefined,
+              { method: "turn/start" },
+            );
+          }
           const rawResponse = yield* client.raw.request("turn/start", params);
           const response = yield* decodeV2TurnStartResponse(rawResponse).pipe(
             Effect.mapError((error) =>
@@ -2562,6 +2620,119 @@ export const makeCodexSessionRuntime = (
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;
           const session = yield* Ref.get(sessionRef);
+          if (options.managedInterrupt) {
+            if (managedInterruptActive) return;
+            const effectiveTurnId = turnId ?? session.activeTurnId;
+            if (!effectiveTurnId || managedInterruptedTurns.has(effectiveTurnId)) return;
+            managedInterruptActive = true;
+            managedAdmissionEpoch++;
+            if (managedInterruptedTurns.size >= 4096) {
+              managedInterruptActive = false;
+              managedInterruptUnconfirmed = true;
+              yield* updateSession(sessionRef, {
+                status: "error",
+                lastError:
+                  "Managed interruption history limit reached; termination is unconfirmed.",
+              });
+              yield* emitSessionEvent(
+                "session/interrupt-unconfirmed",
+                "Managed interruption history limit reached; termination is unconfirmed.",
+              );
+              return;
+            }
+            managedInterruptedTurns.add(effectiveTurnId);
+            const targets = managedOwnership.targets(providerThreadId, effectiveTurnId);
+            const ownershipVerified = managedOwnership.verified(providerThreadId);
+            const interruptTarget = (threadId: string, targetTurnId: string) =>
+              client.request("turn/interrupt", { threadId, turnId: targetTurnId }).pipe(
+                Effect.asVoid,
+                Effect.catch((error): Effect.Effect<void, CodexErrors.CodexAppServerError> => {
+                  // Cancelling an open approval can finish the turn before this RPC.
+                  // Accept only this precise refusal AND the matching terminal event.
+                  if (
+                    error._tag === "CodexAppServerRequestError" &&
+                    error.code === -32600 &&
+                    error.errorMessage === "no active turn to interrupt"
+                  )
+                    return managedOwnership
+                      .awaitTerminals(new Map([[threadId, targetTurnId]]))
+                      .pipe(
+                        Effect.mapError(() =>
+                          CodexErrors.CodexAppServerRequestError.internalError(
+                            "Matching terminal receipt did not arrive after the completed-turn refusal.",
+                          ),
+                        ),
+                      );
+                  return Effect.fail(error);
+                }),
+              );
+            const result = yield* Effect.gen(function* () {
+              yield* settlePendingApprovals("cancel");
+              yield* settlePendingUserInputs({});
+              const children = yield* Effect.forEach(
+                [...targets].filter(
+                  ([threadId, targetTurnId]) =>
+                    threadId !== providerThreadId &&
+                    !managedOwnership.completed(threadId, targetTurnId),
+                ),
+                ([threadId, targetTurnId]) =>
+                  interruptTarget(threadId, targetTurnId).pipe(
+                    Effect.timeout("3 seconds"),
+                    Effect.result,
+                  ),
+                { concurrency: 8 },
+              ).pipe(Effect.timeoutOption("10 seconds"));
+              yield* interruptTarget(providerThreadId, effectiveTurnId).pipe(
+                Effect.timeout("10 seconds"),
+              );
+              if (
+                !ownershipVerified ||
+                children._tag === "None" ||
+                children.value.some((result) => result._tag === "Failure")
+              )
+                return {
+                  confirmed: false,
+                  reason: "Child ownership or interruption could not be confirmed.",
+                  terminated: 0,
+                };
+              yield* managedOwnership.awaitTerminals(targets);
+              return yield* managedOwnership.cleanup(client.raw, targets, providerThreadId);
+            }).pipe(
+              Effect.timeout("30 seconds"),
+              Effect.catchCause(() =>
+                Effect.succeed({
+                  confirmed: false,
+                  reason:
+                    "Managed interruption or command cleanup failed; termination is unconfirmed.",
+                  terminated: 0,
+                }),
+              ),
+            );
+            const completion = managedTurnCompletions.get(effectiveTurnId);
+            const confirmed = result.confirmed && completion !== undefined;
+            managedInterruptUnconfirmed = !confirmed;
+            managedInterruptActive = false;
+            yield* updateSession(sessionRef, {
+              status: confirmed ? "ready" : "error",
+              activeTurnId: undefined,
+              lastError: confirmed ? undefined : result.reason,
+            });
+            // The raw notification consumer may still have the terminal event
+            // queued. The cancellation marker suppresses it in either ordering.
+            if (confirmed && completion) {
+              yield* emitEvent({
+                kind: "notification",
+                threadId: options.threadId,
+                turnId: effectiveTurnId,
+                method: "turn/completed",
+                payload: completion.params,
+              });
+              yield* emitSessionEvent("session/ready", result.reason);
+            } else {
+              yield* emitSessionEvent("session/interrupt-unconfirmed", result.reason);
+            }
+            return;
+          }
           // Settle parked approvals FIRST. The transport answers server
           // requests inline on its stdin read loop, so a pending
           // command/file/app-permission prompt blocks every incoming message,

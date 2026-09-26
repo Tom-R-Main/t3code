@@ -146,9 +146,45 @@ images served over HTTP are unavailable to managed clients.
 
 ## Keeping the fork current
 
-Fork changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
+### Managed Codex interruption
+
+With `T3_SIFT_MANAGED_ACCESS=1`, interrupting Codex also reconciles commands
+owned by the interrupted provider turn. Native Codex interruption deliberately
+preserves background terminals. The managed adapter uses the experimental
+`thread/backgroundTerminals/list` and `terminate` APIs verified with Codex
+0.157.1, matching provider thread, turn, command item, and process identities.
+Earlier-turn terminals remain running. A child requires both provider-reported
+parent lineage and the parent's explicit started-activity turn. Children from
+older parent turns remain running; background commands from completed children
+of the interrupted assignment are included. Reassignment across parent turns
+without an unambiguous ownership transition fails closed. Command text, checkout
+paths, and host process names grant no cleanup authority. Ordinary unmanaged T3
+retains native Codex behavior.
+
+While reconciliation is pending, the adapter withholds the parent completion
+event and refuses new turns. It waits for actual matching provider turn-completed
+receipts before reconciling processes; an accepted interrupt alone never becomes
+a synthesized completion. Turns whose preparation crossed an interrupt must be
+submitted again. Missing ownership (including terminals inherited
+after reconnect without observed item history), changed execution, protocol
+errors, or bounded reconciliation exhaustion produce an explicit error stating
+that termination is unconfirmed. They do not restart or kill the provider.
+The user can explicitly stop the session; a successful managed interrupt keeps
+the session available for another turn. Same-turn commands are not independently
+registered retained services. Service ownership belongs in the workspace
+service-grant integration.
+
+Offline regression tests run the real runtime against a scripted provider that
+owns disposable processes. They prove targeted cleanup and surviving sibling
+and earlier-turn processes. Release acceptance still requires the lifecycle
+probe against the exact rebuilt image with real Codex: offline protocol and
+fixture results do not establish real-provider process termination.
+
+Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,
 the layer entry in `apps/server/src/server.ts`, and one harness hook. Managed
+Codex interruption adds the scoped ownership helper and hooks in the Codex
+adapter and session runtime under `apps/server/src/provider/`. Managed
 access adds two hooks in upstream files: `makeHttpGate` in
 `apps/server/src/auth/EnvironmentAuth.ts` (applied after token verification and
 WebSocket ticket verification, and after session issuance in the two

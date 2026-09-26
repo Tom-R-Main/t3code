@@ -31,6 +31,7 @@ import {
   ThreadId,
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
+import { isManagedAccessEnabled } from "../../sift/ManagedAccess.ts";
 import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
 import * as Crypto from "effect/Crypto";
@@ -1478,6 +1479,24 @@ function mapToRuntimeEvents(
     ];
   }
 
+  if (event.method === "session/interrupt-unconfirmed") {
+    return [
+      {
+        ...runtimeEventBase(event, canonicalThreadId),
+        type: "session.state.changed",
+        payload: { state: "error", reason: event.message ?? "Command termination is unconfirmed." },
+      },
+      {
+        ...runtimeEventBase(event, canonicalThreadId),
+        type: "runtime.error",
+        payload: {
+          class: "provider_error",
+          message: event.message ?? "Command termination is unconfirmed.",
+        },
+      },
+    ];
+  }
+
   if (event.method === "session/started") {
     return [
       {
@@ -2274,6 +2293,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
+          ...(isManagedAccessEnabled(options?.environment ?? process.env)
+            ? { managedInterrupt: true }
+            : {}),
           providerInstanceId: boundInstanceId,
           cwd: input.cwd ?? process.cwd(),
           binaryPath: codexConfig.binaryPath,

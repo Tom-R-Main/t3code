@@ -496,6 +496,56 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }),
   );
 
+  it.effect(
+    "enables managed interruption and publishes unconfirmed termination as an error",
+    () => {
+      const runtimeFactory = makeRuntimeFactory();
+      const layer = Layer.effect(
+        CodexAdapter,
+        makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: runtimeFactory.factory,
+          environment: { T3_SIFT_MANAGED_ACCESS: "1" },
+        }),
+      ).pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+        Layer.provideMerge(providerSessionDirectoryTestLayer),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      return Effect.gen(function* () {
+        const adapter = yield* CodexAdapter;
+        const threadId = asThreadId("managed-interrupt-error");
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const runtime = runtimeFactory.lastRuntime;
+        NodeAssert.ok(runtime);
+        NodeAssert.equal(runtime.options.managedInterrupt, true);
+        const error = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.type === "session.state.changed" && event.payload.state === "error",
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        yield* runtime.emit({
+          id: asEventId("managed-error"),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          createdAt: "2026-09-26T00:00:00.000Z",
+          method: "session/interrupt-unconfirmed",
+          message: "Termination unconfirmed",
+        });
+        const event = Option.getOrThrow(yield* Fiber.join(error));
+        NodeAssert.equal(event.type, "session.state.changed");
+        yield* adapter.stopSession(threadId);
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
   it.effect("passes configured launch args into the session runtime", () => {
     const runtimeFactory = makeRuntimeFactory();
     const layer = Layer.effect(
