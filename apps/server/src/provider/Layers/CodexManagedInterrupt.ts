@@ -52,6 +52,39 @@ type Command = {
 type Client = Pick<CodexAppServerClient["Service"]["raw"], "request">;
 export type ManagedInterruptResult = { confirmed: boolean; reason: string; terminated: number };
 
+const LoadedPage = Schema.Struct({
+  data: Schema.Array(Schema.String),
+  nextCursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
+});
+const decodeLoadedPage = Schema.decodeUnknownEffect(LoadedPage);
+
+/**
+ * Background terminals belong to each thread's own session (Codex 0.157.1
+ * builds a UnifiedExecProcessManager per session), so every thread loaded in
+ * this app-server is listed, not only the root. Any listing failure fails.
+ */
+export const listLoadedThreadTerminals = (client: Client) =>
+  Effect.gen(function* () {
+    let cursor: string | null = null;
+    const seen = new Set<string>();
+    const threads = new Set<string>();
+    do {
+      const page: typeof LoadedPage.Type = yield* client
+        .request("thread/loaded/list", { cursor, limit: 100 })
+        .pipe(Effect.flatMap(decodeLoadedPage));
+      for (const thread of page.data) threads.add(thread);
+      cursor = page.nextCursor ?? null;
+      if (threads.size > 256 || (cursor !== null && (seen.has(cursor) || seen.size >= 64)))
+        return yield* CodexErrors.CodexAppServerRequestError.internalError(
+          "Loaded thread pagination is incomplete.",
+        );
+      if (cursor !== null) seen.add(cursor);
+    } while (cursor !== null);
+    let total = 0;
+    for (const thread of threads) total += (yield* listBackgroundTerminals(client, thread)).length;
+    return { threads: threads.size, terminals: total };
+  });
+
 /** Every background terminal the provider reports for one thread, all pages. */
 export const listBackgroundTerminals = (client: Client, threadId: string) =>
   Effect.gen(function* () {
@@ -115,7 +148,9 @@ export function makeManagedCommandOwnership() {
     }
     if (method === "turn/completed" && p.threadId && p.turn) {
       if (liveTurns.get(p.threadId) === p.turn.id) liveTurns.delete(p.threadId);
-      if (p.turn.status === "completed" || p.turn.status === "interrupted") {
+      // Every terminal status is a receipt: a failed child turn can still leave
+      // background commands behind, and its cleanup must not wait forever.
+      if (p.turn.status !== undefined && p.turn.status !== "inProgress") {
         if (completions.size >= 4096) incomplete = true;
         else completions.add(key(p.threadId, p.turn.id));
       }

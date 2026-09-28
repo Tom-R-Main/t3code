@@ -260,6 +260,42 @@ describe("managed admission across interruption and resume", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  for (const variant of ["child-terminal", "loaded-list-error"] as const) {
+    it.live(`a resumed managed session fails closed: ${variant}`, () =>
+      Effect.gen(function* () {
+        const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "managed-resume-"));
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+        );
+        const child = wireFixture.childThreadIds[0]!;
+        const scriptPath = yield* writeScript(directory, {
+          turnIds: ["resumed-turn"],
+          loadedThreads: [wireFixture.rootThreadId, child],
+          loadedListError: variant === "loaded-list-error",
+          inheritedTerminals:
+            variant === "child-terminal"
+              ? [{ threadId: child, itemId: "child-command", processId: "42" }]
+              : [],
+        });
+        const runtime = yield* makeCodexSessionRuntime({
+          threadId: ThreadId.make("managed-resume-child"),
+          binaryPath: peerPath,
+          cwd: directory,
+          runtimeMode: "full-access",
+          managedInterrupt: true,
+          resumeCursor: { threadId: wireFixture.rootThreadId },
+          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+        });
+        assert.equal((yield* runtime.start()).status, "error");
+        assert.equal(
+          (yield* runtime.sendTurn({ input: "after resume" }).pipe(Effect.result))._tag,
+          "Failure",
+        );
+        yield* runtime.close;
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+
   for (const inherited of [true, false]) {
     it.live(
       `a resumed managed session ${inherited ? "refuses" : "admits"} turns with ${inherited ? "inherited" : "no"} background terminals`,

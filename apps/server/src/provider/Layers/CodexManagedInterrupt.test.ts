@@ -230,6 +230,56 @@ describe("managed command ownership", () => {
     }),
   );
 
+  it.effect("a failed child turn is terminal proof and its outstanding command is cleaned", () =>
+    Effect.gen(function* () {
+      const ownership = makeManagedCommandOwnership();
+      spawnChild(ownership, "child", "root", "turn");
+      ownership.observe("item/started", item("child-command", "child", "child-turn"));
+      ownership.observe("turn/completed", {
+        threadId: "child",
+        turn: { id: "child-turn", status: "failed" },
+      });
+      ownership.observe("turn/completed", {
+        threadId: "root",
+        turn: { id: "turn", status: "interrupted" },
+      });
+      const targets = ownership.targets("root", "turn");
+      assert.equal(targets.get("child"), "child-turn");
+      assert.isTrue(ownership.completed("child", "child-turn"));
+      yield* ownership.awaitTerminals(targets);
+      let present = true;
+      const calls: unknown[] = [];
+      const client = {
+        request: (method: string, params?: unknown) =>
+          Effect.sync(() => {
+            if (method.endsWith("/list"))
+              return {
+                data:
+                  (params as { threadId: string }).threadId === "child" && present
+                    ? [{ itemId: "child-command", processId: "9" }]
+                    : [],
+              };
+            calls.push(params);
+            present = false;
+            return { terminated: true };
+          }),
+      };
+      assert.isTrue((yield* ownership.cleanup(client, targets, "root")).confirmed);
+      assert.deepEqual(calls, [{ threadId: "child", processId: "9" }]);
+    }),
+  );
+
+  it.effect("an in-progress turn/completed status is not terminal proof", () =>
+    Effect.sync(() => {
+      const ownership = makeManagedCommandOwnership();
+      ownership.observe("turn/completed", {
+        threadId: "root",
+        turn: { id: "turn", status: "inProgress" },
+      });
+      assert.isFalse(ownership.completed("root", "turn"));
+    }),
+  );
+
   it.effect("bounds an unresponsive provider without claiming termination", () =>
     Effect.gen(function* () {
       const ownership = makeManagedCommandOwnership();

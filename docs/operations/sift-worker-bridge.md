@@ -164,15 +164,19 @@ retains native Codex behavior.
 
 While reconciliation is pending, the adapter withholds the parent completion
 event and refuses new turns. It waits for actual matching provider turn-completed
-receipts before reconciling processes; an accepted interrupt alone never becomes
+receipts (completed, interrupted or failed) before reconciling processes; an accepted interrupt alone never becomes
 a synthesized completion. Turns whose preparation crossed an interrupt must be
 submitted again. A turn whose `turn/start` response arrives after an interrupt
 began is interrupted and refused, and the session stays unconfirmed until Stop.
-A resumed managed session lists the thread's background terminals before
-admitting turns; any it reports, or a listing failure, leaves the session
-unconfirmed, because a restarted provider has no item history to prove their
-ownership. Terminals belong to the app-server process, so only the root thread
-is checked on resume. Missing ownership (including terminals inherited
+A resumed managed session lists background terminals for every thread loaded in
+the app-server (`thread/loaded/list`, then each thread's
+`thread/backgroundTerminals/list`) before admitting turns. Codex keeps terminals
+per thread session, so the root alone is not enough. Any reported terminal, or
+any listing failure, leaves the session unconfirmed until Stop, because a
+restarted provider has no item history to prove their ownership. This check
+only sees threads loaded in the current app-server process: processes left by a
+previous app-server process are invisible to the protocol and must be removed by
+host teardown of that process tree. Missing ownership (including terminals inherited
 after reconnect without observed item history), changed execution, protocol
 errors, or bounded reconciliation exhaustion produce an explicit error stating
 that termination is unconfirmed. They do not restart or kill the provider.

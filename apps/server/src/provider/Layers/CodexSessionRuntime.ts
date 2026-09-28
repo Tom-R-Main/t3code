@@ -37,7 +37,7 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
-import { listBackgroundTerminals, makeManagedCommandOwnership } from "./CodexManagedInterrupt.ts";
+import { listLoadedThreadTerminals, makeManagedCommandOwnership } from "./CodexManagedInterrupt.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -2490,17 +2490,16 @@ export const makeCodexSessionRuntime = (
 
       const providerThreadId = opened.thread.id;
       // A resumed provider thread carries no item history here, so any background
-      // terminal it still reports has unknown turn ownership. Fail closed until
-      // the user stops the session; an empty or unlistable result is required
-      // before managed turns are admitted.
+      // terminal on any loaded thread (root or child) has unknown turn
+      // ownership. Fail closed until Stop unless every loaded thread lists empty.
       const resumeThreadId = readResumeCursorThreadId(options.resumeCursor);
       const inheritedUnknown =
         options.managedInterrupt === true &&
         resumeThreadId !== undefined &&
         providerThreadId === resumeThreadId &&
-        (yield* listBackgroundTerminals(client.raw, providerThreadId).pipe(
+        (yield* listLoadedThreadTerminals(client.raw).pipe(
           Effect.timeout("10 seconds"),
-          Effect.map((terminals) => terminals.length > 0),
+          Effect.map(({ threads, terminals }) => threads === 0 || terminals > 0),
           Effect.catchCause(() => Effect.succeed(true)),
         ));
       if (inheritedUnknown) managedInterruptUnconfirmed = true;

@@ -66,6 +66,17 @@ rl.on("line", async (line) => {
     write({ id, result: { threadId: script.rootThreadId } });
     return;
   }
+  if (method === "thread/loaded/list") {
+    if (script.loadedListError) {
+      write({ id, error: { code: -32000, message: "scripted loaded-list failure" } });
+      return;
+    }
+    write({
+      id,
+      result: { data: script.loadedThreads ?? [script.rootThreadId], nextCursor: null },
+    });
+    return;
+  }
   if (method === "thread/backgroundTerminals/list") {
     terminalListCount++;
     if (script.managedCleanupError) {
