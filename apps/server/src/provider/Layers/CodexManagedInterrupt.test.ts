@@ -335,6 +335,61 @@ describe("managed command ownership", () => {
     );
   }
 
+  it.effect("a new assigned turn on a known child thread is interrupted and reconciled", () =>
+    Effect.gen(function* () {
+      const ownership = makeManagedCommandOwnership();
+      ownership.observe("turn/started", { threadId: "root", turn: { id: "turn" } });
+      spawnChild(ownership, "child", "root", "turn");
+      const snapshot = ownership.targets("root", "turn");
+      assert.equal(snapshot.get("child"), "child-turn");
+      ownership.observe("turn/completed", {
+        threadId: "child",
+        turn: { id: "child-turn", status: "interrupted" },
+      });
+      ownership.observe("turn/completed", {
+        threadId: "root",
+        turn: { id: "turn", status: "interrupted" },
+      });
+      // The known child starts another assigned turn while cleanup runs.
+      ownership.observe("turn/started", { threadId: "child", turn: { id: "child-second" } });
+      ownership.observe("item/started", item("second-command", "child", "child-second"));
+      let present = true;
+      const calls: Array<{ method: string; params: unknown }> = [];
+      const client = {
+        request: (method: string, params?: unknown) =>
+          Effect.sync(() => {
+            calls.push({ method, params });
+            if (method === "turn/interrupt") {
+              ownership.observe("turn/completed", {
+                threadId: "child",
+                turn: { id: "child-second", status: "interrupted" },
+              });
+              return {};
+            }
+            if (method.endsWith("/list"))
+              return {
+                data:
+                  (params as { threadId: string }).threadId === "child" && present
+                    ? [{ itemId: "second-command", processId: "12" }]
+                    : [],
+              };
+            present = false;
+            return { terminated: true };
+          }),
+      };
+      const result = yield* ownership.cleanup(client, snapshot, "root");
+      assert.isTrue(result.confirmed, result.reason);
+      assert.deepEqual(
+        calls.filter((c) => c.method === "turn/interrupt").map((c) => c.params),
+        [{ threadId: "child", turnId: "child-second" }],
+      );
+      assert.deepEqual(
+        calls.filter((c) => c.method.endsWith("/terminate")).map((c) => c.params),
+        [{ threadId: "child", processId: "12" }],
+      );
+    }),
+  );
+
   it.effect("bounds an unresponsive provider without claiming termination", () =>
     Effect.gen(function* () {
       const ownership = makeManagedCommandOwnership();

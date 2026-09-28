@@ -2752,11 +2752,19 @@ export const makeCodexSessionRuntime = (
               ),
             );
             const completion = managedTurnCompletions.get(effectiveTurnId);
+            // Unconfirmed is sticky for the session: a later cleanup is scoped to
+            // its own turn, so it cannot prove an earlier failure's commands gone.
+            const previouslyUnconfirmed = managedInterruptUnconfirmed;
             const confirmed =
-              result.confirmed && completion !== undefined && !managedAdmissionCrossed;
+              result.confirmed &&
+              completion !== undefined &&
+              !managedAdmissionCrossed &&
+              !previouslyUnconfirmed;
             const reason = managedAdmissionCrossed
               ? "A turn was admitted while an interruption was in progress; termination is unconfirmed."
-              : result.reason;
+              : previouslyUnconfirmed
+                ? "An earlier managed interruption is unconfirmed; stop the session to reconcile it."
+                : result.reason;
             managedInterruptUnconfirmed = !confirmed;
             managedInterruptActive = false;
             yield* updateSession(sessionRef, {

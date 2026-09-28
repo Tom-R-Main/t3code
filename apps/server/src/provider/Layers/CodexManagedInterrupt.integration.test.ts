@@ -260,6 +260,67 @@ describe("managed admission across interruption and resume", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live("an unconfirmed interruption stays unconfirmed after interrupting a queued turn", () =>
+    Effect.gen(function* () {
+      const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "managed-sticky-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      );
+      const scriptPath = yield* writeScript(directory, {
+        turnIds: ["owned-turn", "queued-turn", "later-turn"],
+        failFirstCleanupOnly: true,
+        managedTerminals: [{ kind: "owned" }],
+      });
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("managed-sticky"),
+        binaryPath: peerPath,
+        cwd: directory,
+        runtimeMode: "full-access",
+        managedInterrupt: true,
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const ready = yield* Deferred.make<void>();
+      const outcomes: string[] = [];
+      const firstOutcome = yield* Deferred.make<void>();
+      const secondOutcome = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => {
+          if (event.method === "serverRequest/resolved") return Deferred.succeed(ready, undefined);
+          const outcome =
+            event.method === "session/interrupt-unconfirmed" ||
+            (event.method === "session/ready" &&
+              event.message !== "Codex App Server session ready.");
+          if (outcome) {
+            outcomes.push(event.method);
+            return Deferred.succeed(
+              outcomes.length === 1 ? firstOutcome : secondOutcome,
+              undefined,
+            );
+          }
+          return Effect.void;
+        }),
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "fixture" });
+      yield* Deferred.await(ready).pipe(Effect.timeout("10 seconds"));
+      const queued = yield* runtime.sendTurn({ input: "queued follow-up" });
+      assert.equal(queued.turnId, "queued-turn");
+      yield* runtime.interruptTurn("owned-turn" as never);
+      yield* Deferred.await(firstOutcome).pipe(Effect.timeout("20 seconds"));
+      assert.equal(outcomes[0], "session/interrupt-unconfirmed");
+      yield* runtime.interruptTurn("queued-turn" as never);
+      yield* Deferred.await(secondOutcome).pipe(Effect.timeout("20 seconds"));
+      const session = yield* runtime.getSession;
+      assert.equal(session.status, "error");
+      assert.equal(
+        (yield* runtime.sendTurn({ input: "blocked" }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   for (const variant of ["child-terminal", "loaded-list-error"] as const) {
     it.live(`a resumed managed session fails closed: ${variant}`, () =>
       Effect.gen(function* () {

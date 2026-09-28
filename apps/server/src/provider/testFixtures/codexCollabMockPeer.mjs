@@ -24,6 +24,7 @@ let terminalListCount = 0;
 let reloadCount = 0;
 let pendingReload;
 let pendingTurnStart;
+let interruptCount = 0;
 let approvalEndedTurn = false;
 const lateCommandNotifications = [];
 process.on("exit", () => {
@@ -79,7 +80,7 @@ rl.on("line", async (line) => {
   }
   if (method === "thread/backgroundTerminals/list") {
     terminalListCount++;
-    if (script.managedCleanupError) {
+    if (script.managedCleanupError || (script.failFirstCleanupOnly && interruptCount <= 1)) {
       write({ id, error: { code: -32000, message: "scripted cleanup failure" } });
       return;
     }
@@ -385,6 +386,7 @@ rl.on("line", async (line) => {
     return;
   }
   if (method === "turn/interrupt") {
+    interruptCount++;
     // Record which thread/turn was interrupted (append-only sidecar file the
     // test reads) so Stop coverage can assert every live child was reached.
     // failInterruptFor simulates a dead child whose interrupt errors.

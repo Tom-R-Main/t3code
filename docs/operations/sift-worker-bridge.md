@@ -159,7 +159,11 @@ older parent turns remain running; background commands from completed children
 of the interrupted assignment are included. Cleanup re-derives the owned set on every
 pass, so a child whose assignment arrives after the interrupt began is
 interrupted, awaited for its terminal receipt and reconciled within the same
-bound; if the set is still changing at the bound, termination stays unconfirmed. A child reporting back to its
+bound; if the set is still changing at the bound, termination stays unconfirmed.
+Late work is tracked per thread and turn, so a new assigned turn on a child
+already in the snapshot is reconciled the same way. Once an interruption is
+unconfirmed it stays unconfirmed for the session: a later interrupt only proves
+its own turn's commands, so only Stop clears it. A child reporting back to its
 parent or root transfers no ownership. Reassignment across parent turns
 without an unambiguous ownership transition fails closed. Command text, checkout
 paths, and host process names grant no cleanup authority. Ordinary unmanaged T3

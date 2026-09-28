@@ -255,9 +255,9 @@ export function makeManagedCommandOwnership() {
       (thread) => thread === root || rootTurn(thread, root) !== undefined,
     );
   const completed = (thread: string, turn: string) => completions.has(key(thread, turn));
-  const terminalProof = (turns: ReadonlyMap<string, string>) =>
+  const terminalProof = (turns: Iterable<readonly [string, string]>) =>
     [...turns].every(([thread, turn]) => completed(thread, turn));
-  const awaitTerminals = (turns: ReadonlyMap<string, string>) =>
+  const awaitTerminals = (turns: Iterable<readonly [string, string]>) =>
     Effect.callback<void>((resume) => {
       const notify = () => {
         if (terminalProof(turns)) resume(Effect.void);
@@ -282,19 +282,29 @@ export function makeManagedCommandOwnership() {
       if (rootTurnId === undefined) return fail("The interrupted root turn is unknown.");
       // The caller's snapshot can predate an assignment whose spawn, start and
       // command notifications arrive later. Each pass re-derives the owned set.
-      const scopeNow = () => new Map([...turns, ...targets(root, rootTurnId)]);
+      // Keyed by (thread, turn): a known child thread can start another assigned
+      // turn during cleanup, and that new pair is late work in its own right.
+      const pairKey = (thread: string, turn: string) => JSON.stringify([thread, turn]);
+      const snapshotPairs = new Set([...turns].map(([thread, turn]) => pairKey(thread, turn)));
+      const pairs = new Map<string, readonly [string, string]>();
+      const scopeNow = () => {
+        for (const [thread, turn] of [...turns, ...targets(root, rootTurnId)])
+          pairs.set(pairKey(thread, turn), [thread, turn]);
+        return [...pairs.values()];
+      };
       let scope = scopeNow();
+      const inScope = (thread: string, turn: string) => pairs.has(pairKey(thread, turn));
       const owned = (command: Command) =>
         command.threadId === root
           ? command.turnId === rootTurnId
           : rootTurn(command.threadId, root) === rootTurnId;
       const scopeStable = () =>
         verified(root) &&
-        terminalProof(scope) &&
+        scope.every(([thread, turn]) => completed(thread, turn)) &&
         [...liveTurns].every(([thread, turn]) =>
           thread === root
             ? turn === rootTurnId
-            : rootTurn(thread, root) !== rootTurnId || scope.get(thread) === turn,
+            : rootTurn(thread, root) !== rootTurnId || inScope(thread, turn),
         ) &&
         [...commands.values()].every(
           (command) =>
@@ -309,8 +319,8 @@ export function makeManagedCommandOwnership() {
       // produce its own terminal receipt before its terminals are reconciled.
       const settleLate = Effect.gen(function* () {
         scope = scopeNow();
-        const late = [...scope].filter(
-          ([thread, turn]) => !turns.has(thread) && !completed(thread, turn),
+        const late = scope.filter(
+          ([thread, turn]) => !snapshotPairs.has(pairKey(thread, turn)) && !completed(thread, turn),
         );
         yield* Effect.forEach(
           late,
@@ -322,7 +332,7 @@ export function makeManagedCommandOwnership() {
         );
         // Only late children are awaited: a missing receipt for the caller's
         // own targets still fails closed at once through scopeStable.
-        if (late.length > 0) yield* awaitTerminals(new Map(late));
+        if (late.length > 0) yield* awaitTerminals(late);
       });
       yield* settleLate;
       if (!scopeStable()) return fail("Turn completion or assignment ownership is unconfirmed.");
@@ -330,12 +340,12 @@ export function makeManagedCommandOwnership() {
       // A command can register while the interrupt is settling. Missing ownership
       // is never treated as proof of exit; bounded reconciliation fails closed.
       for (let pass = 0; pass < 4; pass++) {
-        const before = scope.size;
+        const before = scope.length;
         yield* settleLate;
         if (!scopeStable())
           return fail("Execution changed while interruption was being reconciled.");
-        let remaining = scope.size !== before;
-        for (const [threadId] of scope) {
+        let remaining = scope.length !== before;
+        for (const threadId of new Set(scope.map(([thread]) => thread))) {
           for (const terminal of yield* list(threadId)) {
             const command = commands.get(key(threadId, terminal.itemId));
             if (!command) return fail("A terminal has no verified command-item owner.");
