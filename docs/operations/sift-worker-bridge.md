@@ -156,7 +156,8 @@ preserves background terminals. The managed adapter uses the experimental
 Earlier-turn terminals remain running. A child requires both provider-reported
 parent lineage and the parent's explicit started-activity turn. Children from
 older parent turns remain running; background commands from completed children
-of the interrupted assignment are included. Reassignment across parent turns
+of the interrupted assignment are included. A child reporting back to its
+parent or root transfers no ownership. Reassignment across parent turns
 without an unambiguous ownership transition fails closed. Command text, checkout
 paths, and host process names grant no cleanup authority. Ordinary unmanaged T3
 retains native Codex behavior.
@@ -165,7 +166,13 @@ While reconciliation is pending, the adapter withholds the parent completion
 event and refuses new turns. It waits for actual matching provider turn-completed
 receipts before reconciling processes; an accepted interrupt alone never becomes
 a synthesized completion. Turns whose preparation crossed an interrupt must be
-submitted again. Missing ownership (including terminals inherited
+submitted again. A turn whose `turn/start` response arrives after an interrupt
+began is interrupted and refused, and the session stays unconfirmed until Stop.
+A resumed managed session lists the thread's background terminals before
+admitting turns; any it reports, or a listing failure, leaves the session
+unconfirmed, because a restarted provider has no item history to prove their
+ownership. Terminals belong to the app-server process, so only the root thread
+is checked on resume. Missing ownership (including terminals inherited
 after reconnect without observed item history), changed execution, protocol
 errors, or bounded reconciliation exhaustion produce an explicit error stating
 that termination is unconfirmed. They do not restart or kill the provider.

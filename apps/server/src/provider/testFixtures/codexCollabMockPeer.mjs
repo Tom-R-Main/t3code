@@ -23,6 +23,7 @@ const terminals = new Map();
 let terminalListCount = 0;
 let reloadCount = 0;
 let pendingReload;
+let pendingTurnStart;
 let approvalEndedTurn = false;
 const lateCommandNotifications = [];
 process.on("exit", () => {
@@ -51,6 +52,14 @@ rl.on("line", async (line) => {
     } else write({ id, result: {} });
     return;
   }
+  if (method === "feedback/upload" && pendingTurnStart !== undefined) {
+    // Releases a held turn/start response after the test has interrupted.
+    const held = pendingTurnStart;
+    pendingTurnStart = undefined;
+    write({ id, result: { threadId: script.rootThreadId } });
+    write({ id: held.id, result: { ...fixture.responses.turnStart, turn: held.turn } });
+    return;
+  }
   if (method === "feedback/upload" && pendingReload !== undefined) {
     write({ id: pendingReload, result: {} });
     pendingReload = undefined;
@@ -66,14 +75,18 @@ rl.on("line", async (line) => {
     write({
       id,
       result: {
-        data: [...terminals.values()]
-          .filter(
+        data: [
+          // Terminals a restarted provider still reports without item history.
+          ...(script.inheritedTerminals ?? []).filter(
+            (t) => t.threadId === message.params.threadId,
+          ),
+          ...[...terminals.values()].filter(
             (t) =>
               t.threadId === message.params.threadId &&
               t.child.exitCode === null &&
               (!t.late || terminalListCount > 1),
-          )
-          .map((t) => ({ itemId: t.itemId, processId: t.processId })),
+          ),
+        ].map((t) => ({ itemId: t.itemId, processId: t.processId })),
         nextCursor: null,
       },
     });
@@ -239,8 +252,17 @@ rl.on("line", async (line) => {
     const turn = turnId
       ? { ...fixture.responses.turnStart.turn, id: turnId }
       : fixture.responses.turnStart.turn;
-    activeTurn = turn;
     turnStartCount += 1;
+    if (script.holdSecondTurnStart && turnStartCount === 2) {
+      // The response stays in flight until the test releases it (feedback/upload).
+      pendingTurnStart = { id, turn };
+      write({
+        method: "serverRequest/resolved",
+        params: { threadId: script.rootThreadId, requestId: "fixture-turn-start-held" },
+      });
+      return;
+    }
+    activeTurn = turn;
     write({ id, result: { ...fixture.responses.turnStart, turn } });
     const rootThreadId = script.rootThreadId;
     if (script.onlyFirstTurnStarts !== true || turnStartCount === 1) {

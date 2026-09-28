@@ -136,6 +136,100 @@ describe("managed command ownership", () => {
         assert.deepEqual(calls, [{ threadId: "current-child", processId: "1" }]);
       }),
   );
+  const spawnChild = (
+    ownership: ReturnType<typeof makeManagedCommandOwnership>,
+    child: string,
+    parent: string,
+    parentTurn: string,
+  ) => {
+    ownership.observe("thread/started", {
+      thread: {
+        id: child,
+        source: { subAgent: { thread_spawn: { parent_thread_id: parent } } },
+      },
+    });
+    ownership.observe("item/completed", {
+      threadId: parent,
+      turnId: parentTurn,
+      item: {
+        id: `spawn-${child}`,
+        type: "subAgentActivity",
+        kind: "started",
+        agentThreadId: child,
+      },
+    });
+    ownership.observe("turn/started", { threadId: child, turn: { id: `${child}-turn` } });
+  };
+  const interacted = (threadId: string, turnId: string, agentThreadId: string) => ({
+    threadId,
+    turnId,
+    item: {
+      id: `interact-${threadId}-${agentThreadId}`,
+      type: "subAgentActivity",
+      kind: "interacted",
+      agentThreadId,
+    },
+  });
+
+  // Captured in codexMultiAgentWire.json: a child reports back to its root.
+  it.effect("a child's interaction with its ancestor keeps ownership verified", () =>
+    Effect.gen(function* () {
+      const ownership = makeManagedCommandOwnership();
+      spawnChild(ownership, "child", "root", "turn");
+      spawnChild(ownership, "grandchild", "child", "child-turn");
+      ownership.observe("item/started", item("child-command", "child", "child-turn"));
+      ownership.observe("item/completed", interacted("child", "child-turn", "root"));
+      ownership.observe("item/completed", interacted("grandchild", "grandchild-turn", "root"));
+      assert.isTrue(ownership.verified("root"));
+      ownership.observe("turn/completed", {
+        threadId: "child",
+        turn: { id: "child-turn", status: "interrupted" },
+      });
+      ownership.observe("turn/completed", {
+        threadId: "grandchild",
+        turn: { id: "grandchild-turn", status: "interrupted" },
+      });
+      ownership.observe("turn/completed", {
+        threadId: "root",
+        turn: { id: "turn", status: "interrupted" },
+      });
+      const targets = ownership.targets("root", "turn");
+      assert.equal(targets.get("child"), "child-turn");
+      let present = true;
+      const calls: unknown[] = [];
+      const client = {
+        request: (method: string, params?: unknown) =>
+          Effect.sync(() => {
+            if (method.endsWith("/list"))
+              return {
+                data:
+                  (params as { threadId: string }).threadId === "child" && present
+                    ? [{ itemId: "child-command", processId: "7" }]
+                    : [],
+              };
+            calls.push(params);
+            present = false;
+            return { terminated: true };
+          }),
+      };
+      assert.isTrue((yield* ownership.cleanup(client, targets, "root")).confirmed);
+      assert.deepEqual(calls, [{ threadId: "child", processId: "7" }]);
+    }),
+  );
+
+  it.effect("reassigning an older child or messaging an unknown thread still fails closed", () =>
+    Effect.sync(() => {
+      const reassigned = makeManagedCommandOwnership();
+      spawnChild(reassigned, "child", "root", "old-turn");
+      reassigned.observe("item/completed", interacted("root", "turn", "child"));
+      assert.isFalse(reassigned.verified("root"));
+      const unknown = makeManagedCommandOwnership();
+      spawnChild(unknown, "child", "root", "turn");
+      unknown.observe("item/completed", interacted("child", "child-turn", "stranger"));
+      assert.isFalse(unknown.verified("root"));
+    }),
+  );
+
   it.effect("bounds an unresponsive provider without claiming termination", () =>
     Effect.gen(function* () {
       const ownership = makeManagedCommandOwnership();

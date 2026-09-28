@@ -52,6 +52,27 @@ type Command = {
 type Client = Pick<CodexAppServerClient["Service"]["raw"], "request">;
 export type ManagedInterruptResult = { confirmed: boolean; reason: string; terminated: number };
 
+/** Every background terminal the provider reports for one thread, all pages. */
+export const listBackgroundTerminals = (client: Client, threadId: string) =>
+  Effect.gen(function* () {
+    let cursor: string | null = null;
+    const seen = new Set<string>();
+    const all: Array<(typeof TerminalPage.Type.data)[number]> = [];
+    do {
+      const page: typeof TerminalPage.Type = yield* client
+        .request("thread/backgroundTerminals/list", { threadId, cursor, limit: 100 })
+        .pipe(Effect.flatMap(decodeTerminalPage));
+      all.push(...page.data);
+      cursor = page.nextCursor ?? null;
+      if (all.length > 4096 || (cursor !== null && (seen.has(cursor) || seen.size >= 64)))
+        return yield* CodexErrors.CodexAppServerRequestError.internalError(
+          "Terminal pagination is incomplete.",
+        );
+      if (cursor !== null) seen.add(cursor);
+    } while (cursor !== null);
+    return all;
+  });
+
 /** Provider identities only. Never derives authority from command text, cwd, or OS process names. */
 export function makeManagedCommandOwnership() {
   const commands = new Map<string, Command>();
@@ -62,6 +83,16 @@ export function makeManagedCommandOwnership() {
   const listeners = new Set<() => void>();
   let incomplete = false;
   const key = (threadId: string, itemId: string) => JSON.stringify([threadId, itemId]);
+  const isAncestor = (candidate: string, thread: string) => {
+    const seen = new Set<string>();
+    for (let spawn = spawns.get(thread); spawn && !seen.has(thread); spawn = spawns.get(thread)) {
+      if (parents.get(thread) !== spawn.parent) return false;
+      if (spawn.parent === candidate) return true;
+      seen.add(thread);
+      thread = spawn.parent;
+    }
+    return false;
+  };
   const observe = (method: string, value: unknown) => {
     const decoded = decodeNotification(value);
     if (decoded._tag === "None") return;
@@ -114,8 +145,13 @@ export function makeManagedCommandOwnership() {
       p.item.kind === "interacted" &&
       p.item.agentThreadId
     ) {
-      const spawn = spawns.get(p.item.agentThreadId);
-      if (!spawn || spawn.parent !== p.threadId || spawn.turn !== p.turnId) incomplete = true;
+      // Only an interaction toward a spawned descendant can hand it new work.
+      // A child reporting to its parent or root (captured with Codex 0.157.1)
+      // transfers no ownership. Any other target stays fail-closed.
+      if (!isAncestor(p.item.agentThreadId, p.threadId)) {
+        const spawn = spawns.get(p.item.agentThreadId);
+        if (!spawn || spawn.parent !== p.threadId || spawn.turn !== p.turnId) incomplete = true;
+      }
     }
     if (
       (method === "item/started" || method === "item/completed") &&
@@ -230,25 +266,7 @@ export function makeManagedCommandOwnership() {
           (command) => !owned(command) || completed(command.threadId, command.turnId),
         );
       if (!scopeStable()) return fail("Turn completion or assignment ownership is unconfirmed.");
-      const list = (threadId: string) =>
-        Effect.gen(function* () {
-          let cursor: string | null = null;
-          const seen = new Set<string>();
-          const all: Array<(typeof TerminalPage.Type.data)[number]> = [];
-          do {
-            const page: typeof TerminalPage.Type = yield* client
-              .request("thread/backgroundTerminals/list", { threadId, cursor, limit: 100 })
-              .pipe(Effect.flatMap(decodeTerminalPage));
-            all.push(...page.data);
-            cursor = page.nextCursor ?? null;
-            if (all.length > 4096 || (cursor !== null && (seen.has(cursor) || seen.size >= 64)))
-              return yield* CodexErrors.CodexAppServerRequestError.internalError(
-                "Terminal pagination is incomplete.",
-              );
-            if (cursor !== null) seen.add(cursor);
-          } while (cursor !== null);
-          return all;
-        });
+      const list = (threadId: string) => listBackgroundTerminals(client, threadId);
       // A command can register while the interrupt is settling. Missing ownership
       // is never treated as proof of exit; bounded reconciliation fails closed.
       for (let pass = 0; pass < 4; pass++) {

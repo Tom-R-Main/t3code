@@ -177,3 +177,119 @@ describe("managed interruption against owned fixture processes", () => {
     );
   }
 });
+
+describe("managed admission across interruption and resume", () => {
+  const writeScript = (directory: string, script: Record<string, unknown>) =>
+    Effect.gen(function* () {
+      const scriptPath = NodePath.join(directory, "script.json");
+      NodeFS.writeFileSync(
+        scriptPath,
+        yield* encodeScript({
+          rootThreadId: wireFixture.rootThreadId,
+          holdTurnOpen: true,
+          notifications: [],
+          ...script,
+        }),
+      );
+      return scriptPath;
+    });
+
+  it.live("a turn whose start response lands after interruption is interrupted and refused", () =>
+    Effect.gen(function* () {
+      const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "managed-crossed-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      );
+      const scriptPath = yield* writeScript(directory, {
+        turnIds: ["owned-turn", "crossed-turn", "later-turn"],
+        holdSecondTurnStart: true,
+        managedTerminals: [{ kind: "owned" }],
+      });
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("managed-crossed"),
+        binaryPath: peerPath,
+        cwd: directory,
+        runtimeMode: "full-access",
+        managedInterrupt: true,
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const ready = yield* Deferred.make<void>();
+      const held = yield* Deferred.make<void>();
+      const settled = yield* Deferred.make<void>();
+      const unconfirmed = yield* Deferred.make<void>();
+      const events: ProviderEvent[] = [];
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => {
+          events.push(event);
+          if (event.method === "session/interrupt-unconfirmed")
+            return Deferred.succeed(unconfirmed, undefined);
+          if (event.method === "serverRequest/resolved") {
+            const requestId = (event.payload as { requestId?: string }).requestId;
+            return Deferred.succeed(
+              requestId === "fixture-turn-start-held" ? held : ready,
+              undefined,
+            );
+          }
+          if (event.method === "session/ready" && events.some((e) => e.method === "turn/completed"))
+            return Deferred.succeed(settled, undefined);
+          return Effect.void;
+        }),
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "fixture" });
+      yield* Deferred.await(ready).pipe(Effect.timeout("10 seconds"));
+      const crossing = yield* runtime
+        .sendTurn({ input: "follow-up in flight" })
+        .pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(held).pipe(Effect.timeout("10 seconds"));
+      yield* runtime.interruptTurn();
+      yield* Deferred.await(settled).pipe(Effect.timeout("10 seconds"));
+      yield* runtime.uploadFeedback("release held turn start");
+      assert.equal((yield* Fiber.join(crossing))._tag, "Failure");
+      const interrupts = NodeFS.readFileSync(`${scriptPath}.interrupts`, "utf8");
+      assert.include(interrupts, '"turnId":"crossed-turn"');
+      const session = yield* runtime.getSession;
+      assert.equal(session.status, "error");
+      yield* Deferred.await(unconfirmed).pipe(Effect.timeout("10 seconds"));
+      assert.equal(
+        (yield* runtime.sendTurn({ input: "blocked" }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  for (const inherited of [true, false]) {
+    it.live(
+      `a resumed managed session ${inherited ? "refuses" : "admits"} turns with ${inherited ? "inherited" : "no"} background terminals`,
+      () =>
+        Effect.gen(function* () {
+          const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "managed-resume-"));
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+          );
+          const scriptPath = yield* writeScript(directory, {
+            turnIds: ["resumed-turn"],
+            inheritedTerminals: inherited
+              ? [{ threadId: wireFixture.rootThreadId, itemId: "earlier-command", processId: "41" }]
+              : [],
+          });
+          const runtime = yield* makeCodexSessionRuntime({
+            threadId: ThreadId.make("managed-resume"),
+            binaryPath: peerPath,
+            cwd: directory,
+            runtimeMode: "full-access",
+            managedInterrupt: true,
+            resumeCursor: { threadId: wireFixture.rootThreadId },
+            environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+          });
+          const session = yield* runtime.start();
+          assert.equal(session.status, inherited ? "error" : "ready");
+          const turn = yield* runtime.sendTurn({ input: "after resume" }).pipe(Effect.result);
+          assert.equal(turn._tag, inherited ? "Failure" : "Success");
+          yield* runtime.close;
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+});

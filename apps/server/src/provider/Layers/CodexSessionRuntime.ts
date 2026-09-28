@@ -37,7 +37,7 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
-import { makeManagedCommandOwnership } from "./CodexManagedInterrupt.ts";
+import { listBackgroundTerminals, makeManagedCommandOwnership } from "./CodexManagedInterrupt.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -1385,6 +1385,9 @@ export const makeCodexSessionRuntime = (
     const managedOwnership = makeManagedCommandOwnership();
     let managedInterruptActive = false;
     let managedInterruptUnconfirmed = false;
+    // A turn/start whose response arrived after an interruption began. Sticky:
+    // no later interruption result can make that admission owned again.
+    let managedAdmissionCrossed = false;
     let managedAdmissionEpoch = 0;
     const managedInterruptedTurns = new Set<string>();
     const managedTurnCompletions = new Map<string, CodexServerNotification>();
@@ -1882,7 +1885,7 @@ export const makeCodexSessionRuntime = (
             return;
           }
           if (
-            (managedInterruptActive || managedInterruptUnconfirmed) &&
+            (managedInterruptActive || managedInterruptUnconfirmed || managedAdmissionCrossed) &&
             notification.method === "thread/status/changed" &&
             notification.params.threadId === root
           )
@@ -2486,16 +2489,36 @@ export const makeCodexSessionRuntime = (
       });
 
       const providerThreadId = opened.thread.id;
+      // A resumed provider thread carries no item history here, so any background
+      // terminal it still reports has unknown turn ownership. Fail closed until
+      // the user stops the session; an empty or unlistable result is required
+      // before managed turns are admitted.
+      const resumeThreadId = readResumeCursorThreadId(options.resumeCursor);
+      const inheritedUnknown =
+        options.managedInterrupt === true &&
+        resumeThreadId !== undefined &&
+        providerThreadId === resumeThreadId &&
+        (yield* listBackgroundTerminals(client.raw, providerThreadId).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.map((terminals) => terminals.length > 0),
+          Effect.catchCause(() => Effect.succeed(true)),
+        ));
+      if (inheritedUnknown) managedInterruptUnconfirmed = true;
+      const inheritedReason =
+        "Resumed session reports background terminals with unknown ownership; stop the session before sending another turn.";
       const session = {
         ...(yield* Ref.get(sessionRef)),
-        status: "ready",
+        status: inheritedUnknown ? "error" : "ready",
+        ...(inheritedUnknown ? { lastError: inheritedReason } : {}),
         cwd: opened.cwd,
         model: opened.model,
         resumeCursor: { threadId: providerThreadId },
         updatedAt: yield* nowIso,
       } satisfies ProviderSession;
       yield* Ref.set(sessionRef, session);
-      yield* emitSessionEvent("session/ready", "Codex App Server session ready.");
+      if (inheritedUnknown)
+        yield* emitSessionEvent("session/interrupt-unconfirmed", inheritedReason);
+      else yield* emitSessionEvent("session/ready", "Codex App Server session ready.");
       return session;
     });
 
@@ -2540,7 +2563,7 @@ export const makeCodexSessionRuntime = (
       sendTurn: (input) =>
         Effect.gen(function* () {
           const admissionEpoch = managedAdmissionEpoch;
-          if (managedInterruptActive || managedInterruptUnconfirmed) {
+          if (managedInterruptActive || managedInterruptUnconfirmed || managedAdmissionCrossed) {
             return yield* CodexErrors.CodexAppServerRequestError.internalError(
               "Managed command termination is pending or unconfirmed; stop or reconcile the session before sending another turn.",
               undefined,
@@ -2599,6 +2622,27 @@ export const makeCodexSessionRuntime = (
             ),
           );
           const turnId = TurnId.make(response.turn.id);
+          if (
+            options.managedInterrupt &&
+            (admissionEpoch !== managedAdmissionEpoch ||
+              managedInterruptActive ||
+              managedInterruptUnconfirmed)
+          ) {
+            // Codex queued this turn while an interruption was underway, so it
+            // belongs to no confirmed epoch. Ask Codex to interrupt it, then fail
+            // closed: only an explicit Stop can prove nothing it started remains.
+            managedAdmissionCrossed = true;
+            yield* client
+              .request("turn/interrupt", { threadId: providerThreadId, turnId: response.turn.id })
+              .pipe(Effect.timeout("3 seconds"), Effect.ignore);
+            const reason =
+              "A turn was admitted while an interruption was in progress; termination is unconfirmed.";
+            yield* updateSession(sessionRef, { status: "error", lastError: reason });
+            yield* emitSessionEvent("session/interrupt-unconfirmed", reason);
+            return yield* CodexErrors.CodexAppServerRequestError.internalError(reason, undefined, {
+              method: "turn/start",
+            });
+          }
           yield* updateSession(sessionRef, (session) => ({
             status: "running",
             // Codex accepts follow-ups while the current turn is still
@@ -2709,13 +2753,17 @@ export const makeCodexSessionRuntime = (
               ),
             );
             const completion = managedTurnCompletions.get(effectiveTurnId);
-            const confirmed = result.confirmed && completion !== undefined;
+            const confirmed =
+              result.confirmed && completion !== undefined && !managedAdmissionCrossed;
+            const reason = managedAdmissionCrossed
+              ? "A turn was admitted while an interruption was in progress; termination is unconfirmed."
+              : result.reason;
             managedInterruptUnconfirmed = !confirmed;
             managedInterruptActive = false;
             yield* updateSession(sessionRef, {
               status: confirmed ? "ready" : "error",
               activeTurnId: undefined,
-              lastError: confirmed ? undefined : result.reason,
+              lastError: confirmed ? undefined : reason,
             });
             // The raw notification consumer may still have the terminal event
             // queued. The cancellation marker suppresses it in either ordering.
@@ -2729,7 +2777,7 @@ export const makeCodexSessionRuntime = (
               });
               yield* emitSessionEvent("session/ready", result.reason);
             } else {
-              yield* emitSessionEvent("session/interrupt-unconfirmed", result.reason);
+              yield* emitSessionEvent("session/interrupt-unconfirmed", reason);
             }
             return;
           }
