@@ -280,6 +280,61 @@ describe("managed command ownership", () => {
     }),
   );
 
+  for (const childEnds of ["before-cleanup", "during-cleanup"] as const) {
+    it.effect(`a child assigned after the interrupt snapshot is reconciled: ${childEnds}`, () =>
+      Effect.gen(function* () {
+        const ownership = makeManagedCommandOwnership();
+        ownership.observe("turn/started", { threadId: "root", turn: { id: "turn" } });
+        // The interrupt snapshots targets before the late assignment arrives.
+        const snapshot = ownership.targets("root", "turn");
+        assert.isFalse(snapshot.has("late-child"));
+        spawnChild(ownership, "late-child", "root", "turn");
+        ownership.observe("item/started", item("late-command", "late-child", "late-child-turn"));
+        ownership.observe("turn/completed", {
+          threadId: "root",
+          turn: { id: "turn", status: "interrupted" },
+        });
+        const completeChild = () =>
+          ownership.observe("turn/completed", {
+            threadId: "late-child",
+            turn: { id: "late-child-turn", status: "completed" },
+          });
+        if (childEnds === "before-cleanup") completeChild();
+        let present = true;
+        const calls: Array<{ method: string; params: unknown }> = [];
+        const client = {
+          request: (method: string, params?: unknown) =>
+            Effect.sync(() => {
+              calls.push({ method, params });
+              if (method === "turn/interrupt") {
+                completeChild();
+                return {};
+              }
+              if (method.endsWith("/list"))
+                return {
+                  data:
+                    (params as { threadId: string }).threadId === "late-child" && present
+                      ? [{ itemId: "late-command", processId: "11" }]
+                      : [],
+                };
+              present = false;
+              return { terminated: true };
+            }),
+        };
+        const result = yield* ownership.cleanup(client, snapshot, "root");
+        assert.isTrue(result.confirmed, result.reason);
+        assert.deepEqual(
+          calls.filter((c) => c.method.endsWith("/terminate")).map((c) => c.params),
+          [{ threadId: "late-child", processId: "11" }],
+        );
+        assert.equal(
+          calls.some((c) => c.method === "turn/interrupt"),
+          childEnds === "during-cleanup",
+        );
+      }),
+    );
+  }
+
   it.effect("bounds an unresponsive provider without claiming termination", () =>
     Effect.gen(function* () {
       const ownership = makeManagedCommandOwnership();

@@ -279,17 +279,22 @@ export function makeManagedCommandOwnership() {
       });
       if (incomplete) return fail("Command ownership history is incomplete.");
       const rootTurnId = turns.get(root);
+      if (rootTurnId === undefined) return fail("The interrupted root turn is unknown.");
+      // The caller's snapshot can predate an assignment whose spawn, start and
+      // command notifications arrive later. Each pass re-derives the owned set.
+      const scopeNow = () => new Map([...turns, ...targets(root, rootTurnId)]);
+      let scope = scopeNow();
       const owned = (command: Command) =>
         command.threadId === root
           ? command.turnId === rootTurnId
           : rootTurn(command.threadId, root) === rootTurnId;
       const scopeStable = () =>
         verified(root) &&
-        terminalProof(turns) &&
+        terminalProof(scope) &&
         [...liveTurns].every(([thread, turn]) =>
           thread === root
             ? turn === rootTurnId
-            : rootTurn(thread, root) !== rootTurnId || turns.get(thread) === turn,
+            : rootTurn(thread, root) !== rootTurnId || scope.get(thread) === turn,
         ) &&
         [...commands.values()].every(
           (command) =>
@@ -300,15 +305,37 @@ export function makeManagedCommandOwnership() {
         [...commands.values()].every(
           (command) => !owned(command) || completed(command.threadId, command.turnId),
         );
+      // A late owned child that is still running is interrupted here and must
+      // produce its own terminal receipt before its terminals are reconciled.
+      const settleLate = Effect.gen(function* () {
+        scope = scopeNow();
+        const late = [...scope].filter(
+          ([thread, turn]) => !turns.has(thread) && !completed(thread, turn),
+        );
+        yield* Effect.forEach(
+          late,
+          ([threadId, turnId]) =>
+            client
+              .request("turn/interrupt", { threadId, turnId })
+              .pipe(Effect.timeout("3 seconds"), Effect.ignore),
+          { concurrency: 8 },
+        );
+        // Only late children are awaited: a missing receipt for the caller's
+        // own targets still fails closed at once through scopeStable.
+        if (late.length > 0) yield* awaitTerminals(new Map(late));
+      });
+      yield* settleLate;
       if (!scopeStable()) return fail("Turn completion or assignment ownership is unconfirmed.");
       const list = (threadId: string) => listBackgroundTerminals(client, threadId);
       // A command can register while the interrupt is settling. Missing ownership
       // is never treated as proof of exit; bounded reconciliation fails closed.
       for (let pass = 0; pass < 4; pass++) {
+        const before = scope.size;
+        yield* settleLate;
         if (!scopeStable())
           return fail("Execution changed while interruption was being reconciled.");
-        let remaining = false;
-        for (const [threadId] of turns) {
+        let remaining = scope.size !== before;
+        for (const [threadId] of scope) {
           for (const terminal of yield* list(threadId)) {
             const command = commands.get(key(threadId, terminal.itemId));
             if (!command) return fail("A terminal has no verified command-item owner.");

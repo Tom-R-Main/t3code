@@ -156,7 +156,10 @@ preserves background terminals. The managed adapter uses the experimental
 Earlier-turn terminals remain running. A child requires both provider-reported
 parent lineage and the parent's explicit started-activity turn. Children from
 older parent turns remain running; background commands from completed children
-of the interrupted assignment are included. A child reporting back to its
+of the interrupted assignment are included. Cleanup re-derives the owned set on every
+pass, so a child whose assignment arrives after the interrupt began is
+interrupted, awaited for its terminal receipt and reconciled within the same
+bound; if the set is still changing at the bound, termination stays unconfirmed. A child reporting back to its
 parent or root transfers no ownership. Reassignment across parent turns
 without an unambiguous ownership transition fails closed. Command text, checkout
 paths, and host process names grant no cleanup authority. Ordinary unmanaged T3
