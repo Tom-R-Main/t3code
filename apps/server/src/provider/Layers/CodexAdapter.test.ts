@@ -496,6 +496,57 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }),
   );
 
+  for (const [label, attestation, expected] of [
+    ["a valid attestation admits exactly one resume", "4242", [true, false]],
+    ["a malformed attestation admits none", "042", [false, false]],
+    ["a missing attestation admits none", undefined, [false, false]],
+  ] as const) {
+    it.effect(`managed resume process-tree attestation: ${label}`, () => {
+      const runtimeFactory = makeRuntimeFactory();
+      const layer = Layer.effect(
+        CodexAdapter,
+        makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: runtimeFactory.factory,
+          environment: {
+            T3_SIFT_MANAGED_ACCESS: "1",
+            ...(attestation === undefined
+              ? {}
+              : { T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED: attestation }),
+          },
+        }),
+      ).pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+        Layer.provideMerge(providerSessionDirectoryTestLayer),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      return Effect.gen(function* () {
+        const adapter = yield* CodexAdapter;
+        const attested: boolean[] = [];
+        for (const name of ["resume-first", "resume-second"]) {
+          const threadId = asThreadId(name);
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId,
+            runtimeMode: "full-access",
+            resumeCursor: { threadId: `provider-${name}` },
+          });
+          attested.push(runtimeFactory.lastRuntime?.options.managedResumeAttested === true);
+          yield* adapter.stopSession(threadId);
+        }
+        NodeAssert.deepEqual(attested, [...expected]);
+        // A fresh managed session never consumes or needs the attestation.
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("fresh"),
+          runtimeMode: "full-access",
+        });
+        NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedResumeAttested, undefined);
+        yield* adapter.stopSession(asThreadId("fresh"));
+      }).pipe(Effect.provide(layer));
+    });
+  }
+
   it.effect(
     "enables managed interruption and publishes unconfirmed termination as an error",
     () => {

@@ -321,6 +321,33 @@ describe("managed admission across interruption and resume", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live("a resumed managed session without process-tree attestation fails closed", () =>
+    Effect.gen(function* () {
+      const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "managed-resume-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      );
+      const scriptPath = yield* writeScript(directory, { turnIds: ["resumed-turn"] });
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("managed-resume-unattested"),
+        binaryPath: peerPath,
+        cwd: directory,
+        runtimeMode: "full-access",
+        managedInterrupt: true,
+        resumeCursor: { threadId: wireFixture.rootThreadId },
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const session = yield* runtime.start();
+      assert.equal(session.status, "error");
+      assert.include(session.lastError ?? "", "T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED");
+      assert.equal(
+        (yield* runtime.sendTurn({ input: "after resume" }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   for (const variant of ["child-terminal", "loaded-list-error"] as const) {
     it.live(`a resumed managed session fails closed: ${variant}`, () =>
       Effect.gen(function* () {
@@ -345,6 +372,7 @@ describe("managed admission across interruption and resume", () => {
           runtimeMode: "full-access",
           managedInterrupt: true,
           resumeCursor: { threadId: wireFixture.rootThreadId },
+          managedResumeAttested: true,
           environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
         });
         assert.equal((yield* runtime.start()).status, "error");
@@ -379,6 +407,7 @@ describe("managed admission across interruption and resume", () => {
             runtimeMode: "full-access",
             managedInterrupt: true,
             resumeCursor: { threadId: wireFixture.rootThreadId },
+            managedResumeAttested: true,
             environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
           });
           const session = yield* runtime.start();

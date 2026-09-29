@@ -178,6 +178,11 @@ export interface CodexSessionRuntimeOptions {
   readonly runtimeMode: RuntimeMode;
   /** Sift requires command cleanup in addition to Codex's native turn interruption. */
   readonly managedInterrupt?: boolean;
+  /**
+   * A managed resume is admitted only when the host attested that the previous
+   * app-server's process tree is gone (T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED).
+   */
+  readonly managedResumeAttested?: boolean;
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
@@ -2489,22 +2494,28 @@ export const makeCodexSessionRuntime = (
       });
 
       const providerThreadId = opened.thread.id;
-      // A resumed provider thread carries no item history here, so any background
-      // terminal on any loaded thread (root or child) has unknown turn
-      // ownership. Fail closed until Stop unless every loaded thread lists empty.
-      const resumeThreadId = readResumeCursorThreadId(options.resumeCursor);
-      const inheritedUnknown =
+      // A resumed managed session has no ownership history. Processes left by the
+      // previous app-server are invisible to this one (terminals live in its
+      // memory), so the host must attest that tree is gone; then any background
+      // terminal on any thread loaded here (root or child) still fails closed.
+      // Applies whenever a resume cursor was supplied, including a fallback to a
+      // fresh thread, because the earlier processes belong to the host, not a thread.
+      const managedResume =
         options.managedInterrupt === true &&
-        resumeThreadId !== undefined &&
-        providerThreadId === resumeThreadId &&
-        (yield* listLoadedThreadTerminals(client.raw).pipe(
-          Effect.timeout("10 seconds"),
-          Effect.map(({ threads, terminals }) => threads === 0 || terminals > 0),
-          Effect.catchCause(() => Effect.succeed(true)),
-        ));
+        readResumeCursorThreadId(options.resumeCursor) !== undefined;
+      const inheritedReason = !managedResume
+        ? undefined
+        : options.managedResumeAttested !== true
+          ? "Resumed managed session has no host attestation (T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED) that the previous app-server process tree is gone; stop the session before sending another turn."
+          : (yield* listLoadedThreadTerminals(client.raw).pipe(
+                Effect.timeout("10 seconds"),
+                Effect.map(({ threads, terminals }) => threads === 0 || terminals > 0),
+                Effect.catchCause(() => Effect.succeed(true)),
+              ))
+            ? "Resumed session reports background terminals with unknown ownership, or they could not be listed; stop the session before sending another turn."
+            : undefined;
+      const inheritedUnknown = inheritedReason !== undefined;
       if (inheritedUnknown) managedInterruptUnconfirmed = true;
-      const inheritedReason =
-        "Resumed session reports background terminals with unknown ownership; stop the session before sending another turn.";
       const session = {
         ...(yield* Ref.get(sessionRef)),
         status: inheritedUnknown ? "error" : "ready",

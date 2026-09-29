@@ -390,6 +390,135 @@ describe("managed command ownership", () => {
     }),
   );
 
+  const spawnOnly = (
+    ownership: ReturnType<typeof makeManagedCommandOwnership>,
+    child: string,
+    parentTurn: string,
+  ) => {
+    ownership.observe("thread/started", {
+      thread: {
+        id: child,
+        source: { subAgent: { thread_spawn: { parent_thread_id: "root" } } },
+      },
+    });
+    ownership.observe("item/completed", {
+      threadId: "root",
+      turnId: parentTurn,
+      item: {
+        id: `spawn-${child}`,
+        type: "subAgentActivity",
+        kind: "started",
+        agentThreadId: child,
+      },
+    });
+  };
+  const settle = Effect.gen(function* () {
+    for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
+  });
+
+  it.effect("a spawned child that starts after its parent completes is settled", () =>
+    Effect.gen(function* () {
+      const ownership = makeManagedCommandOwnership();
+      ownership.observe("turn/started", { threadId: "root", turn: { id: "turn" } });
+      spawnOnly(ownership, "pending-child", "turn");
+      ownership.observe("turn/completed", {
+        threadId: "root",
+        turn: { id: "turn", status: "interrupted" },
+      });
+      const snapshot = ownership.targets("root", "turn");
+      // Codex reports a terminal only after its command item has started.
+      let registered = false;
+      let present = true;
+      const calls: Array<{ method: string; params: unknown }> = [];
+      const client = {
+        request: (method: string, params?: unknown) =>
+          Effect.sync(() => {
+            calls.push({ method, params });
+            if (method === "turn/interrupt") {
+              ownership.observe("turn/completed", {
+                threadId: "pending-child",
+                turn: { id: "pending-child-turn", status: "interrupted" },
+              });
+              return {};
+            }
+            if (method.endsWith("/list"))
+              return {
+                data:
+                  (params as { threadId: string }).threadId === "pending-child" &&
+                  registered &&
+                  present
+                    ? [{ itemId: "pending-command", processId: "13" }]
+                    : [],
+              };
+            present = false;
+            return { terminated: true };
+          }),
+      };
+      const running = yield* ownership.cleanup(client, snapshot, "root").pipe(Effect.forkChild);
+      yield* settle;
+      ownership.observe("turn/started", {
+        threadId: "pending-child",
+        turn: { id: "pending-child-turn" },
+      });
+      ownership.observe(
+        "item/started",
+        item("pending-command", "pending-child", "pending-child-turn"),
+      );
+      registered = true;
+      const result = yield* Fiber.join(running);
+      assert.isTrue(result.confirmed, result.reason);
+      assert.deepEqual(
+        calls.filter((c) => c.method.endsWith("/terminate")).map((c) => c.params),
+        [{ threadId: "pending-child", processId: "13" }],
+      );
+    }),
+  );
+
+  it.effect("a spawned child that never starts or closes keeps cleanup unconfirmed", () =>
+    Effect.gen(function* () {
+      const ownership = makeManagedCommandOwnership();
+      ownership.observe("turn/started", { threadId: "root", turn: { id: "turn" } });
+      spawnOnly(ownership, "silent-child", "turn");
+      ownership.observe("turn/completed", {
+        threadId: "root",
+        turn: { id: "turn", status: "interrupted" },
+      });
+      const running = yield* ownership
+        .cleanup(
+          { request: () => Effect.succeed({ data: [] }) },
+          ownership.targets("root", "turn"),
+          "root",
+        )
+        .pipe(Effect.forkChild);
+      yield* settle;
+      yield* TestClock.adjust("15 seconds");
+      assert.isFalse((yield* Fiber.join(running)).confirmed);
+    }),
+  );
+
+  it.effect("a spawned child that closes without starting a turn does not block cleanup", () =>
+    Effect.gen(function* () {
+      const ownership = makeManagedCommandOwnership();
+      ownership.observe("turn/started", { threadId: "root", turn: { id: "turn" } });
+      spawnOnly(ownership, "closed-child", "turn");
+      ownership.observe("turn/completed", {
+        threadId: "root",
+        turn: { id: "turn", status: "interrupted" },
+      });
+      const running = yield* ownership
+        .cleanup(
+          { request: () => Effect.succeed({ data: [] }) },
+          ownership.targets("root", "turn"),
+          "root",
+        )
+        .pipe(Effect.forkChild);
+      yield* settle;
+      ownership.observe("thread/closed", { threadId: "closed-child" });
+      const result = yield* Fiber.join(running);
+      assert.isTrue(result.confirmed, result.reason);
+    }),
+  );
+
   it.effect("bounds an unresponsive provider without claiming termination", () =>
     Effect.gen(function* () {
       const ownership = makeManagedCommandOwnership();

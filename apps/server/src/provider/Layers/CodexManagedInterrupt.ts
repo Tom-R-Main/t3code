@@ -113,6 +113,9 @@ export function makeManagedCommandOwnership() {
   const liveTurns = new Map<string, string>();
   const spawns = new Map<string, { parent: string; turn: string }>();
   const completions = new Set<string>();
+  // A spawned child is pending until it starts a turn or its thread closes.
+  const startedThreads = new Set<string>();
+  const closedThreads = new Set<string>();
   const listeners = new Set<() => void>();
   let incomplete = false;
   const key = (threadId: string, itemId: string) => JSON.stringify([threadId, itemId]);
@@ -142,7 +145,13 @@ export function makeManagedCommandOwnership() {
         else parents.set(p.thread.id, parent);
       }
     }
+    if (method === "thread/closed" && p.threadId) {
+      if (!closedThreads.has(p.threadId) && closedThreads.size >= 256) incomplete = true;
+      else closedThreads.add(p.threadId);
+    }
     if (method === "turn/started" && p.threadId && p.turn) {
+      if (!startedThreads.has(p.threadId) && startedThreads.size >= 256) incomplete = true;
+      else startedThreads.add(p.threadId);
       if (!liveTurns.has(p.threadId) && liveTurns.size >= 256) incomplete = true;
       else liveTurns.set(p.threadId, p.turn.id);
     }
@@ -154,7 +163,6 @@ export function makeManagedCommandOwnership() {
         if (completions.size >= 4096) incomplete = true;
         else completions.add(key(p.threadId, p.turn.id));
       }
-      for (const notify of listeners) notify();
     }
     if (
       (method === "item/started" || method === "item/completed") &&
@@ -223,6 +231,11 @@ export function makeManagedCommandOwnership() {
       });
     }
     if (parents.size > 256 || liveTurns.size > 256) incomplete = true;
+    // Waiters re-check after every observation: completions, turn starts and
+    // thread closures can each settle a pending cleanup condition. They resume
+    // through a yield, so the caller's notification handling (and any items it
+    // delivers next) completes before cleanup continues.
+    for (const notify of listeners) notify();
   };
   // A lineage proves which thread is the parent; the parent's started activity
   // independently proves which parent turn created this assignment.
@@ -249,6 +262,26 @@ export function makeManagedCommandOwnership() {
     }
     return turns;
   };
+  // Assigned children under this root turn that have neither started a turn nor
+  // closed: their first turn and its commands would otherwise escape cleanup.
+  const pendingChildren = (root: string, turn: string) =>
+    [...spawns.keys()].filter(
+      (thread) =>
+        rootTurn(thread, root) === turn &&
+        !startedThreads.has(thread) &&
+        !closedThreads.has(thread),
+    );
+  const awaitNoPendingChildren = (root: string, turn: string) =>
+    Effect.callback<void>((resume) => {
+      const notify = () => {
+        if (pendingChildren(root, turn).length === 0) resume(Effect.yieldNow);
+      };
+      listeners.add(notify);
+      notify();
+      return Effect.sync(() => {
+        listeners.delete(notify);
+      });
+    }).pipe(Effect.timeoutOption("10 seconds"));
   const verified = (root: string) =>
     !incomplete &&
     [...liveTurns.keys()].every(
@@ -260,7 +293,7 @@ export function makeManagedCommandOwnership() {
   const awaitTerminals = (turns: Iterable<readonly [string, string]>) =>
     Effect.callback<void>((resume) => {
       const notify = () => {
-        if (terminalProof(turns)) resume(Effect.void);
+        if (terminalProof(turns)) resume(Effect.yieldNow);
       };
       listeners.add(notify);
       notify();
@@ -300,6 +333,7 @@ export function makeManagedCommandOwnership() {
           : rootTurn(command.threadId, root) === rootTurnId;
       const scopeStable = () =>
         verified(root) &&
+        pendingChildren(root, rootTurnId).length === 0 &&
         scope.every(([thread, turn]) => completed(thread, turn)) &&
         [...liveTurns].every(([thread, turn]) =>
           thread === root
@@ -318,6 +352,7 @@ export function makeManagedCommandOwnership() {
       // A late owned child that is still running is interrupted here and must
       // produce its own terminal receipt before its terminals are reconciled.
       const settleLate = Effect.gen(function* () {
+        if ((yield* awaitNoPendingChildren(root, rootTurnId))._tag === "None") return false;
         scope = scopeNow();
         const late = scope.filter(
           ([thread, turn]) => !snapshotPairs.has(pairKey(thread, turn)) && !completed(thread, turn),
@@ -333,15 +368,18 @@ export function makeManagedCommandOwnership() {
         // Only late children are awaited: a missing receipt for the caller's
         // own targets still fails closed at once through scopeStable.
         if (late.length > 0) yield* awaitTerminals(late);
+        return true;
       });
-      yield* settleLate;
+      if (!(yield* settleLate))
+        return fail("A spawned child neither started a turn nor closed within the bound.");
       if (!scopeStable()) return fail("Turn completion or assignment ownership is unconfirmed.");
       const list = (threadId: string) => listBackgroundTerminals(client, threadId);
       // A command can register while the interrupt is settling. Missing ownership
       // is never treated as proof of exit; bounded reconciliation fails closed.
       for (let pass = 0; pass < 4; pass++) {
         const before = scope.length;
-        yield* settleLate;
+        if (!(yield* settleLate))
+          return fail("A spawned child neither started a turn nor closed within the bound.");
         if (!scopeStable())
           return fail("Execution changed while interruption was being reconciled.");
         let remaining = scope.length !== before;

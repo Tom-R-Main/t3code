@@ -31,7 +31,7 @@ import {
   ThreadId,
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
-import { isManagedAccessEnabled } from "../../sift/ManagedAccess.ts";
+import { isManagedAccessEnabled, priorProcessTreeTerminated } from "../../sift/ManagedAccess.ts";
 import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
 import * as Crypto from "effect/Crypto";
@@ -2269,6 +2269,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  // The host attests one process-tree termination per T3 server launch, so it
+  // admits at most one managed resume in this process; later resumes fail closed.
+  let priorProcessTreeAttestation = priorProcessTreeTerminated(options?.environment ?? process.env);
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2291,11 +2294,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const managedResume =
+          isManagedAccessEnabled(options?.environment ?? process.env) &&
+          isCodexResumeCursorSchema(input.resumeCursor);
+        const managedResumeAttested = managedResume && priorProcessTreeAttestation;
+        if (managedResume) priorProcessTreeAttestation = false;
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           ...(isManagedAccessEnabled(options?.environment ?? process.env)
             ? { managedInterrupt: true }
             : {}),
+          ...(managedResume ? { managedResumeAttested } : {}),
           providerInstanceId: boundInstanceId,
           cwd: input.cwd ?? process.cwd(),
           binaryPath: codexConfig.binaryPath,

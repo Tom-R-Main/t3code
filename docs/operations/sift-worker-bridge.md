@@ -156,7 +156,10 @@ preserves background terminals. The managed adapter uses the experimental
 Earlier-turn terminals remain running. A child requires both provider-reported
 parent lineage and the parent's explicit started-activity turn. Children from
 older parent turns remain running; background commands from completed children
-of the interrupted assignment are included. Cleanup re-derives the owned set on every
+of the interrupted assignment are included. A child whose spawn is verified
+but which has not yet started a turn is part of the interrupted assignment:
+cleanup waits, within its bound, for that child to start (and then settles its
+turn) or for its thread to close, and otherwise stays unconfirmed. Cleanup re-derives the owned set on every
 pass, so a child whose assignment arrives after the interrupt began is
 interrupted, awaited for its terminal receipt and reconciled within the same
 bound; if the set is still changing at the bound, termination stays unconfirmed.
@@ -175,15 +178,17 @@ receipts (completed, interrupted or failed) before reconciling processes; an acc
 a synthesized completion. Turns whose preparation crossed an interrupt must be
 submitted again. A turn whose `turn/start` response arrives after an interrupt
 began is interrupted and refused, and the session stays unconfirmed until Stop.
-A resumed managed session lists background terminals for every thread loaded in
-the app-server (`thread/loaded/list`, then each thread's
-`thread/backgroundTerminals/list`) before admitting turns. Codex keeps terminals
-per thread session, so the root alone is not enough. Any reported terminal, or
-any listing failure, leaves the session unconfirmed until Stop, because a
-restarted provider has no item history to prove their ownership. This check
-only sees threads loaded in the current app-server process: processes left by a
-previous app-server process are invisible to the protocol and must be removed by
-host teardown of that process tree. Missing ownership (including terminals inherited
+A resumed managed session (any session started with a resume cursor, including
+one that falls back to a fresh thread) is refused until two things hold. First,
+the host has attested that the previous app-server's process tree is gone
+(`T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED`, below): Codex keeps background
+terminals in the app-server's memory, so nothing in the provider protocol can
+reveal processes the previous app-server left. Second, every thread loaded in the
+new app-server (`thread/loaded/list`, then each thread's
+`thread/backgroundTerminals/list`) reports no background terminals; Codex keeps
+terminals per thread session, so the root alone is not enough. A missing or
+malformed attestation, any reported terminal, an empty loaded set, or any listing
+failure leaves the session unconfirmed until Stop. Missing ownership (including terminals inherited
 after reconnect without observed item history), changed execution, protocol
 errors, or bounded reconciliation exhaustion produce an explicit error stating
 that termination is unconfirmed. They do not restart or kill the provider.
@@ -197,6 +202,27 @@ owns disposable processes. They prove targeted cleanup and surviving sibling
 and earlier-turn processes. Release acceptance still requires the lifecycle
 probe against the exact rebuilt image with real Codex: offline protocol and
 fixture results do not establish real-provider process termination.
+
+#### Host contract: `T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED`
+
+- **Name**: `T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED`, an environment variable of
+  the T3 server process. Read only with `T3_SIFT_MANAGED_ACCESS=1`.
+- **Value**: the decimal process-group id of the previous T3 server for the same
+  runtime: `^[1-9][0-9]{0,9}$`, at most 2147483647. Any other value counts as
+  absent.
+- **Who sets it**: the Sift host daemon, never an operator or a client.
+- **When**: only when the daemon launches a replacement T3 server for a runtime
+  whose previous T3 server it launched, and only after it has confirmed that no
+  process descended from that server remains: the previous Codex app-server and
+  every command it started, including commands running in their own session or
+  process group (for example under a PTY). An empty process group alone is not
+  sufficient; track descendants by a containment the commands cannot leave, such
+  as a cgroup or systemd scope. Omit the variable on a first launch and whenever
+  that confirmation is not available.
+- **Effect**: admits at most one managed resume in this T3 server process; any
+  later resume in the same process is refused until Stop. The loaded-thread
+  terminal check still runs. The value is an assertion by the host; T3 does not
+  inspect the host's process table.
 
 Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,
