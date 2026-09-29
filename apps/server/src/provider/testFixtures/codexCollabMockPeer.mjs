@@ -8,6 +8,7 @@ import * as NodeFS from "node:fs";
 import * as NodeReadline from "node:readline";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
+import * as NodeChildProcess from "node:child_process";
 
 const here = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const fixture = JSON.parse(
@@ -16,13 +17,31 @@ const fixture = JSON.parse(
 const script = JSON.parse(NodeFS.readFileSync(process.env.T3_CODEX_COLLAB_SCRIPT, "utf8"));
 
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+// Ordered record of lifecycle effects (interrupts and terminations) for tests.
+const lifecycle = (entry) => {
+  if (script.recordLifecycle)
+    NodeFS.appendFileSync(`${process.env.T3_CODEX_COLLAB_SCRIPT}.lifecycle`, `${entry}\n`);
+};
 let turnStartCount = 0;
 let activeTurn;
+const terminals = new Map();
+let terminalListCount = 0;
+let reloadCount = 0;
+let pendingReload;
+const heldTurnStarts = [];
+let queuedStarted = false;
+let interruptCount = 0;
+let approvalEndedTurn = false;
+const lateCommandNotifications = [];
+process.on("exit", () => {
+  for (const terminal of terminals.values()) terminal.child.kill("SIGTERM");
+});
+process.on("SIGTERM", () => process.exit(0));
 // Server->client requests the runtime must answer (approval prompts), keyed
 // by the numeric JSON-RPC id this peer allocated for them.
 const openServerRequests = new Map();
 const rl = NodeReadline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
+rl.on("line", async (line) => {
   let message;
   try {
     message = JSON.parse(line);
@@ -30,6 +49,82 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method } = message;
+  if (method === "config/mcpServer/reload" && script.deferSecondReload) {
+    if (++reloadCount === 2) {
+      pendingReload = id;
+      write({
+        method: "serverRequest/resolved",
+        params: { threadId: script.rootThreadId, requestId: "fixture-reload-blocked" },
+      });
+    } else write({ id, result: {} });
+    return;
+  }
+  if (method === "feedback/upload" && heldTurnStarts.length > 0) {
+    // Releases the oldest held turn/start response.
+    const held = heldTurnStarts.shift();
+    write({ id, result: { threadId: script.rootThreadId } });
+    write({ id: held.id, result: { ...fixture.responses.turnStart, turn: held.turn } });
+    return;
+  }
+  if (method === "feedback/upload" && pendingReload !== undefined) {
+    write({ id: pendingReload, result: {} });
+    pendingReload = undefined;
+    write({ id, result: { threadId: script.rootThreadId } });
+    return;
+  }
+  if (method === "thread/loaded/list") {
+    if (script.loadedListError) {
+      write({ id, error: { code: -32000, message: "scripted loaded-list failure" } });
+      return;
+    }
+    write({
+      id,
+      result: { data: script.loadedThreads ?? [script.rootThreadId], nextCursor: null },
+    });
+    return;
+  }
+  if (method === "thread/backgroundTerminals/list") {
+    terminalListCount++;
+    if (script.managedCleanupError || (script.failFirstCleanupOnly && interruptCount <= 1)) {
+      write({ id, error: { code: -32000, message: "scripted cleanup failure" } });
+      return;
+    }
+    write({
+      id,
+      result: {
+        data: [
+          // Terminals a restarted provider still reports without item history.
+          ...(script.inheritedTerminals ?? []).filter(
+            (t) => t.threadId === message.params.threadId,
+          ),
+          ...[...terminals.values()].filter(
+            (t) =>
+              t.threadId === message.params.threadId &&
+              t.child.exitCode === null &&
+              (!t.late || terminalListCount > 1),
+          ),
+        ].map((t) => ({ itemId: t.itemId, processId: t.processId })),
+        nextCursor: null,
+      },
+    });
+    return;
+  }
+  if (method === "thread/backgroundTerminals/terminate") {
+    const t = terminals.get(message.params.processId);
+    if (!t || t.threadId !== message.params.threadId) {
+      write({ id, result: { terminated: false } });
+      return;
+    }
+    await new Promise((resolve) => {
+      t.child.once("exit", resolve);
+      t.child.kill("SIGTERM");
+    });
+    terminals.delete(t.processId);
+    NodeFS.appendFileSync(`${process.env.T3_CODEX_COLLAB_SCRIPT}.terminated`, `${t.processId}\n`);
+    lifecycle(`terminate:${t.processId}`);
+    write({ id, result: { terminated: true } });
+    return;
+  }
   if (openServerRequests.has(id)) {
     // The runtime answered an approval request. Record the response so tests
     // can assert settlement behavior, then emit serverRequest/resolved as a
@@ -52,6 +147,31 @@ rl.on("line", (line) => {
         requestId: request.itemId ?? request.label,
       },
     });
+    if (script.cancelApprovalEndsTurn && message.result?.decision === "cancel") {
+      write({
+        method: "item/completed",
+        params: {
+          threadId: script.rootThreadId,
+          turnId: activeTurn.id,
+          completedAtMs: 2,
+          item: {
+            id: request.itemId,
+            type: "commandExecution",
+            command: "pending fixture",
+            cwd: "/tmp",
+            status: "declined",
+            commandActions: [],
+            exitCode: null,
+            processId: null,
+          },
+        },
+      });
+      write({
+        method: "turn/completed",
+        params: { threadId: script.rootThreadId, turn: { ...activeTurn, status: "interrupted" } },
+      });
+      approvalEndedTurn = true;
+    }
     return;
   }
   if (method === undefined && script.serverRequests?.some((request) => request.id === id)) {
@@ -144,12 +264,45 @@ rl.on("line", (line) => {
     return;
   }
   if (method === "turn/start") {
+    approvalEndedTurn = false;
+    if (script.deferSecondReload)
+      NodeFS.appendFileSync(`${process.env.T3_CODEX_COLLAB_SCRIPT}.turnStarts`, "start\n");
     const turnId = script.turnIds?.[turnStartCount];
     const turn = turnId
       ? { ...fixture.responses.turnStart.turn, id: turnId }
       : fixture.responses.turnStart.turn;
-    activeTurn = turn;
     turnStartCount += 1;
+    const holdIndexes = script.holdTurnStarts ?? (script.holdSecondTurnStart ? [2] : []);
+    if (holdIndexes.includes(turnStartCount)) {
+      // The response stays in flight until the test releases it (feedback/upload).
+      heldTurnStarts.push({ id, turn });
+      write({
+        method: "serverRequest/resolved",
+        params: {
+          threadId: script.rootThreadId,
+          requestId:
+            turnStartCount === 2
+              ? "fixture-turn-start-held"
+              : `fixture-turn-start-held-${turnStartCount}`,
+        },
+      });
+      return;
+    }
+    const failure = script.failTurnStartResponse;
+    if (failure && failure.index === turnStartCount) {
+      // Codex accepted the turn (it starts), but the response is lost or unusable.
+      activeTurn = turn;
+      write({
+        jsonrpc: "2.0",
+        method: "turn/started",
+        params: { threadId: script.rootThreadId, turn },
+      });
+      if (failure.mode === "error")
+        write({ id, error: { code: -32000, message: "scripted turn/start response failure" } });
+      else write({ id, result: { turn: { id: 5 } } });
+      return;
+    }
+    activeTurn = turn;
     write({ id, result: { ...fixture.responses.turnStart, turn } });
     const rootThreadId = script.rootThreadId;
     if (script.onlyFirstTurnStarts !== true || turnStartCount === 1) {
@@ -157,6 +310,55 @@ rl.on("line", (line) => {
         jsonrpc: "2.0",
         method: "turn/started",
         params: { threadId: rootThreadId, turn },
+      });
+    }
+    if (turnStartCount === 1 && script.managedTerminals) {
+      for (const [index, spec] of script.managedTerminals.entries()) {
+        const child = NodeChildProcess.spawn(
+          process.execPath,
+          ["-e", "setInterval(() => {}, 1000)"],
+          {
+            stdio: "ignore",
+          },
+        );
+        await new Promise((resolve, reject) => {
+          child.once("spawn", resolve);
+          child.once("error", reject);
+        });
+        const processId = String(index + 1);
+        const threadId = spec.threadId ?? rootThreadId;
+        const itemId = `command-${processId}`;
+        terminals.set(processId, { child, threadId, itemId, processId, late: spec.late });
+        NodeFS.appendFileSync(
+          `${process.env.T3_CODEX_COLLAB_SCRIPT}.processes`,
+          `${JSON.stringify({ pid: child.pid, kind: spec.kind, processId })}\n`,
+        );
+        if (spec.kind !== "sibling") {
+          const notification = {
+            method: "item/started",
+            params: {
+              startedAtMs: 1,
+              threadId,
+              turnId: spec.kind === "retained" ? "earlier-turn" : turn.id,
+              item: {
+                id: itemId,
+                type: "commandExecution",
+                command: "node fixture",
+                cwd: "/tmp",
+                status: "inProgress",
+                commandActions: [],
+                processId,
+              },
+            },
+          };
+          if (script.missingTerminal && spec.kind === "owned")
+            lateCommandNotifications.push(notification);
+          else write(notification);
+        }
+      }
+      write({
+        method: "serverRequest/resolved",
+        params: { threadId: rootThreadId, requestId: "fixture-processes-ready" },
       });
     }
     for (const notification of script.notifications) {
@@ -179,6 +381,24 @@ rl.on("line", (line) => {
           .replaceAll("${threadId}", String(rootThreadId))
           .replaceAll("${turnId}", String(turn.id)),
       );
+      if (script.cancelApprovalEndsTurn)
+        write({
+          method: "item/started",
+          params: {
+            threadId: script.rootThreadId,
+            turnId: turn.id,
+            startedAtMs: 1,
+            item: {
+              id: params.itemId,
+              type: "commandExecution",
+              command: "pending fixture",
+              cwd: "/tmp",
+              status: "inProgress",
+              commandActions: [],
+              processId: null,
+            },
+          },
+        });
       write({ jsonrpc: "2.0", id: requestId, method: request.method, params });
     }
     if (script.holdTurnOpen !== true) {
@@ -194,6 +414,8 @@ rl.on("line", (line) => {
     return;
   }
   if (method === "turn/interrupt") {
+    interruptCount++;
+    lifecycle(`interrupt:${message.params?.turnId}`);
     // Record which thread/turn was interrupted (append-only sidecar file the
     // test reads) so Stop coverage can assert every live child was reached.
     // failInterruptFor simulates a dead child whose interrupt errors.
@@ -202,6 +424,14 @@ rl.on("line", (line) => {
       `${process.env.T3_CODEX_COLLAB_SCRIPT}.interrupts`,
       `${JSON.stringify({ threadId: target, turnId: message.params?.turnId })}\n`,
     );
+    if (approvalEndedTurn) {
+      NodeFS.writeFileSync(
+        `${process.env.T3_CODEX_COLLAB_SCRIPT}.noActiveInterrupt`,
+        "confirmed\n",
+      );
+      write({ id, error: { code: -32600, message: "no active turn to interrupt" } });
+      return;
+    }
     if (
       script.expectedActiveTurnId &&
       message.params?.threadId === script.rootThreadId &&
@@ -225,7 +455,26 @@ rl.on("line", (line) => {
       // nor rejects. The runtime's bounded deadline must move on.
       return;
     }
+    const queuedIgnores =
+      script.queuedIgnoresInterrupt && activeTurn?.id === script.startQueuedOnInterrupt;
+    if (
+      script.managedTerminals &&
+      !script.missingTerminal &&
+      target === script.rootThreadId &&
+      !queuedIgnores
+    )
+      write({
+        method: "turn/completed",
+        params: { threadId: target, turn: { ...activeTurn, status: "interrupted" } },
+      });
+    if (script.startQueuedOnInterrupt && !queuedStarted && target === script.rootThreadId) {
+      // Codex runs a queued follow-up as soon as the current turn is interrupted.
+      queuedStarted = true;
+      activeTurn = { ...activeTurn, id: script.startQueuedOnInterrupt };
+      write({ method: "turn/started", params: { threadId: target, turn: activeTurn } });
+    }
     write({ id, result: {} });
+    for (const notification of lateCommandNotifications.splice(0)) write(notification);
     return;
   }
   if (id !== undefined) {

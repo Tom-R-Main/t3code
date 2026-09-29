@@ -146,9 +146,162 @@ images served over HTTP are unavailable to managed clients.
 
 ## Keeping the fork current
 
-Fork changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
+### Managed Codex interruption
+
+With `T3_SIFT_MANAGED_ACCESS=1`, interrupting Codex also reconciles commands
+owned by the interrupted provider turn. Native Codex interruption deliberately
+preserves background terminals. The managed adapter uses the experimental
+`thread/backgroundTerminals/list` and `terminate` APIs verified with Codex
+0.157.1, matching provider thread, turn, command item, and process identities.
+Earlier-turn terminals remain running. A child requires both provider-reported
+parent lineage and the parent's explicit started-activity turn. Children from
+older parent turns remain running; background commands from completed children
+of the interrupted assignment are included. A child whose spawn is verified
+but which has not yet started a turn is part of the interrupted assignment:
+cleanup waits, within its bound, for that child to start (and then settles its
+turn) or for its thread to close, and otherwise stays unconfirmed. Cleanup re-derives the owned set on every
+pass, so a child whose assignment arrives after the interrupt began is
+interrupted, awaited for its terminal receipt and reconciled within the same
+bound; if the set is still changing at the bound, termination stays unconfirmed.
+Late work is tracked per thread and turn, so a new assigned turn on a child
+already in the snapshot is reconciled the same way. Once an interruption is
+unconfirmed it stays unconfirmed for the session: a later interrupt only proves
+its own turn's commands, so only Stop clears it. A child reporting back to its
+parent or root transfers no ownership. Reassignment across parent turns
+without an unambiguous ownership transition fails closed. Command text, checkout
+paths, and host process names grant no cleanup authority. Ordinary unmanaged T3
+retains native Codex behavior.
+
+While reconciliation is pending, the adapter withholds the parent completion
+event and refuses new turns. It waits for actual matching provider turn-completed
+receipts (completed, interrupted or failed) before reconciling processes; an accepted interrupt alone never becomes
+a synthesized completion. Turns whose preparation crossed an interrupt must be
+submitted again. A turn whose `turn/start` response arrives after an interrupt
+began is interrupted and refused, and the session stays unconfirmed until Stop.
+A resumed managed session (any session started with a resume cursor, including
+one that falls back to a fresh thread) is refused until two things hold. First,
+the host has attested that the previous app-server's process tree is gone
+(`T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED`, below): Codex keeps background
+terminals in the app-server's memory, so nothing in the provider protocol can
+reveal processes the previous app-server left. Second, every thread loaded in the
+new app-server (`thread/loaded/list`, then each thread's
+`thread/backgroundTerminals/list`) reports no background terminals; Codex keeps
+terminals per thread session, so the root alone is not enough. A missing or
+malformed attestation, any reported terminal, an empty loaded set, or any listing
+failure leaves the session unconfirmed until Stop. Missing ownership (including terminals inherited
+after reconnect without observed item history), changed execution, protocol
+errors, or bounded reconciliation exhaustion produce an explicit error stating
+that termination is unconfirmed. They do not restart or kill the provider.
+The user can explicitly stop the session; a successful managed interrupt keeps
+the session available for another turn. Same-turn commands are not independently
+registered retained services. Service ownership belongs in the workspace
+service-grant integration.
+
+Offline regression tests run the real runtime against a scripted provider that
+owns disposable processes. They prove targeted cleanup and surviving sibling
+and earlier-turn processes. Release acceptance still requires the lifecycle
+probe against the exact rebuilt image with real Codex: offline protocol and
+fixture results do not establish real-provider process termination.
+
+#### Host contract: `T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED`
+
+- **Name**: `T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED`, an environment variable of
+  the T3 server process. Read only with `T3_SIFT_MANAGED_ACCESS=1`.
+- **Value**: the decimal process-group id of the previous T3 server for the same
+  runtime: `^[1-9][0-9]{0,9}$`, at most 2147483647. Any other value counts as
+  absent.
+- **Who sets it**: the Sift host daemon, never an operator or a client.
+- **When**: only when the daemon launches a replacement T3 server for a runtime
+  whose previous T3 server it launched, and only after it has confirmed that no
+  process descended from that server remains: the previous Codex app-server and
+  every command it started, including commands running in their own session or
+  process group (for example under a PTY). An empty process group alone is not
+  sufficient; track descendants by a containment the commands cannot leave, such
+  as a cgroup or systemd scope. Omit the variable on a first launch and whenever
+  that confirmation is not available.
+- **Effect**: valid only for the first managed provider session this T3 server
+  process starts, fresh or resumed. Any earlier managed session start in the
+  process consumes it, so a resume after an in-process replacement is refused
+  until the host restarts T3. The loaded-thread terminal check still runs. The
+  value is an assertion by the host; T3 does not inspect the host's process
+  table.
+
+#### In-process replacement and close
+
+Closing a managed provider session (Stop, or replacement by another session in
+the same T3 server) first terminates every background terminal on every loaded
+thread of its app-server, each with the provider's confirmation, and requires a
+final empty listing. The next app-server cannot see terminals the closed one
+leaves, so this is the only point where they can be proved gone. If that proof
+fails (listing or termination errors, a refusal, or the bound is exhausted),
+the T3 server process is tainted: every later managed session in it, fresh or
+resumed, starts unconfirmed and refuses turns until the host restarts T3 (with
+the attestation above, once the host has confirmed the tree is gone).
+Managed session starts in one T3 server wait for every close-time proof still
+in progress before starting, and every session reads the taint live, so a
+session that was already running also refuses new turns once the taint is set.
+
+#### Admission
+
+Principle: any uncertainty about owned provider work closes managed admission
+until Stop or a host restart of T3; only positive proof reopens it.
+
+One predicate decides admission, read live each time: no interruption in
+progress, no unconfirmed cleanup, no turn that crossed an interruption or whose
+start outcome is uncertain, no observed conflict in command ownership history,
+no close in progress, and no process taint. It gates every point that starts or
+continues provider work or reports the session ready or running: before and
+after `turn/start` (including after the turn is recorded), compaction, accepting
+an approval, answering a question, the `turn/started` and `turn/completed`
+status updates, rollback, the end of an interruption, and session start. A
+closed check leaves the session in error. Closing admission is sticky and
+cancels parked approvals. A root turn the provider starts while admission is
+closed for any reason (including a queued follow-up Codex starts during an
+interruption) is interrupted; an interruption confirms only after each such turn
+has its terminal receipt and a confirmed cleanup of its own work. Closing
+admission does not stop a turn already admitted and running; Stop does.
+
+Approval decisions are classified by effect, not by name: anything other than
+decline or cancel (accept, acceptForSession, acceptAlways, and any future
+variant) lets work proceed. While admission is closed such a decision is refused
+when submitted and, independently, replaced by cancel where each handler returns
+its answer to Codex (command, file-change, permissions and MCP elicitation
+approvals). Question answers are refused at both points as well.
+
+Provider requests and their failure paths:
+
+| Request                                                  | Creates or continues work         | Rejection, decode failure, timeout or abort                                                                                 |
+| -------------------------------------------------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `turn/start`                                             | Yes                               | Treated as possibly accepted: admission closes, and any root turn seen starting since the request is interrupted.           |
+| approval accept (any accepting variant), question answer | Yes (continues a turn)            | Refused while admission is closed, at submission and where the answer reaches Codex; declining or cancelling stays allowed. |
+| `thread/compact/start`                                   | Summarizes history; runs no tools | Refused while admission is closed. A failed compaction cannot leave commands, so it does not close admission.               |
+| `thread/rollback`                                        | No                                | History only; failure leaves status unchanged.                                                                              |
+| `thread/start`, `thread/resume`                          | Opens the session                 | Failure fails `start`; the session is never admitted and close still settles and sweeps.                                    |
+| `turn/interrupt`                                         | No (reduces work)                 | Failure leaves cleanup unconfirmed, which closes admission.                                                                 |
+
+Ownership history that the tracker cannot establish (a command item reported
+under two turns or process ids, a bound exceeded) closes admission as soon as it
+is observed.
+
+Close is a proof in two steps: first every live turn (and any spawned child that
+has not started or closed) is interrupted and its terminal receipt awaited, then
+every loaded thread's background terminals are terminated with confirmation and
+a final listing must be empty. Either step failing, or unknown ownership, taints
+the process. The proof is taint-by-default: a close counts as unproven from the
+moment Stop or replacement begins it until the runtime reports the completed
+proof, so an interrupted Stop or replacement fiber leaves the process tainted.
+An interrupted interruption leaves admission closed. A `turn/start` is live work
+from the moment it is sent until the turn is fully recorded: close waits
+(bounded) for every such request to resolve before settling and sweeping, and
+any other exit in that window, including interruption of the caller after a
+successful response, closes admission and interrupts the turn. A start that
+resolves after a close proof completed re-taints the process.
+
+Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,
 the layer entry in `apps/server/src/server.ts`, and one harness hook. Managed
+Codex interruption adds the scoped ownership helper and hooks in the Codex
+adapter and session runtime under `apps/server/src/provider/`. Managed
 access adds two hooks in upstream files: `makeHttpGate` in
 `apps/server/src/auth/EnvironmentAuth.ts` (applied after token verification and
 WebSocket ticket verification, and after session issuance in the two

@@ -31,9 +31,11 @@ import {
   ThreadId,
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
+import { isManagedAccessEnabled, priorProcessTreeTerminated } from "../../sift/ManagedAccess.ts";
 import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
@@ -107,6 +109,8 @@ interface CodexAdapterSessionContext {
   readonly eventFiber: Fiber.Fiber<void, never>;
   readonly turnTokenUsage: CodexTurnTokenUsageState;
   stopped: boolean;
+  /** Managed only: whether Stop began this session's close proof, and whether it completed. */
+  readonly managedCloseProof?: { requested: boolean; proven: boolean };
 }
 
 type CodexCumulativeTokenUsage = {
@@ -1478,6 +1482,24 @@ function mapToRuntimeEvents(
     ];
   }
 
+  if (event.method === "session/interrupt-unconfirmed") {
+    return [
+      {
+        ...runtimeEventBase(event, canonicalThreadId),
+        type: "session.state.changed",
+        payload: { state: "error", reason: event.message ?? "Command termination is unconfirmed." },
+      },
+      {
+        ...runtimeEventBase(event, canonicalThreadId),
+        type: "runtime.error",
+        payload: {
+          class: "provider_error",
+          message: event.message ?? "Command termination is unconfirmed.",
+        },
+      },
+    ];
+  }
+
   if (event.method === "session/started") {
     return [
       {
@@ -2250,6 +2272,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  // The host attests one process-tree termination per T3 server launch. It is
+  // valid only for the first managed session this process starts (fresh or
+  // resumed): any in-process replacement fails closed or relies on its
+  // predecessor's own close-time termination proof.
+  let priorProcessTreeAttestation = priorProcessTreeTerminated(options?.environment ?? process.env);
+  // Set once a managed session's close could not confirm its background
+  // commands were terminated; only a host restart of T3 clears it.
+  let managedProcessTainted = false;
+  // Close-time cleanup proofs still running for managed sessions in this
+  // process. A managed start waits for all of them before reading the taint.
+  const managedClosesInFlight = new Set<Deferred.Deferred<void>>();
+  // Closes begun but not yet proven. Counted as taint until each proves itself,
+  // so an interrupted Stop or replacement cannot leave the process untainted.
+  let unprovenManagedCloses = 0;
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2272,8 +2308,37 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const managed = isManagedAccessEnabled(options?.environment ?? process.env);
+        // Serialize managed lifecycle in this process: a start never races an
+        // earlier session's close-time cleanup proof, and reads taint after it.
+        if (managed)
+          yield* Effect.forEach([...managedClosesInFlight], (closing) => Deferred.await(closing), {
+            discard: true,
+          });
+        const managedResume = managed && isCodexResumeCursorSchema(input.resumeCursor);
+        const managedCloseProof = { requested: false, proven: false };
+        const managedResumeAttested = managedResume && priorProcessTreeAttestation;
+        if (managed) priorProcessTreeAttestation = false;
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
+          ...(isManagedAccessEnabled(options?.environment ?? process.env)
+            ? { managedInterrupt: true }
+            : {}),
+          ...(managedResume ? { managedResumeAttested } : {}),
+          ...(managed
+            ? {
+                managedProcessTaint: () => managedProcessTainted || unprovenManagedCloses > 0,
+                onManagedCloseConfirmed: () => {
+                  if (managedCloseProof.requested && !managedCloseProof.proven) {
+                    managedCloseProof.proven = true;
+                    unprovenManagedCloses--;
+                  }
+                },
+                onManagedCloseUnconfirmed: () => {
+                  managedProcessTainted = true;
+                },
+              }
+            : {}),
           providerInstanceId: boundInstanceId,
           cwd: input.cwd ?? process.cwd(),
           binaryPath: codexConfig.binaryPath,
@@ -2486,6 +2551,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           eventFiber,
           turnTokenUsage,
           stopped: false,
+          ...(managed ? { managedCloseProof } : {}),
         });
         sessionScopeTransferred = true;
 
@@ -2680,7 +2746,26 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     }
     session.stopped = true;
     sessions.delete(session.threadId);
-    yield* session.runtime.close.pipe(Effect.ignore);
+    // Taint by default: this close is unproven until the runtime reports proof.
+    if (session.managedCloseProof && !session.managedCloseProof.requested) {
+      session.managedCloseProof.requested = true;
+      unprovenManagedCloses++;
+    }
+    // Registered before any await, so a concurrent managed start observes it.
+    const closing = isManagedAccessEnabled(options?.environment ?? process.env)
+      ? Deferred.makeUnsafe<void>()
+      : undefined;
+    if (closing) managedClosesInFlight.add(closing);
+    yield* session.runtime.close.pipe(
+      Effect.ignore,
+      Effect.ensuring(
+        closing
+          ? Effect.sync(() => managedClosesInFlight.delete(closing)).pipe(
+              Effect.andThen(Deferred.succeed(closing, undefined)),
+            )
+          : Effect.void,
+      ),
+    );
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
   });

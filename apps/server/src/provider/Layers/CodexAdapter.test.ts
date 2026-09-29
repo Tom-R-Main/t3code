@@ -496,6 +496,313 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }),
   );
 
+  for (const [label, attestation, expected] of [
+    ["a valid attestation admits exactly one resume", "4242", [true, false]],
+    ["a malformed attestation admits none", "042", [false, false]],
+    ["a missing attestation admits none", undefined, [false, false]],
+  ] as const) {
+    it.effect(`managed resume process-tree attestation: ${label}`, () => {
+      const runtimeFactory = makeRuntimeFactory();
+      const layer = Layer.effect(
+        CodexAdapter,
+        makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: runtimeFactory.factory,
+          environment: {
+            T3_SIFT_MANAGED_ACCESS: "1",
+            ...(attestation === undefined
+              ? {}
+              : { T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED: attestation }),
+          },
+        }),
+      ).pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+        Layer.provideMerge(providerSessionDirectoryTestLayer),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      return Effect.gen(function* () {
+        const adapter = yield* CodexAdapter;
+        const attested: boolean[] = [];
+        for (const name of ["resume-first", "resume-second"]) {
+          const threadId = asThreadId(name);
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId,
+            runtimeMode: "full-access",
+            resumeCursor: { threadId: `provider-${name}` },
+          });
+          attested.push(runtimeFactory.lastRuntime?.options.managedResumeAttested === true);
+          yield* adapter.stopSession(threadId);
+        }
+        NodeAssert.deepEqual(attested, [...expected]);
+        // A fresh managed session never consumes or needs the attestation.
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("fresh"),
+          runtimeMode: "full-access",
+        });
+        NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedResumeAttested, undefined);
+        yield* adapter.stopSession(asThreadId("fresh"));
+      }).pipe(Effect.provide(layer));
+    });
+  }
+
+  const managedLayer = (
+    runtimeFactory: ReturnType<typeof makeRuntimeFactory>,
+    environment: NodeJS.ProcessEnv,
+  ) =>
+    Layer.effect(
+      CodexAdapter,
+      makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: runtimeFactory.factory,
+        environment,
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+  it.effect("an earlier fresh managed session consumes the resume attestation", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("fresh-first"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.stopSession(asThreadId("fresh-first"));
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("resume-after"),
+        runtimeMode: "full-access",
+        resumeCursor: { threadId: "provider-resume-after" },
+      });
+      NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedResumeAttested, false);
+      yield* adapter.stopSession(asThreadId("resume-after"));
+    }).pipe(
+      Effect.provide(
+        managedLayer(runtimeFactory, {
+          T3_SIFT_MANAGED_ACCESS: "1",
+          T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED: "4242",
+        }),
+      ),
+    );
+  });
+
+  for (const closeConfirmed of [true, false]) {
+    it.effect(
+      `an in-process replacement is ${closeConfirmed ? "admitted" : "tainted"} by its predecessor's close`,
+      () => {
+        const runtimeFactory = makeRuntimeFactory();
+        return Effect.gen(function* () {
+          const adapter = yield* CodexAdapter;
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("replaced"),
+            runtimeMode: "full-access",
+          });
+          const first = runtimeFactory.lastRuntime!;
+          NodeAssert.equal(typeof first.options.onManagedCloseUnconfirmed, "function");
+          // A real close reports its proof explicitly while closing; no proof taints.
+          first.closeImpl.mockImplementation(() => {
+            if (closeConfirmed) first.options.onManagedCloseConfirmed?.();
+            else first.options.onManagedCloseUnconfirmed?.();
+            return Promise.resolve(undefined);
+          });
+          yield* adapter.stopSession(asThreadId("replaced"));
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("replacement"),
+            runtimeMode: "full-access",
+          });
+          NodeAssert.equal(
+            runtimeFactory.lastRuntime?.options.managedProcessTaint?.(),
+            !closeConfirmed,
+          );
+          yield* adapter.stopSession(asThreadId("replacement"));
+        }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+      },
+    );
+  }
+
+  for (const closeConfirmed of [false, true]) {
+    it.effect(
+      `a replacement started during its predecessor's close waits for it: ${closeConfirmed ? "confirmed" : "unconfirmed"}`,
+      () => {
+        const runtimeFactory = makeRuntimeFactory();
+        return Effect.gen(function* () {
+          const adapter = yield* CodexAdapter;
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("closing"),
+            runtimeMode: "full-access",
+          });
+          const closing = runtimeFactory.lastRuntime!;
+          let finishClose!: () => void;
+          closing.closeImpl.mockImplementation(
+            () =>
+              new Promise<undefined>((resolve) => {
+                finishClose = () => {
+                  if (closeConfirmed) closing.options.onManagedCloseConfirmed?.();
+                  else closing.options.onManagedCloseUnconfirmed?.();
+                  resolve(undefined);
+                };
+              }),
+          );
+          const stopping = yield* adapter.stopSession(asThreadId("closing")).pipe(Effect.forkChild);
+          for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
+          const replacing = yield* adapter
+            .startSession({
+              provider: ProviderDriverKind.make("codex"),
+              threadId: asThreadId("replacement"),
+              runtimeMode: "full-access",
+            })
+            .pipe(Effect.forkChild);
+          for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
+          // The replacement is not constructed while the close proof is pending.
+          NodeAssert.equal(runtimeFactory.lastRuntime, closing);
+          finishClose();
+          yield* Fiber.join(stopping);
+          yield* Fiber.join(replacing);
+          const replacement = runtimeFactory.lastRuntime!;
+          NodeAssert.notEqual(replacement, closing);
+          NodeAssert.equal(replacement.options.managedProcessTaint?.(), !closeConfirmed);
+          yield* adapter.stopSession(asThreadId("replacement"));
+        }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+      },
+    );
+  }
+
+  it.effect("an interrupted close leaves the process tainted", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("abandoned"),
+        runtimeMode: "full-access",
+      });
+      const abandoned = runtimeFactory.lastRuntime!;
+      // The close proof never completes before the Stop fiber is interrupted.
+      abandoned.closeImpl.mockImplementation(() => new Promise<undefined>(() => {}));
+      const stopping = yield* adapter.stopSession(asThreadId("abandoned")).pipe(Effect.forkChild);
+      for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
+      yield* Fiber.interrupt(stopping);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("after-abandoned"),
+        runtimeMode: "full-access",
+      });
+      NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedProcessTaint?.(), true);
+      yield* adapter.stopSession(asThreadId("after-abandoned"));
+    }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+  });
+
+  it.effect("a proven close clears its own pending proof", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("proven"),
+        runtimeMode: "full-access",
+      });
+      const proven = runtimeFactory.lastRuntime!;
+      proven.closeImpl.mockImplementation(() => {
+        proven.options.onManagedCloseConfirmed?.();
+        return Promise.resolve(undefined);
+      });
+      yield* adapter.stopSession(asThreadId("proven"));
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("after-proven"),
+        runtimeMode: "full-access",
+      });
+      NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedProcessTaint?.(), false);
+      yield* adapter.stopSession(asThreadId("after-proven"));
+    }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+  });
+
+  it.effect("a session started before a later close fails reads the taint live", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("first"),
+        runtimeMode: "full-access",
+      });
+      const first = runtimeFactory.lastRuntime!;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("second"),
+        runtimeMode: "full-access",
+      });
+      const second = runtimeFactory.lastRuntime!;
+      NodeAssert.equal(second.options.managedProcessTaint?.(), false);
+      first.closeImpl.mockImplementation(() => {
+        first.options.onManagedCloseUnconfirmed?.();
+        return Promise.resolve(undefined);
+      });
+      yield* adapter.stopSession(asThreadId("first"));
+      NodeAssert.equal(second.options.managedProcessTaint?.(), true);
+      yield* adapter.stopSession(asThreadId("second"));
+    }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+  });
+
+  it.effect(
+    "enables managed interruption and publishes unconfirmed termination as an error",
+    () => {
+      const runtimeFactory = makeRuntimeFactory();
+      const layer = Layer.effect(
+        CodexAdapter,
+        makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: runtimeFactory.factory,
+          environment: { T3_SIFT_MANAGED_ACCESS: "1" },
+        }),
+      ).pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+        Layer.provideMerge(providerSessionDirectoryTestLayer),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      return Effect.gen(function* () {
+        const adapter = yield* CodexAdapter;
+        const threadId = asThreadId("managed-interrupt-error");
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const runtime = runtimeFactory.lastRuntime;
+        NodeAssert.ok(runtime);
+        NodeAssert.equal(runtime.options.managedInterrupt, true);
+        const error = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.type === "session.state.changed" && event.payload.state === "error",
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+        yield* runtime.emit({
+          id: asEventId("managed-error"),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          createdAt: "2026-09-26T00:00:00.000Z",
+          method: "session/interrupt-unconfirmed",
+          message: "Termination unconfirmed",
+        });
+        const event = Option.getOrThrow(yield* Fiber.join(error));
+        NodeAssert.equal(event.type, "session.state.changed");
+        yield* adapter.stopSession(threadId);
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
   it.effect("passes configured launch args into the session runtime", () => {
     const runtimeFactory = makeRuntimeFactory();
     const layer = Layer.effect(
