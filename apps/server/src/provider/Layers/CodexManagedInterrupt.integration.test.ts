@@ -807,10 +807,12 @@ describe("managed admission across interruption and resume", () => {
       }
       assert.isDefined(request);
       const requestId = request!.requestId!;
-      assert.equal(
-        (yield* f.runtime.respondToRequest(requestId, "accept").pipe(Effect.result))._tag,
-        "Failure",
-      );
+      for (const decision of ["accept", "acceptForSession", "acceptAlways"] as const)
+        assert.equal(
+          (yield* f.runtime.respondToRequest(requestId, decision).pipe(Effect.result))._tag,
+          "Failure",
+          decision,
+        );
       assert.equal(
         (yield* f.runtime.respondToRequest(requestId, "decline").pipe(Effect.result))._tag,
         "Success",
@@ -824,4 +826,40 @@ describe("managed admission across interruption and resume", () => {
       ),
     );
   });
+
+  for (const settles of [true, false]) {
+    it.live(
+      `a root turn that starts during reconciliation is interrupted: ${settles ? "settled" : "unsettled"}`,
+      () => {
+        let directory = "";
+        return Effect.gen(function* () {
+          const f = yield* managedFixture("queued-during-interrupt", {
+            turnIds: ["owned-turn"],
+            managedTerminals: [{ kind: "owned" }],
+            startQueuedOnInterrupt: "queued-turn",
+            queuedIgnoresInterrupt: !settles,
+          });
+          directory = f.directory;
+          yield* f.runtime.start();
+          yield* f.runtime.sendTurn({ input: "fixture" });
+          yield* Deferred.await(f.ready).pipe(Effect.timeout("10 seconds"));
+          yield* f.runtime.interruptTurn();
+          assert.include(lifecycleOf(f.scriptPath), "interrupt:queued-turn");
+          const session = yield* f.runtime.getSession;
+          assert.equal(session.status, settles ? "ready" : "error", session.lastError);
+          assert.equal(
+            (yield* f.runtime.sendTurn({ input: "next" }).pipe(Effect.result))._tag,
+            settles ? "Success" : "Failure",
+          );
+          yield* f.runtime.close;
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(NodeServices.layer),
+          Effect.ensuring(
+            Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+          ),
+        );
+      },
+    );
+  }
 });

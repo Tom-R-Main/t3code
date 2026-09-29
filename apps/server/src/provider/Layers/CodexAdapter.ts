@@ -109,6 +109,8 @@ interface CodexAdapterSessionContext {
   readonly eventFiber: Fiber.Fiber<void, never>;
   readonly turnTokenUsage: CodexTurnTokenUsageState;
   stopped: boolean;
+  /** Managed only: whether Stop began this session's close proof, and whether it completed. */
+  readonly managedCloseProof?: { requested: boolean; proven: boolean };
 }
 
 type CodexCumulativeTokenUsage = {
@@ -2281,6 +2283,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   // Close-time cleanup proofs still running for managed sessions in this
   // process. A managed start waits for all of them before reading the taint.
   const managedClosesInFlight = new Set<Deferred.Deferred<void>>();
+  // Closes begun but not yet proven. Counted as taint until each proves itself,
+  // so an interrupted Stop or replacement cannot leave the process untainted.
+  let unprovenManagedCloses = 0;
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2311,6 +2316,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             discard: true,
           });
         const managedResume = managed && isCodexResumeCursorSchema(input.resumeCursor);
+        const managedCloseProof = { requested: false, proven: false };
         const managedResumeAttested = managedResume && priorProcessTreeAttestation;
         if (managed) priorProcessTreeAttestation = false;
         const runtimeInput: CodexSessionRuntimeOptions = {
@@ -2321,7 +2327,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(managedResume ? { managedResumeAttested } : {}),
           ...(managed
             ? {
-                managedProcessTaint: () => managedProcessTainted,
+                managedProcessTaint: () => managedProcessTainted || unprovenManagedCloses > 0,
+                onManagedCloseConfirmed: () => {
+                  if (managedCloseProof.requested && !managedCloseProof.proven) {
+                    managedCloseProof.proven = true;
+                    unprovenManagedCloses--;
+                  }
+                },
                 onManagedCloseUnconfirmed: () => {
                   managedProcessTainted = true;
                 },
@@ -2539,6 +2551,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           eventFiber,
           turnTokenUsage,
           stopped: false,
+          ...(managed ? { managedCloseProof } : {}),
         });
         sessionScopeTransferred = true;
 
@@ -2733,6 +2746,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     }
     session.stopped = true;
     sessions.delete(session.threadId);
+    // Taint by default: this close is unproven until the runtime reports proof.
+    if (session.managedCloseProof && !session.managedCloseProof.requested) {
+      session.managedCloseProof.requested = true;
+      unprovenManagedCloses++;
+    }
     // Registered before any await, so a concurrent managed start observes it.
     const closing = isManagedAccessEnabled(options?.environment ?? process.env)
       ? Deferred.makeUnsafe<void>()

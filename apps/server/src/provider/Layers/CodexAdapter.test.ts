@@ -606,7 +606,12 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
           });
           const first = runtimeFactory.lastRuntime!;
           NodeAssert.equal(typeof first.options.onManagedCloseUnconfirmed, "function");
-          if (!closeConfirmed) first.options.onManagedCloseUnconfirmed?.();
+          // A real close reports its proof explicitly while closing; no proof taints.
+          first.closeImpl.mockImplementation(() => {
+            if (closeConfirmed) first.options.onManagedCloseConfirmed?.();
+            else first.options.onManagedCloseUnconfirmed?.();
+            return Promise.resolve(undefined);
+          });
           yield* adapter.stopSession(asThreadId("replaced"));
           yield* adapter.startSession({
             provider: ProviderDriverKind.make("codex"),
@@ -641,7 +646,8 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
             () =>
               new Promise<undefined>((resolve) => {
                 finishClose = () => {
-                  if (!closeConfirmed) closing.options.onManagedCloseUnconfirmed?.();
+                  if (closeConfirmed) closing.options.onManagedCloseConfirmed?.();
+                  else closing.options.onManagedCloseUnconfirmed?.();
                   resolve(undefined);
                 };
               }),
@@ -669,6 +675,56 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       },
     );
   }
+
+  it.effect("an interrupted close leaves the process tainted", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("abandoned"),
+        runtimeMode: "full-access",
+      });
+      const abandoned = runtimeFactory.lastRuntime!;
+      // The close proof never completes before the Stop fiber is interrupted.
+      abandoned.closeImpl.mockImplementation(() => new Promise<undefined>(() => {}));
+      const stopping = yield* adapter.stopSession(asThreadId("abandoned")).pipe(Effect.forkChild);
+      for (let i = 0; i < 20; i++) yield* Effect.yieldNow;
+      yield* Fiber.interrupt(stopping);
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("after-abandoned"),
+        runtimeMode: "full-access",
+      });
+      NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedProcessTaint?.(), true);
+      yield* adapter.stopSession(asThreadId("after-abandoned"));
+    }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+  });
+
+  it.effect("a proven close clears its own pending proof", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("proven"),
+        runtimeMode: "full-access",
+      });
+      const proven = runtimeFactory.lastRuntime!;
+      proven.closeImpl.mockImplementation(() => {
+        proven.options.onManagedCloseConfirmed?.();
+        return Promise.resolve(undefined);
+      });
+      yield* adapter.stopSession(asThreadId("proven"));
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("after-proven"),
+        runtimeMode: "full-access",
+      });
+      NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedProcessTaint?.(), false);
+      yield* adapter.stopSession(asThreadId("after-proven"));
+    }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+  });
 
   it.effect("a session started before a later close fails reads the taint live", () => {
     const runtimeFactory = makeRuntimeFactory();

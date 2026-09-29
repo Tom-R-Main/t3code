@@ -29,6 +29,7 @@ let terminalListCount = 0;
 let reloadCount = 0;
 let pendingReload;
 const heldTurnStarts = [];
+let queuedStarted = false;
 let interruptCount = 0;
 let approvalEndedTurn = false;
 const lateCommandNotifications = [];
@@ -454,11 +455,24 @@ rl.on("line", async (line) => {
       // nor rejects. The runtime's bounded deadline must move on.
       return;
     }
-    if (script.managedTerminals && !script.missingTerminal && target === script.rootThreadId)
+    const queuedIgnores =
+      script.queuedIgnoresInterrupt && activeTurn?.id === script.startQueuedOnInterrupt;
+    if (
+      script.managedTerminals &&
+      !script.missingTerminal &&
+      target === script.rootThreadId &&
+      !queuedIgnores
+    )
       write({
         method: "turn/completed",
         params: { threadId: target, turn: { ...activeTurn, status: "interrupted" } },
       });
+    if (script.startQueuedOnInterrupt && !queuedStarted && target === script.rootThreadId) {
+      // Codex runs a queued follow-up as soon as the current turn is interrupted.
+      queuedStarted = true;
+      activeTurn = { ...activeTurn, id: script.startQueuedOnInterrupt };
+      write({ method: "turn/started", params: { threadId: target, turn: activeTurn } });
+    }
     write({ id, result: {} });
     for (const notification of lateCommandNotifications.splice(0)) write(notification);
     return;

@@ -254,20 +254,30 @@ continues provider work or reports the session ready or running: before and
 after `turn/start` (including after the turn is recorded), compaction, accepting
 an approval, answering a question, the `turn/started` and `turn/completed`
 status updates, rollback, the end of an interruption, and session start. A
-closed check leaves the session in error. Closing admission is sticky, cancels
-parked approvals, and a root turn the provider starts while admission is closed
-is interrupted. It does not stop a turn already running; Stop does.
+closed check leaves the session in error. Closing admission is sticky and
+cancels parked approvals. A root turn the provider starts while admission is
+closed for any reason (including a queued follow-up Codex starts during an
+interruption) is interrupted; an interruption confirms only after each such turn
+has its terminal receipt and a confirmed cleanup of its own work. Closing
+admission does not stop a turn already admitted and running; Stop does.
+
+Approval decisions are classified by effect, not by name: anything other than
+decline or cancel (accept, acceptForSession, acceptAlways, and any future
+variant) lets work proceed. While admission is closed such a decision is refused
+when submitted and, independently, replaced by cancel where each handler returns
+its answer to Codex (command, file-change, permissions and MCP elicitation
+approvals). Question answers are refused at both points as well.
 
 Provider requests and their failure paths:
 
-| Request                          | Creates or continues work         | Rejection, decode failure, timeout or abort                                                                       |
-| -------------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `turn/start`                     | Yes                               | Treated as possibly accepted: admission closes, and any root turn seen starting since the request is interrupted. |
-| approval accept, question answer | Yes (continues a turn)            | Refused while admission is closed; declining or cancelling stays allowed.                                         |
-| `thread/compact/start`           | Summarizes history; runs no tools | Refused while admission is closed. A failed compaction cannot leave commands, so it does not close admission.     |
-| `thread/rollback`                | No                                | History only; failure leaves status unchanged.                                                                    |
-| `thread/start`, `thread/resume`  | Opens the session                 | Failure fails `start`; the session is never admitted and close still settles and sweeps.                          |
-| `turn/interrupt`                 | No (reduces work)                 | Failure leaves cleanup unconfirmed, which closes admission.                                                       |
+| Request                                                  | Creates or continues work         | Rejection, decode failure, timeout or abort                                                                                 |
+| -------------------------------------------------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `turn/start`                                             | Yes                               | Treated as possibly accepted: admission closes, and any root turn seen starting since the request is interrupted.           |
+| approval accept (any accepting variant), question answer | Yes (continues a turn)            | Refused while admission is closed, at submission and where the answer reaches Codex; declining or cancelling stays allowed. |
+| `thread/compact/start`                                   | Summarizes history; runs no tools | Refused while admission is closed. A failed compaction cannot leave commands, so it does not close admission.               |
+| `thread/rollback`                                        | No                                | History only; failure leaves status unchanged.                                                                              |
+| `thread/start`, `thread/resume`                          | Opens the session                 | Failure fails `start`; the session is never admitted and close still settles and sweeps.                                    |
+| `turn/interrupt`                                         | No (reduces work)                 | Failure leaves cleanup unconfirmed, which closes admission.                                                                 |
 
 Ownership history that the tracker cannot establish (a command item reported
 under two turns or process ids, a bound exceeded) closes admission as soon as it
@@ -277,7 +287,11 @@ Close is a proof in two steps: first every live turn (and any spawned child that
 has not started or closed) is interrupted and its terminal receipt awaited, then
 every loaded thread's background terminals are terminated with confirmation and
 a final listing must be empty. Either step failing, or unknown ownership, taints
-the process.
+the process. The proof is taint-by-default: a close counts as unproven from the
+moment Stop or replacement begins it until the runtime reports the completed
+proof, so an interrupted Stop or replacement fiber leaves the process tainted.
+An interrupted interruption leaves admission closed, and an interrupted
+`turn/start` after it was sent closes admission.
 
 Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,

@@ -195,6 +195,12 @@ export interface CodexSessionRuntimeOptions {
   readonly managedProcessTaint?: () => boolean;
   /** Called when closing a managed session cannot confirm command termination. */
   readonly onManagedCloseUnconfirmed?: () => void;
+  /**
+   * Called only when the close proof completed (live work settled, terminals
+   * swept, ownership known). The host counts a close as unproven until then,
+   * so an interrupted or failed close leaves the process tainted.
+   */
+  readonly onManagedCloseConfirmed?: () => void;
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
@@ -1410,6 +1416,11 @@ export const makeCodexSessionRuntime = (
     // Root turns the provider reported starting, so an uncertain turn/start can
     // learn which turn it may have created.
     const managedRootTurnsSeen = new Set<string>();
+    // Root turns the provider started while admission was closed (including a
+    // queued follow-up Codex starts during reconciliation). Each is interrupted;
+    // an interruption confirms only after every one has been settled.
+    const managedUnadmittedRootTurns = new Set<string>();
+    const managedSettledRootTurns = new Set<string>();
     /**
      * The single managed admission predicate, read live at every point that
      * admits a turn or moves the session to ready/running: not interrupting,
@@ -1612,6 +1623,16 @@ export const makeCodexSessionRuntime = (
         yield* emitSessionEvent("session/interrupt-unconfirmed", reason);
       });
     let managedOwnershipReported = false;
+    /**
+     * Classifies a decision by its effect, not its name: anything other than
+     * decline or cancel lets provider work proceed (accept, acceptForSession,
+     * acceptAlways, and any future variant). While managed admission is closed
+     * such a decision is replaced by cancel at the point it is returned to Codex.
+     */
+    const decisionAllowsWork = (decision: ProviderApprovalDecision) =>
+      decision !== "decline" && decision !== "cancel";
+    const gateManagedDecision = (decision: ProviderApprovalDecision): ProviderApprovalDecision =>
+      decisionAllowsWork(decision) && !managedAdmissionOpen() ? "cancel" : decision;
 
     /**
      * Registers v2 collab children and re-emits their notifications as
@@ -2181,7 +2202,7 @@ export const makeCodexSessionRuntime = (
           payload,
         });
 
-        const resolved = yield* Deferred.await(decision).pipe(
+        const requested = yield* Deferred.await(decision).pipe(
           Effect.ensuring(
             Ref.update(pendingApprovalsRef, (current) => {
               const next = new Map(current);
@@ -2190,6 +2211,9 @@ export const makeCodexSessionRuntime = (
             }),
           ),
         );
+        // Gated where the answer reaches Codex: admission may have closed
+        // after the user decided.
+        const resolved = gateManagedDecision(requested);
         return {
           decision: resolved === "acceptAlways" ? "acceptForSession" : resolved,
         } satisfies EffectCodexSchema.CommandExecutionRequestApprovalResponse;
@@ -2239,7 +2263,7 @@ export const makeCodexSessionRuntime = (
           payload,
         });
 
-        const resolved = yield* Deferred.await(decision).pipe(
+        const requested = yield* Deferred.await(decision).pipe(
           Effect.ensuring(
             Ref.update(pendingApprovalsRef, (current) => {
               const next = new Map(current);
@@ -2248,6 +2272,9 @@ export const makeCodexSessionRuntime = (
             }),
           ),
         );
+        // Gated where the answer reaches Codex: admission may have closed
+        // after the user decided.
+        const resolved = gateManagedDecision(requested);
         return {
           decision: resolved === "acceptAlways" ? "acceptForSession" : resolved,
         } satisfies EffectCodexSchema.FileChangeRequestApprovalResponse;
@@ -2306,7 +2333,7 @@ export const makeCodexSessionRuntime = (
           payload,
         });
 
-        const resolved = yield* Deferred.await(decision).pipe(
+        const requested = yield* Deferred.await(decision).pipe(
           Effect.ensuring(
             Ref.update(pendingApprovalsRef, (current) => {
               const next = new Map(current);
@@ -2315,6 +2342,9 @@ export const makeCodexSessionRuntime = (
             }),
           ),
         );
+        // Gated where the answer reaches Codex: admission may have closed
+        // after the user decided.
+        const resolved = gateManagedDecision(requested);
         return toMcpElicitationResponse(payload, resolved);
       }),
     );
@@ -2362,7 +2392,7 @@ export const makeCodexSessionRuntime = (
           payload,
         });
 
-        const resolved = yield* Deferred.await(decision).pipe(
+        const requested = yield* Deferred.await(decision).pipe(
           Effect.ensuring(
             Ref.update(pendingApprovalsRef, (current) => {
               const next = new Map(current);
@@ -2371,6 +2401,9 @@ export const makeCodexSessionRuntime = (
             }),
           ),
         );
+        // Gated where the answer reaches Codex: admission may have closed
+        // after the user decided.
+        const resolved = gateManagedDecision(requested);
         // Approving grants the requested profile; denying answers with an
         // empty grant so the app-server treats the permission as withheld.
         const grantedPermissions =
@@ -2420,6 +2453,12 @@ export const makeCodexSessionRuntime = (
           ),
         );
 
+        // Answers continue the provider turn: refused (as a request error) when
+        // admission closed after the user answered.
+        if (!managedAdmissionOpen())
+          return yield* CodexErrors.CodexAppServerRequestError.internalError(
+            "Managed command termination is pending or unconfirmed; the turn cannot continue.",
+          );
         return {
           answers: yield* toCodexUserInputAnswers(resolvedAnswers).pipe(
             Effect.mapError((error) =>
@@ -2452,9 +2491,14 @@ export const makeCodexSessionRuntime = (
             if (notification.method === "turn/started" && notification.params.threadId === root) {
               if (managedRootTurnsSeen.size >= 4096) managedRootTurnsSeen.clear();
               managedRootTurnsSeen.add(notification.params.turn.id);
-              // A root turn the provider starts while admission is closed was
-              // never admitted: interrupt it (outside this handler, bounded).
-              if (!managedAdmissionOpen() && !managedInterruptActive && root !== undefined)
+              // A root turn the provider starts while admission is closed for any
+              // reason, including an active interruption, was never admitted:
+              // record it and interrupt it (outside this handler, bounded).
+              if (!managedAdmissionOpen() && root !== undefined) {
+                if (managedUnadmittedRootTurns.size >= 4096) managedInterruptUnconfirmed = true;
+                else managedUnadmittedRootTurns.add(notification.params.turn.id);
+              }
+              if (!managedAdmissionOpen() && root !== undefined)
                 yield* client
                   .request("turn/interrupt", {
                     threadId: root,
@@ -2629,10 +2673,20 @@ export const makeCodexSessionRuntime = (
       if (options.managedInterrupt === true) {
         // Settle live work first: an empty terminal list proves nothing while a
         // turn could still start another command.
-        const settled = yield* managedOwnership.settleForClose(client.raw);
-        const swept = yield* terminateLoadedThreadTerminals(client.raw);
-        if (!settled || !swept || managedOwnership.incomplete())
-          yield* Effect.sync(() => options.onManagedCloseUnconfirmed?.());
+        // Taint by default: only a completed proof reports success. Interruption
+        // or failure anywhere in the proof reports unconfirmed.
+        yield* Effect.gen(function* () {
+          const settled = yield* managedOwnership.settleForClose(client.raw);
+          const swept = yield* terminateLoadedThreadTerminals(client.raw);
+          return settled && swept && !managedOwnership.incomplete();
+        }).pipe(
+          Effect.onExit((exit) =>
+            Effect.sync(() => {
+              if (Exit.isSuccess(exit) && exit.value) options.onManagedCloseConfirmed?.();
+              else options.onManagedCloseUnconfirmed?.();
+            }),
+          ),
+        );
       }
       yield* updateSession(sessionRef, {
         status: "closed",
@@ -2871,6 +2925,20 @@ export const makeCodexSessionRuntime = (
                   terminated: 0,
                 };
               yield* managedOwnership.awaitTerminals(targets);
+              // A queued root turn Codex starts after this interrupt is itself
+              // interrupted (turn/started handler); its terminal receipt must
+              // arrive before this turn's cleanup can see a stable scope.
+              for (let round = 0; round < 3; round++) {
+                const pending = [...managedUnadmittedRootTurns]
+                  .filter(
+                    (turn) =>
+                      turn !== effectiveTurnId &&
+                      !managedOwnership.completed(providerThreadId, turn),
+                  )
+                  .map((turn) => [providerThreadId, turn] as const);
+                if (pending.length === 0) break;
+                yield* managedOwnership.awaitTerminals(pending);
+              }
               return yield* managedOwnership.cleanup(client.raw, targets, providerThreadId);
             }).pipe(
               Effect.timeout("30 seconds"),
@@ -2883,10 +2951,40 @@ export const makeCodexSessionRuntime = (
                 }),
               ),
             );
+            // Settle root turns that started while this interruption ran: each
+            // needs its terminal receipt and a confirmed cleanup of its own work.
+            let unadmittedSettled = true;
+            for (let round = 0; round < 3 && unadmittedSettled; round++) {
+              const unsettled = [...managedUnadmittedRootTurns].filter(
+                (turn) => turn !== effectiveTurnId && !managedSettledRootTurns.has(turn),
+              );
+              if (unsettled.length === 0) break;
+              for (const turn of unsettled) {
+                const receipt = yield* managedOwnership
+                  .awaitTerminals([[providerThreadId, turn]])
+                  .pipe(Effect.option);
+                const cleaned =
+                  receipt._tag === "Some" &&
+                  (yield* managedOwnership.cleanup(
+                    client.raw,
+                    managedOwnership.targets(providerThreadId, turn),
+                    providerThreadId,
+                  )).confirmed;
+                if (!cleaned) unadmittedSettled = false;
+                else managedSettledRootTurns.add(turn);
+              }
+            }
+            if (
+              [...managedUnadmittedRootTurns].some(
+                (turn) => turn !== effectiveTurnId && !managedSettledRootTurns.has(turn),
+              )
+            )
+              unadmittedSettled = false;
             const completion = managedTurnCompletions.get(effectiveTurnId);
             // Unconfirmed is sticky for the session: a later cleanup is scoped to
             // its own turn, so it cannot prove an earlier failure's commands gone.
             const previouslyUnconfirmed = managedInterruptUnconfirmed;
+            if (!unadmittedSettled) managedInterruptUnconfirmed = true;
             if (!result.confirmed || completion === undefined) managedInterruptUnconfirmed = true;
             managedInterruptActive = false;
             // Ready requires the live admission predicate, not this cleanup alone.
@@ -2985,7 +3083,7 @@ export const makeCodexSessionRuntime = (
       respondToRequest: (requestId, decision) =>
         Effect.gen(function* () {
           // Accepting lets the provider run more commands: an admission.
-          if ((decision === "accept" || decision === "acceptForSession") && !managedAdmissionOpen())
+          if (decisionAllowsWork(decision) && !managedAdmissionOpen())
             return yield* CodexErrors.CodexAppServerRequestError.internalError(
               "Managed command termination is pending or unconfirmed; only decline or cancel is allowed.",
             );
