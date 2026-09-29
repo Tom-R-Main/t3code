@@ -290,8 +290,12 @@ a final listing must be empty. Either step failing, or unknown ownership, taints
 the process. The proof is taint-by-default: a close counts as unproven from the
 moment Stop or replacement begins it until the runtime reports the completed
 proof, so an interrupted Stop or replacement fiber leaves the process tainted.
-An interrupted interruption leaves admission closed, and an interrupted
-`turn/start` after it was sent closes admission.
+An interrupted interruption leaves admission closed. A `turn/start` is live work
+from the moment it is sent until the turn is fully recorded: close waits
+(bounded) for every such request to resolve before settling and sweeping, and
+any other exit in that window, including interruption of the caller after a
+successful response, closes admission and interrupts the turn. A start that
+resolves after a close proof completed re-taints the process.
 
 Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,

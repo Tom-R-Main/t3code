@@ -201,6 +201,8 @@ export interface CodexSessionRuntimeOptions {
    * so an interrupted or failed close leaves the process tainted.
    */
   readonly onManagedCloseConfirmed?: () => void;
+  /** Test seam only: runs after a successful turn/start response is decoded. */
+  readonly testHooks?: { readonly afterTurnStartResponse?: Effect.Effect<void> };
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
@@ -1413,6 +1415,11 @@ export const makeCodexSessionRuntime = (
     let managedAdmissionCrossed = false;
     // Set when close begins: no admission while the close proof is in progress.
     let managedClosing = false;
+    // turn/start requests sent but not yet resolved and recorded; close waits
+    // for these, since each can still create a turn.
+    let managedStartsInFlight = 0;
+    // Set once this session's close proof completed; a later start invalidates it.
+    let managedCloseProven = false;
     // Root turns the provider reported starting, so an uncertain turn/start can
     // learn which turn it may have created.
     const managedRootTurnsSeen = new Set<string>();
@@ -2676,14 +2683,24 @@ export const makeCodexSessionRuntime = (
         // Taint by default: only a completed proof reports success. Interruption
         // or failure anywhere in the proof reports unconfirmed.
         yield* Effect.gen(function* () {
+          // A sent turn/start can still create a turn: wait (bounded) for every
+          // one to resolve; a turn it produced is then live and settled below.
+          let startsResolved = false;
+          for (let poll = 0; poll < 400 && !startsResolved; poll++) {
+            if (managedStartsInFlight === 0) startsResolved = true;
+            else yield* Effect.sleep("25 millis");
+          }
+          if (!startsResolved) return false;
           const settled = yield* managedOwnership.settleForClose(client.raw);
           const swept = yield* terminateLoadedThreadTerminals(client.raw);
-          return settled && swept && !managedOwnership.incomplete();
+          return settled && swept && !managedOwnership.incomplete() && managedStartsInFlight === 0;
         }).pipe(
           Effect.onExit((exit) =>
             Effect.sync(() => {
-              if (Exit.isSuccess(exit) && exit.value) options.onManagedCloseConfirmed?.();
-              else options.onManagedCloseUnconfirmed?.();
+              if (Exit.isSuccess(exit) && exit.value) {
+                managedCloseProven = true;
+                options.onManagedCloseConfirmed?.();
+              } else options.onManagedCloseUnconfirmed?.();
             }),
           ),
         );
@@ -2764,13 +2781,21 @@ export const makeCodexSessionRuntime = (
             );
           }
           const rootTurnsBefore = new Set(managedRootTurnsSeen);
-          // Once sent, a turn/start without a decoded success (rejection,
-          // decode failure, timeout or interruption) may still have created a
-          // turn: close admission and interrupt any turn it can be tied to.
+          // Once sent, a turn/start is live work until its outcome is recorded:
+          // close waits for it, and any exit other than a fully recorded success
+          // (rejection, decode failure, refusal, timeout or interruption at any
+          // point before the turn is recorded) closes admission and interrupts
+          // the turn it may have created.
+          let startedTurnId: string | undefined;
+          let outcomeHandled = false;
           const uncertainStart = Effect.gen(function* () {
             managedAdmissionCrossed = true;
-            yield* Effect.forEach(
+            const learned = new Set(
               [...managedRootTurnsSeen].filter((turn) => !rootTurnsBefore.has(turn)),
+            );
+            if (startedTurnId !== undefined) learned.add(startedTurnId);
+            yield* Effect.forEach(
+              [...learned],
               (turn) =>
                 client
                   .request("turn/interrupt", { threadId: providerThreadId, turnId: turn })
@@ -2781,69 +2806,102 @@ export const makeCodexSessionRuntime = (
               "A turn/start outcome is uncertain; termination is unconfirmed. Stop the session before sending another turn.",
             );
           });
-          const response = yield* client.raw.request("turn/start", params).pipe(
-            Effect.flatMap((rawResponse) =>
-              decodeV2TurnStartResponse(rawResponse).pipe(
-                Effect.mapError((error) =>
-                  CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
-                    "decode-response-payload",
-                    error,
-                    { method: "turn/start" },
+          if (options.managedInterrupt === true) {
+            managedStartsInFlight++;
+            // Close may have begun since the admission checks above; nothing is
+            // sent yet, so this start simply does not happen.
+            if (managedClosing) {
+              managedStartsInFlight--;
+              return yield* CodexErrors.CodexAppServerRequestError.internalError(
+                "The managed session is closing.",
+                undefined,
+                { method: "turn/start" },
+              );
+            }
+          }
+          return yield* Effect.gen(function* () {
+            const response = yield* client.raw
+              .request("turn/start", params)
+              .pipe(
+                Effect.flatMap((rawResponse) =>
+                  decodeV2TurnStartResponse(rawResponse).pipe(
+                    Effect.mapError((error) =>
+                      CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
+                        "decode-response-payload",
+                        error,
+                        { method: "turn/start" },
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ),
+              );
+            startedTurnId = response.turn.id;
+            if (options.testHooks?.afterTurnStartResponse)
+              yield* options.testHooks.afterTurnStartResponse;
+            const turnId = TurnId.make(response.turn.id);
+            // A turn Codex accepted whose admission is not proved: ask Codex to
+            // interrupt it, then fail closed; only an explicit Stop can prove that
+            // nothing it started remains.
+            const refuseCrossedTurn = Effect.gen(function* () {
+              managedAdmissionCrossed = true;
+              outcomeHandled = true;
+              yield* client
+                .request("turn/interrupt", { threadId: providerThreadId, turnId: response.turn.id })
+                .pipe(Effect.timeout("3 seconds"), Effect.ignore);
+              const reason =
+                "A turn was admitted while an interruption was in progress; termination is unconfirmed.";
+              yield* updateSession(sessionRef, { status: "error", lastError: reason });
+              yield* emitSessionEvent("session/interrupt-unconfirmed", reason);
+              return yield* CodexErrors.CodexAppServerRequestError.internalError(
+                reason,
+                undefined,
+                { method: "turn/start" },
+              );
+            });
+            if (
+              options.managedInterrupt &&
+              (admissionEpoch !== managedAdmissionEpoch || !managedAdmissionOpen())
+            )
+              return yield* refuseCrossedTurn;
+            // A start resolving after this session's close proof completed
+            // invalidates that proof: re-taint the process and refuse the turn.
+            if (options.managedInterrupt && managedCloseProven) {
+              options.onManagedCloseUnconfirmed?.();
+              return yield* refuseCrossedTurn;
+            }
+            yield* updateSession(sessionRef, (session) => ({
+              ...(managedAdmissionOpen() ? { status: "running" as const } : {}),
+              // Codex accepts follow-ups while the current turn is still
+              // running. The response contains the queued turn id, but
+              // turn/interrupt only accepts the id that is active now.
+              activeTurnId: session.activeTurnId ?? turnId,
+              ...(normalizedModel ? { model: normalizedModel } : {}),
+            }));
+            // Recheck after recording: an interruption or another crossing that
+            // landed meanwhile still refuses this turn.
+            if (
+              options.managedInterrupt &&
+              (admissionEpoch !== managedAdmissionEpoch || !managedAdmissionOpen())
+            )
+              return yield* refuseCrossedTurn;
+            const resumedProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+            outcomeHandled = true;
+            return {
+              threadId: options.threadId,
+              turnId,
+              ...(resumedProviderThreadId
+                ? { resumeCursor: { threadId: resumedProviderThreadId } }
+                : {}),
+            } satisfies ProviderTurnStartResult;
+          }).pipe(
             Effect.onExit((exit) =>
-              options.managedInterrupt === true && Exit.isFailure(exit)
-                ? uncertainStart
-                : Effect.void,
+              Effect.gen(function* () {
+                if (options.managedInterrupt !== true) return;
+                if (Exit.isFailure(exit) && !outcomeHandled) yield* uncertainStart;
+                managedStartsInFlight--;
+              }),
             ),
           );
-          const turnId = TurnId.make(response.turn.id);
-          // A turn Codex accepted whose admission is not proved: ask Codex to
-          // interrupt it, then fail closed; only an explicit Stop can prove that
-          // nothing it started remains.
-          const refuseCrossedTurn = Effect.gen(function* () {
-            managedAdmissionCrossed = true;
-            yield* client
-              .request("turn/interrupt", { threadId: providerThreadId, turnId: response.turn.id })
-              .pipe(Effect.timeout("3 seconds"), Effect.ignore);
-            const reason =
-              "A turn was admitted while an interruption was in progress; termination is unconfirmed.";
-            yield* updateSession(sessionRef, { status: "error", lastError: reason });
-            yield* emitSessionEvent("session/interrupt-unconfirmed", reason);
-            return yield* CodexErrors.CodexAppServerRequestError.internalError(reason, undefined, {
-              method: "turn/start",
-            });
-          });
-          if (
-            options.managedInterrupt &&
-            (admissionEpoch !== managedAdmissionEpoch || !managedAdmissionOpen())
-          )
-            return yield* refuseCrossedTurn;
-          yield* updateSession(sessionRef, (session) => ({
-            ...(managedAdmissionOpen() ? { status: "running" as const } : {}),
-            // Codex accepts follow-ups while the current turn is still
-            // running. The response contains the queued turn id, but
-            // turn/interrupt only accepts the id that is active now.
-            activeTurnId: session.activeTurnId ?? turnId,
-            ...(normalizedModel ? { model: normalizedModel } : {}),
-          }));
-          // Recheck after recording: an interruption or another crossing that
-          // landed meanwhile still refuses this turn.
-          if (
-            options.managedInterrupt &&
-            (admissionEpoch !== managedAdmissionEpoch || !managedAdmissionOpen())
-          )
-            return yield* refuseCrossedTurn;
-          const resumedProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
-          return {
-            threadId: options.threadId,
-            turnId,
-            ...(resumedProviderThreadId
-              ? { resumeCursor: { threadId: resumedProviderThreadId } }
-              : {}),
-          } satisfies ProviderTurnStartResult;
         }),
       interruptTurn: (turnId) =>
         Effect.gen(function* () {

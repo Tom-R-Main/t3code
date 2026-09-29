@@ -862,4 +862,102 @@ describe("managed admission across interruption and resume", () => {
       },
     );
   }
+
+  const pollUntil = (check: () => boolean) =>
+    Effect.gen(function* () {
+      for (let i = 0; i < 400 && !check(); i++) yield* Effect.sleep("25 millis");
+      assert.isTrue(check());
+    });
+
+  it.live("interruption after a successful turn/start response still closes admission", () => {
+    let directory = "";
+    let starts = 0;
+    return Effect.gen(function* () {
+      const f = yield* managedFixture(
+        "interrupted-after-response",
+        { turnIds: ["first-turn", "second-turn"] },
+        {
+          // The second sendTurn stalls after its response is decoded, where
+          // the caller is then interrupted.
+          testHooks: {
+            afterTurnStartResponse: Effect.suspend(() =>
+              ++starts === 2 ? Effect.never : Effect.void,
+            ),
+          },
+        },
+      );
+      directory = f.directory;
+      yield* f.runtime.start();
+      yield* f.runtime.sendTurn({ input: "first" });
+      const sending = yield* f.runtime.sendTurn({ input: "second" }).pipe(Effect.forkScoped);
+      yield* pollUntil(() => starts === 2);
+      yield* Fiber.interrupt(sending);
+      yield* Deferred.await(f.unconfirmed).pipe(Effect.timeout("10 seconds"));
+      assert.equal((yield* f.runtime.getSession).status, "error");
+      assert.equal(
+        (yield* f.runtime.sendTurn({ input: "refused" }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      assert.include(lifecycleOf(f.scriptPath), "interrupt:second-turn");
+      yield* f.runtime.close;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  });
+
+  for (const resolves of [true, false]) {
+    it.live(
+      `close waits for an in-flight turn/start: ${resolves ? "resolves late" : "never resolves"}`,
+      () => {
+        let directory = "";
+        return Effect.gen(function* () {
+          const f = yield* managedFixture("close-inflight-start", {
+            turnIds: ["first-turn", "second-turn"],
+            holdTurnStarts: [2],
+            managedTerminals: [{ kind: "owned" }],
+          });
+          directory = f.directory;
+          yield* f.runtime.start();
+          yield* f.runtime.sendTurn({ input: "first" });
+          yield* Deferred.await(f.ready).pipe(Effect.timeout("10 seconds"));
+          const sending = yield* f.runtime
+            .sendTurn({ input: "second" })
+            .pipe(Effect.result, Effect.forkScoped);
+          yield* pollUntil(() =>
+            f.events.some(
+              (e) =>
+                e.method === "serverRequest/resolved" &&
+                (e.payload as { requestId?: string }).requestId === "fixture-turn-start-held",
+            ),
+          );
+          const closing = yield* f.runtime.close.pipe(Effect.forkScoped);
+          yield* Effect.sleep("300 millis");
+          if (resolves) yield* f.runtime.uploadFeedback("release held start").pipe(Effect.result);
+          yield* Fiber.join(closing);
+          // close ends the scope the sender was forked in; only its exit matters.
+          yield* Fiber.await(sending);
+          const events = lifecycleOf(f.scriptPath);
+          if (resolves) {
+            // The late start's turn is interrupted before the terminal sweep.
+            const late = events.indexOf("interrupt:second-turn");
+            assert.isAtLeast(late, 0, events.join(","));
+            assert.isBelow(late, events.indexOf("terminate:1"), events.join(","));
+            assert.equal(f.closes(), 0);
+          } else {
+            assert.equal(f.closes(), 1);
+          }
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(NodeServices.layer),
+          Effect.ensuring(
+            Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+          ),
+        );
+      },
+    );
+  }
 });
