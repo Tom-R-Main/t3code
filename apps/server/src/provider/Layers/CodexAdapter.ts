@@ -2269,9 +2269,14 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
-  // The host attests one process-tree termination per T3 server launch, so it
-  // admits at most one managed resume in this process; later resumes fail closed.
+  // The host attests one process-tree termination per T3 server launch. It is
+  // valid only for the first managed session this process starts (fresh or
+  // resumed): any in-process replacement fails closed or relies on its
+  // predecessor's own close-time termination proof.
   let priorProcessTreeAttestation = priorProcessTreeTerminated(options?.environment ?? process.env);
+  // Set once a managed session's close could not confirm its background
+  // commands were terminated; only a host restart of T3 clears it.
+  let managedProcessTainted = false;
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2294,17 +2299,24 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-        const managedResume =
-          isManagedAccessEnabled(options?.environment ?? process.env) &&
-          isCodexResumeCursorSchema(input.resumeCursor);
+        const managed = isManagedAccessEnabled(options?.environment ?? process.env);
+        const managedResume = managed && isCodexResumeCursorSchema(input.resumeCursor);
         const managedResumeAttested = managedResume && priorProcessTreeAttestation;
-        if (managedResume) priorProcessTreeAttestation = false;
+        if (managed) priorProcessTreeAttestation = false;
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           ...(isManagedAccessEnabled(options?.environment ?? process.env)
             ? { managedInterrupt: true }
             : {}),
           ...(managedResume ? { managedResumeAttested } : {}),
+          ...(managed
+            ? {
+                ...(managedProcessTainted ? { managedProcessTainted: true } : {}),
+                onManagedCloseUnconfirmed: () => {
+                  managedProcessTainted = true;
+                },
+              }
+            : {}),
           providerInstanceId: boundInstanceId,
           cwd: input.cwd ?? process.cwd(),
           binaryPath: codexConfig.binaryPath,

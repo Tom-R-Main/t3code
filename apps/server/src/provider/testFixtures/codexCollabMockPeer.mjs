@@ -115,6 +115,7 @@ rl.on("line", async (line) => {
       t.child.kill("SIGTERM");
     });
     terminals.delete(t.processId);
+    NodeFS.appendFileSync(`${process.env.T3_CODEX_COLLAB_SCRIPT}.terminated`, `${t.processId}\n`);
     write({ id, result: { terminated: true } });
     return;
   }

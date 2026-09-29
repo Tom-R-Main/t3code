@@ -418,4 +418,109 @@ describe("managed admission across interruption and resume", () => {
         }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
   }
+
+  for (const listing of ["works", "fails"] as const) {
+    it.live(
+      `closing a managed session terminates its terminals or taints the process: ${listing}`,
+      () => {
+        // runtime.close closes the scope it was built in, so the directory and any
+        // surviving fixture processes are released outside it, after assertions.
+        const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "managed-close-"));
+        let spawned: ReadonlyArray<{ pid: number }> = [];
+        return Effect.gen(function* () {
+          const scriptPath = yield* writeScript(directory, {
+            turnIds: ["owned-turn"],
+            managedCleanupError: listing === "fails",
+            managedTerminals: [{ kind: "owned" }, { kind: "retained" }],
+          });
+          let unconfirmedCloses = 0;
+          const runtime = yield* makeCodexSessionRuntime({
+            threadId: ThreadId.make("managed-close"),
+            binaryPath: peerPath,
+            cwd: directory,
+            runtimeMode: "full-access",
+            managedInterrupt: true,
+            onManagedCloseUnconfirmed: () => {
+              unconfirmedCloses++;
+            },
+            environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+          });
+          const ready = yield* Deferred.make<void>();
+          yield* runtime.events.pipe(
+            Stream.runForEach((event) =>
+              event.method === "serverRequest/resolved"
+                ? Deferred.succeed(ready, undefined)
+                : Effect.void,
+            ),
+            Effect.forkScoped,
+          );
+          yield* runtime.start();
+          yield* runtime.sendTurn({ input: "fixture" });
+          yield* Deferred.await(ready).pipe(Effect.timeout("10 seconds"));
+          const processes = yield* Effect.forEach(
+            NodeFS.readFileSync(`${scriptPath}.processes`, "utf8").trim().split("\n"),
+            (row) => decodeProcessRow(row),
+          );
+          spawned = processes;
+          yield* runtime.close;
+          if (listing === "works") {
+            // Close asked Codex to terminate every terminal and got confirmation,
+            // rather than relying on app-server teardown to take them down.
+            assert.equal(unconfirmedCloses, 0);
+            assert.deepEqual(
+              NodeFS.readFileSync(`${scriptPath}.terminated`, "utf8").trim().split("\n").sort(),
+              processes.map((p) => p.processId).sort(),
+            );
+          } else {
+            assert.equal(unconfirmedCloses, 1);
+          }
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(NodeServices.layer),
+          Effect.ensuring(
+            Effect.sync(() => {
+              for (const p of spawned) if (alive(p.pid)) process.kill(p.pid, "SIGKILL");
+              NodeFS.rmSync(directory, { recursive: true, force: true });
+            }),
+          ),
+        );
+      },
+    );
+  }
+
+  for (const cursor of [false, true]) {
+    it.live(
+      `a tainted T3 process refuses later managed sessions: ${cursor ? "resumed" : "fresh"}`,
+      () =>
+        Effect.gen(function* () {
+          const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "managed-taint-"));
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+          );
+          const scriptPath = yield* writeScript(directory, { turnIds: ["turn"] });
+          const runtime = yield* makeCodexSessionRuntime({
+            threadId: ThreadId.make("managed-taint"),
+            binaryPath: peerPath,
+            cwd: directory,
+            runtimeMode: "full-access",
+            managedInterrupt: true,
+            managedProcessTainted: true,
+            ...(cursor
+              ? {
+                  resumeCursor: { threadId: wireFixture.rootThreadId },
+                  managedResumeAttested: true,
+                }
+              : {}),
+            environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+          });
+          const session = yield* runtime.start();
+          assert.equal(session.status, "error");
+          assert.equal(
+            (yield* runtime.sendTurn({ input: "blocked" }).pipe(Effect.result))._tag,
+            "Failure",
+          );
+          yield* runtime.close;
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
 });

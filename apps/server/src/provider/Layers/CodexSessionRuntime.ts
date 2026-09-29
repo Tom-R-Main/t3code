@@ -37,7 +37,11 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
-import { listLoadedThreadTerminals, makeManagedCommandOwnership } from "./CodexManagedInterrupt.ts";
+import {
+  listLoadedThreadTerminals,
+  makeManagedCommandOwnership,
+  terminateLoadedThreadTerminals,
+} from "./CodexManagedInterrupt.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -183,6 +187,14 @@ export interface CodexSessionRuntimeOptions {
    * app-server's process tree is gone (T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED).
    */
   readonly managedResumeAttested?: boolean;
+  /**
+   * An earlier managed session in this T3 server could not prove at close that
+   * its background commands were terminated. Every later managed session starts
+   * unconfirmed until the host restarts T3.
+   */
+  readonly managedProcessTainted?: boolean;
+  /** Called when closing a managed session cannot confirm command termination. */
+  readonly onManagedCloseUnconfirmed?: () => void;
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
@@ -2503,17 +2515,20 @@ export const makeCodexSessionRuntime = (
       const managedResume =
         options.managedInterrupt === true &&
         readResumeCursorThreadId(options.resumeCursor) !== undefined;
-      const inheritedReason = !managedResume
-        ? undefined
-        : options.managedResumeAttested !== true
-          ? "Resumed managed session has no host attestation (T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED) that the previous app-server process tree is gone; stop the session before sending another turn."
-          : (yield* listLoadedThreadTerminals(client.raw).pipe(
-                Effect.timeout("10 seconds"),
-                Effect.map(({ threads, terminals }) => threads === 0 || terminals > 0),
-                Effect.catchCause(() => Effect.succeed(true)),
-              ))
-            ? "Resumed session reports background terminals with unknown ownership, or they could not be listed; stop the session before sending another turn."
-            : undefined;
+      const inheritedReason =
+        options.managedInterrupt === true && options.managedProcessTainted === true
+          ? "An earlier managed session in this T3 server could not confirm its background commands were terminated; the host must restart T3 before another turn."
+          : !managedResume
+            ? undefined
+            : options.managedResumeAttested !== true
+              ? "Resumed managed session has no host attestation (T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED) that the previous app-server process tree is gone; stop the session before sending another turn."
+              : (yield* listLoadedThreadTerminals(client.raw).pipe(
+                    Effect.timeout("10 seconds"),
+                    Effect.map(({ threads, terminals }) => threads === 0 || terminals > 0),
+                    Effect.catchCause(() => Effect.succeed(true)),
+                  ))
+                ? "Resumed session reports background terminals with unknown ownership, or they could not be listed; stop the session before sending another turn."
+                : undefined;
       const inheritedUnknown = inheritedReason !== undefined;
       if (inheritedUnknown) managedInterruptUnconfirmed = true;
       const session = {
@@ -2549,6 +2564,13 @@ export const makeCodexSessionRuntime = (
       }
       yield* settlePendingApprovals("cancel");
       yield* settlePendingUserInputs({});
+      // The app-server about to be closed is the only one that can see its
+      // background terminals. Terminate them with confirmation now; otherwise
+      // report the process as tainted so no later managed session is admitted.
+      if (options.managedInterrupt === true) {
+        const confirmed = yield* terminateLoadedThreadTerminals(client.raw);
+        if (!confirmed) yield* Effect.sync(() => options.onManagedCloseUnconfirmed?.());
+      }
       yield* updateSession(sessionRef, {
         status: "closed",
         activeTurnId: undefined,

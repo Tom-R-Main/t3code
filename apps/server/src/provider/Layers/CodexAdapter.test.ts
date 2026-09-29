@@ -547,6 +547,82 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     });
   }
 
+  const managedLayer = (
+    runtimeFactory: ReturnType<typeof makeRuntimeFactory>,
+    environment: NodeJS.ProcessEnv,
+  ) =>
+    Layer.effect(
+      CodexAdapter,
+      makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: runtimeFactory.factory,
+        environment,
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+  it.effect("an earlier fresh managed session consumes the resume attestation", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("fresh-first"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.stopSession(asThreadId("fresh-first"));
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("resume-after"),
+        runtimeMode: "full-access",
+        resumeCursor: { threadId: "provider-resume-after" },
+      });
+      NodeAssert.equal(runtimeFactory.lastRuntime?.options.managedResumeAttested, false);
+      yield* adapter.stopSession(asThreadId("resume-after"));
+    }).pipe(
+      Effect.provide(
+        managedLayer(runtimeFactory, {
+          T3_SIFT_MANAGED_ACCESS: "1",
+          T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED: "4242",
+        }),
+      ),
+    );
+  });
+
+  for (const closeConfirmed of [true, false]) {
+    it.effect(
+      `an in-process replacement is ${closeConfirmed ? "admitted" : "tainted"} by its predecessor's close`,
+      () => {
+        const runtimeFactory = makeRuntimeFactory();
+        return Effect.gen(function* () {
+          const adapter = yield* CodexAdapter;
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("replaced"),
+            runtimeMode: "full-access",
+          });
+          const first = runtimeFactory.lastRuntime!;
+          NodeAssert.equal(typeof first.options.onManagedCloseUnconfirmed, "function");
+          if (!closeConfirmed) first.options.onManagedCloseUnconfirmed?.();
+          yield* adapter.stopSession(asThreadId("replaced"));
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("replacement"),
+            runtimeMode: "full-access",
+          });
+          NodeAssert.equal(
+            runtimeFactory.lastRuntime?.options.managedProcessTainted,
+            closeConfirmed ? undefined : true,
+          );
+          yield* adapter.stopSession(asThreadId("replacement"));
+        }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+      },
+    );
+  }
+
   it.effect(
     "enables managed interruption and publishes unconfirmed termination as an error",
     () => {

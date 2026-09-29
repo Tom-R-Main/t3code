@@ -63,7 +63,7 @@ const decodeLoadedPage = Schema.decodeUnknownEffect(LoadedPage);
  * builds a UnifiedExecProcessManager per session), so every thread loaded in
  * this app-server is listed, not only the root. Any listing failure fails.
  */
-export const listLoadedThreadTerminals = (client: Client) =>
+const listLoadedThreads = (client: Client) =>
   Effect.gen(function* () {
     let cursor: string | null = null;
     const seen = new Set<string>();
@@ -80,10 +80,48 @@ export const listLoadedThreadTerminals = (client: Client) =>
         );
       if (cursor !== null) seen.add(cursor);
     } while (cursor !== null);
+    return [...threads];
+  });
+
+export const listLoadedThreadTerminals = (client: Client) =>
+  Effect.gen(function* () {
+    const threads = yield* listLoadedThreads(client);
     let total = 0;
     for (const thread of threads) total += (yield* listBackgroundTerminals(client, thread)).length;
-    return { threads: threads.size, terminals: total };
+    return { threads: threads.length, terminals: total };
   });
+
+/**
+ * Stop-time cleanup for a managed session being closed or replaced in-process:
+ * every background terminal on every loaded thread is terminated, each with the
+ * provider's confirmation, and a final listing must be empty. The next
+ * app-server cannot see terminals this one leaves, so anything short of that
+ * proof is reported as unconfirmed (false).
+ */
+export const terminateLoadedThreadTerminals = (client: Client) =>
+  Effect.gen(function* () {
+    for (let pass = 0; pass < 4; pass++) {
+      let found = 0;
+      for (const thread of yield* listLoadedThreads(client)) {
+        for (const terminal of yield* listBackgroundTerminals(client, thread)) {
+          found++;
+          const response = yield* client
+            .request("thread/backgroundTerminals/terminate", {
+              threadId: thread,
+              processId: terminal.processId,
+            })
+            .pipe(Effect.flatMap(decodeTermination));
+          if (!response.terminated) return false;
+        }
+      }
+      if (found === 0) return true;
+      yield* Effect.yieldNow;
+    }
+    return false;
+  }).pipe(
+    Effect.timeout("15 seconds"),
+    Effect.catchCause(() => Effect.succeed(false)),
+  );
 
 /** Every background terminal the provider reports for one thread, all pages. */
 export const listBackgroundTerminals = (client: Client, threadId: string) =>

@@ -219,10 +219,24 @@ fixture results do not establish real-provider process termination.
   sufficient; track descendants by a containment the commands cannot leave, such
   as a cgroup or systemd scope. Omit the variable on a first launch and whenever
   that confirmation is not available.
-- **Effect**: admits at most one managed resume in this T3 server process; any
-  later resume in the same process is refused until Stop. The loaded-thread
-  terminal check still runs. The value is an assertion by the host; T3 does not
-  inspect the host's process table.
+- **Effect**: valid only for the first managed provider session this T3 server
+  process starts, fresh or resumed. Any earlier managed session start in the
+  process consumes it, so a resume after an in-process replacement is refused
+  until the host restarts T3. The loaded-thread terminal check still runs. The
+  value is an assertion by the host; T3 does not inspect the host's process
+  table.
+
+#### In-process replacement and close
+
+Closing a managed provider session (Stop, or replacement by another session in
+the same T3 server) first terminates every background terminal on every loaded
+thread of its app-server, each with the provider's confirmation, and requires a
+final empty listing. The next app-server cannot see terminals the closed one
+leaves, so this is the only point where they can be proved gone. If that proof
+fails (listing or termination errors, a refusal, or the bound is exhausted),
+the T3 server process is tainted: every later managed session in it, fresh or
+resumed, starts unconfirmed and refuses turns until the host restarts T3 (with
+the attestation above, once the host has confirmed the tree is gone).
 
 Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,
