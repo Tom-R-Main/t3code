@@ -23,7 +23,7 @@ const terminals = new Map();
 let terminalListCount = 0;
 let reloadCount = 0;
 let pendingReload;
-let pendingTurnStart;
+const heldTurnStarts = [];
 let interruptCount = 0;
 let approvalEndedTurn = false;
 const lateCommandNotifications = [];
@@ -53,10 +53,9 @@ rl.on("line", async (line) => {
     } else write({ id, result: {} });
     return;
   }
-  if (method === "feedback/upload" && pendingTurnStart !== undefined) {
-    // Releases a held turn/start response after the test has interrupted.
-    const held = pendingTurnStart;
-    pendingTurnStart = undefined;
+  if (method === "feedback/upload" && heldTurnStarts.length > 0) {
+    // Releases the oldest held turn/start response.
+    const held = heldTurnStarts.shift();
     write({ id, result: { threadId: script.rootThreadId } });
     write({ id: held.id, result: { ...fixture.responses.turnStart, turn: held.turn } });
     return;
@@ -266,12 +265,19 @@ rl.on("line", async (line) => {
       ? { ...fixture.responses.turnStart.turn, id: turnId }
       : fixture.responses.turnStart.turn;
     turnStartCount += 1;
-    if (script.holdSecondTurnStart && turnStartCount === 2) {
+    const holdIndexes = script.holdTurnStarts ?? (script.holdSecondTurnStart ? [2] : []);
+    if (holdIndexes.includes(turnStartCount)) {
       // The response stays in flight until the test releases it (feedback/upload).
-      pendingTurnStart = { id, turn };
+      heldTurnStarts.push({ id, turn });
       write({
         method: "serverRequest/resolved",
-        params: { threadId: script.rootThreadId, requestId: "fixture-turn-start-held" },
+        params: {
+          threadId: script.rootThreadId,
+          requestId:
+            turnStartCount === 2
+              ? "fixture-turn-start-held"
+              : `fixture-turn-start-held-${turnStartCount}`,
+        },
       });
       return;
     }

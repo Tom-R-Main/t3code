@@ -188,11 +188,11 @@ export interface CodexSessionRuntimeOptions {
    */
   readonly managedResumeAttested?: boolean;
   /**
-   * An earlier managed session in this T3 server could not prove at close that
-   * its background commands were terminated. Every later managed session starts
-   * unconfirmed until the host restarts T3.
+   * Live read of the T3 server's process taint: true once any managed session in
+   * this process could not prove at close that its background commands were
+   * terminated. Read at every admission, never snapshotted.
    */
-  readonly managedProcessTainted?: boolean;
+  readonly managedProcessTaint?: () => boolean;
   /** Called when closing a managed session cannot confirm command termination. */
   readonly onManagedCloseUnconfirmed?: () => void;
   readonly model?: string;
@@ -1405,6 +1405,18 @@ export const makeCodexSessionRuntime = (
     // A turn/start whose response arrived after an interruption began. Sticky:
     // no later interruption result can make that admission owned again.
     let managedAdmissionCrossed = false;
+    /**
+     * The single managed admission predicate, read live at every point that
+     * admits a turn or moves the session to ready/running: not interrupting,
+     * no unconfirmed cleanup or unknown ownership, no turn that crossed an
+     * interruption, and no process taint from another session's close.
+     */
+    const managedAdmissionOpen = () =>
+      options.managedInterrupt !== true ||
+      (!managedInterruptActive &&
+        !managedInterruptUnconfirmed &&
+        !managedAdmissionCrossed &&
+        options.managedProcessTaint?.() !== true);
     let managedAdmissionEpoch = 0;
     const managedInterruptedTurns = new Set<string>();
     const managedTurnCompletions = new Map<string, CodexServerNotification>();
@@ -1902,7 +1914,7 @@ export const makeCodexSessionRuntime = (
             return;
           }
           if (
-            (managedInterruptActive || managedInterruptUnconfirmed || managedAdmissionCrossed) &&
+            !managedAdmissionOpen() &&
             notification.method === "thread/status/changed" &&
             notification.params.threadId === root
           )
@@ -2055,8 +2067,10 @@ export const makeCodexSessionRuntime = (
           if (providerThreadId && payload.threadId !== providerThreadId) {
             return Effect.void;
           }
+          // A managed session whose admission is closed stays in error: a turn the
+          // provider starts anyway is not an admitted turn.
           return updateSession(sessionRef, {
-            status: "running",
+            ...(managedAdmissionOpen() ? { status: "running" as const } : {}),
             activeTurnId: TurnId.make(payload.turn.id),
           });
         }),
@@ -2076,7 +2090,11 @@ export const makeCodexSessionRuntime = (
               ? payload.turn.error.message
               : undefined;
           return updateSession(sessionRef, {
-            status: payload.turn.status === "failed" ? "error" : "ready",
+            ...(payload.turn.status === "failed"
+              ? { status: "error" as const }
+              : managedAdmissionOpen()
+                ? { status: "ready" as const }
+                : {}),
             activeTurnId: undefined,
             ...(lastError ? { lastError } : {}),
           });
@@ -2516,7 +2534,7 @@ export const makeCodexSessionRuntime = (
         options.managedInterrupt === true &&
         readResumeCursorThreadId(options.resumeCursor) !== undefined;
       const inheritedReason =
-        options.managedInterrupt === true && options.managedProcessTainted === true
+        options.managedInterrupt === true && options.managedProcessTaint?.() === true
           ? "An earlier managed session in this T3 server could not confirm its background commands were terminated; the host must restart T3 before another turn."
           : !managedResume
             ? undefined
@@ -2589,13 +2607,20 @@ export const makeCodexSessionRuntime = (
       start,
       getSession: Ref.get(sessionRef),
       compactThread: Effect.gen(function* () {
+        // Compaction starts provider work, so it is an admission like a turn.
+        if (!managedAdmissionOpen())
+          return yield* CodexErrors.CodexAppServerRequestError.internalError(
+            "Managed command termination is pending or unconfirmed; stop or reconcile the session before compacting.",
+            undefined,
+            { method: "thread/compact/start" },
+          );
         const providerThreadId = yield* readProviderThreadId;
         yield* client.request("thread/compact/start", { threadId: providerThreadId });
       }),
       sendTurn: (input) =>
         Effect.gen(function* () {
           const admissionEpoch = managedAdmissionEpoch;
-          if (managedInterruptActive || managedInterruptUnconfirmed || managedAdmissionCrossed) {
+          if (!managedAdmissionOpen()) {
             return yield* CodexErrors.CodexAppServerRequestError.internalError(
               "Managed command termination is pending or unconfirmed; stop or reconcile the session before sending another turn.",
               undefined,
@@ -2632,11 +2657,7 @@ export const makeCodexSessionRuntime = (
               options.mcpCapabilities,
             ),
           });
-          if (
-            managedInterruptActive ||
-            managedInterruptUnconfirmed ||
-            admissionEpoch !== managedAdmissionEpoch
-          ) {
+          if (!managedAdmissionOpen() || admissionEpoch !== managedAdmissionEpoch) {
             return yield* CodexErrors.CodexAppServerRequestError.internalError(
               "Turn submission crossed a managed interruption; submit again after termination is confirmed.",
               undefined,
@@ -2654,15 +2675,10 @@ export const makeCodexSessionRuntime = (
             ),
           );
           const turnId = TurnId.make(response.turn.id);
-          if (
-            options.managedInterrupt &&
-            (admissionEpoch !== managedAdmissionEpoch ||
-              managedInterruptActive ||
-              managedInterruptUnconfirmed)
-          ) {
-            // Codex queued this turn while an interruption was underway, so it
-            // belongs to no confirmed epoch. Ask Codex to interrupt it, then fail
-            // closed: only an explicit Stop can prove nothing it started remains.
+          // A turn Codex accepted whose admission is not proved: ask Codex to
+          // interrupt it, then fail closed; only an explicit Stop can prove that
+          // nothing it started remains.
+          const refuseCrossedTurn = Effect.gen(function* () {
             managedAdmissionCrossed = true;
             yield* client
               .request("turn/interrupt", { threadId: providerThreadId, turnId: response.turn.id })
@@ -2674,15 +2690,27 @@ export const makeCodexSessionRuntime = (
             return yield* CodexErrors.CodexAppServerRequestError.internalError(reason, undefined, {
               method: "turn/start",
             });
-          }
+          });
+          if (
+            options.managedInterrupt &&
+            (admissionEpoch !== managedAdmissionEpoch || !managedAdmissionOpen())
+          )
+            return yield* refuseCrossedTurn;
           yield* updateSession(sessionRef, (session) => ({
-            status: "running",
+            ...(managedAdmissionOpen() ? { status: "running" as const } : {}),
             // Codex accepts follow-ups while the current turn is still
             // running. The response contains the queued turn id, but
             // turn/interrupt only accepts the id that is active now.
             activeTurnId: session.activeTurnId ?? turnId,
             ...(normalizedModel ? { model: normalizedModel } : {}),
           }));
+          // Recheck after recording: an interruption or another crossing that
+          // landed meanwhile still refuses this turn.
+          if (
+            options.managedInterrupt &&
+            (admissionEpoch !== managedAdmissionEpoch || !managedAdmissionOpen())
+          )
+            return yield* refuseCrossedTurn;
           const resumedProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
           return {
             threadId: options.threadId,
@@ -2788,18 +2816,17 @@ export const makeCodexSessionRuntime = (
             // Unconfirmed is sticky for the session: a later cleanup is scoped to
             // its own turn, so it cannot prove an earlier failure's commands gone.
             const previouslyUnconfirmed = managedInterruptUnconfirmed;
-            const confirmed =
-              result.confirmed &&
-              completion !== undefined &&
-              !managedAdmissionCrossed &&
-              !previouslyUnconfirmed;
+            if (!result.confirmed || completion === undefined) managedInterruptUnconfirmed = true;
+            managedInterruptActive = false;
+            // Ready requires the live admission predicate, not this cleanup alone.
+            const confirmed = managedAdmissionOpen();
             const reason = managedAdmissionCrossed
               ? "A turn was admitted while an interruption was in progress; termination is unconfirmed."
               : previouslyUnconfirmed
                 ? "An earlier managed interruption is unconfirmed; stop the session to reconcile it."
-                : result.reason;
-            managedInterruptUnconfirmed = !confirmed;
-            managedInterruptActive = false;
+                : options.managedProcessTaint?.() === true
+                  ? "An earlier managed session in this T3 server could not confirm its background commands were terminated; the host must restart T3 before another turn."
+                  : result.reason;
             yield* updateSession(sessionRef, {
               status: confirmed ? "ready" : "error",
               activeTurnId: undefined,
@@ -2869,7 +2896,7 @@ export const makeCodexSessionRuntime = (
           const providerThreadId = yield* readProviderThreadId;
           const snapshot = yield* rollbackCodexThread(client, providerThreadId, numTurns);
           yield* updateSession(sessionRef, {
-            status: "ready",
+            ...(managedAdmissionOpen() ? { status: "ready" as const } : {}),
             activeTurnId: undefined,
           });
           return snapshot;

@@ -35,6 +35,7 @@ import { isManagedAccessEnabled, priorProcessTreeTerminated } from "../../sift/M
 import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
@@ -2277,6 +2278,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   // Set once a managed session's close could not confirm its background
   // commands were terminated; only a host restart of T3 clears it.
   let managedProcessTainted = false;
+  // Close-time cleanup proofs still running for managed sessions in this
+  // process. A managed start waits for all of them before reading the taint.
+  const managedClosesInFlight = new Set<Deferred.Deferred<void>>();
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2300,6 +2304,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
         const managed = isManagedAccessEnabled(options?.environment ?? process.env);
+        // Serialize managed lifecycle in this process: a start never races an
+        // earlier session's close-time cleanup proof, and reads taint after it.
+        if (managed)
+          yield* Effect.forEach([...managedClosesInFlight], (closing) => Deferred.await(closing), {
+            discard: true,
+          });
         const managedResume = managed && isCodexResumeCursorSchema(input.resumeCursor);
         const managedResumeAttested = managedResume && priorProcessTreeAttestation;
         if (managed) priorProcessTreeAttestation = false;
@@ -2311,7 +2321,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(managedResume ? { managedResumeAttested } : {}),
           ...(managed
             ? {
-                ...(managedProcessTainted ? { managedProcessTainted: true } : {}),
+                managedProcessTaint: () => managedProcessTainted,
                 onManagedCloseUnconfirmed: () => {
                   managedProcessTainted = true;
                 },
@@ -2723,7 +2733,21 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     }
     session.stopped = true;
     sessions.delete(session.threadId);
-    yield* session.runtime.close.pipe(Effect.ignore);
+    // Registered before any await, so a concurrent managed start observes it.
+    const closing = isManagedAccessEnabled(options?.environment ?? process.env)
+      ? Deferred.makeUnsafe<void>()
+      : undefined;
+    if (closing) managedClosesInFlight.add(closing);
+    yield* session.runtime.close.pipe(
+      Effect.ignore,
+      Effect.ensuring(
+        closing
+          ? Effect.sync(() => managedClosesInFlight.delete(closing)).pipe(
+              Effect.andThen(Deferred.succeed(closing, undefined)),
+            )
+          : Effect.void,
+      ),
+    );
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
   });

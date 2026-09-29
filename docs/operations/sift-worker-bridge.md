@@ -237,6 +237,19 @@ fails (listing or termination errors, a refusal, or the bound is exhausted),
 the T3 server process is tainted: every later managed session in it, fresh or
 resumed, starts unconfirmed and refuses turns until the host restarts T3 (with
 the attestation above, once the host has confirmed the tree is gone).
+Managed session starts in one T3 server wait for every close-time proof still
+in progress before starting, and every session reads the taint live, so a
+session that was already running also refuses new turns once the taint is set.
+
+#### Admission
+
+One predicate decides admission for a managed session, read live each time: no
+interruption in progress, no unconfirmed cleanup or unknown ownership, no turn
+that crossed an interruption, and no process taint. It gates every point that
+starts provider work or reports the session ready or running: before and after
+`turn/start` (including after the turn is recorded), compaction, the
+`turn/started` and `turn/completed` status updates, rollback, the end of an
+interruption, and session start. Any closed check leaves the session in error.
 
 Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,

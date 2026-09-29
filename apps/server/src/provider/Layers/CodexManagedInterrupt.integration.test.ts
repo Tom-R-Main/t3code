@@ -385,6 +385,82 @@ describe("managed admission across interruption and resume", () => {
     );
   }
 
+  it.live(
+    "a turn admitted after interruption is refused once an earlier in-flight turn crosses",
+    () =>
+      Effect.gen(function* () {
+        const directory = NodeFS.mkdtempSync(
+          NodePath.join(NodeOS.tmpdir(), "managed-crossed-two-"),
+        );
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+        );
+        const scriptPath = yield* writeScript(directory, {
+          turnIds: ["owned-turn", "crossed-turn", "late-turn"],
+          holdTurnStarts: [2, 3],
+          managedTerminals: [{ kind: "owned" }],
+        });
+        const runtime = yield* makeCodexSessionRuntime({
+          threadId: ThreadId.make("managed-crossed-two"),
+          binaryPath: peerPath,
+          cwd: directory,
+          runtimeMode: "full-access",
+          managedInterrupt: true,
+          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+        });
+        const ready = yield* Deferred.make<void>();
+        const heldSecond = yield* Deferred.make<void>();
+        const heldThird = yield* Deferred.make<void>();
+        const settled = yield* Deferred.make<void>();
+        const events: ProviderEvent[] = [];
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) => {
+            events.push(event);
+            if (event.method === "serverRequest/resolved") {
+              const requestId = (event.payload as { requestId?: string }).requestId;
+              if (requestId === "fixture-turn-start-held")
+                return Deferred.succeed(heldSecond, undefined);
+              if (requestId === "fixture-turn-start-held-3")
+                return Deferred.succeed(heldThird, undefined);
+              return Deferred.succeed(ready, undefined);
+            }
+            if (
+              event.method === "session/ready" &&
+              events.some((e) => e.method === "turn/completed")
+            )
+              return Deferred.succeed(settled, undefined);
+            return Effect.void;
+          }),
+          Effect.forkScoped,
+        );
+        yield* runtime.start();
+        yield* runtime.sendTurn({ input: "fixture" });
+        yield* Deferred.await(ready).pipe(Effect.timeout("10 seconds"));
+        const crossing = yield* runtime
+          .sendTurn({ input: "in flight across the interrupt" })
+          .pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(heldSecond).pipe(Effect.timeout("10 seconds"));
+        yield* runtime.interruptTurn();
+        yield* Deferred.await(settled).pipe(Effect.timeout("10 seconds"));
+        // Admitted after the interrupt settled, still in flight when the first crosses.
+        const late = yield* runtime
+          .sendTurn({ input: "admitted after the interrupt" })
+          .pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(heldThird).pipe(Effect.timeout("10 seconds"));
+        yield* runtime.uploadFeedback("release crossed turn");
+        assert.equal((yield* Fiber.join(crossing))._tag, "Failure");
+        yield* runtime.uploadFeedback("release late turn");
+        assert.equal((yield* Fiber.join(late))._tag, "Failure");
+        const session = yield* runtime.getSession;
+        assert.equal(session.status, "error");
+        assert.include(
+          NodeFS.readFileSync(`${scriptPath}.interrupts`, "utf8"),
+          '"turnId":"late-turn"',
+        );
+        yield* runtime.close;
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   for (const inherited of [true, false]) {
     it.live(
       `a resumed managed session ${inherited ? "refuses" : "admits"} turns with ${inherited ? "inherited" : "no"} background terminals`,
@@ -504,7 +580,7 @@ describe("managed admission across interruption and resume", () => {
             cwd: directory,
             runtimeMode: "full-access",
             managedInterrupt: true,
-            managedProcessTainted: true,
+            managedProcessTaint: () => true,
             ...(cursor
               ? {
                   resumeCursor: { threadId: wireFixture.rootThreadId },
@@ -519,6 +595,7 @@ describe("managed admission across interruption and resume", () => {
             (yield* runtime.sendTurn({ input: "blocked" }).pipe(Effect.result))._tag,
             "Failure",
           );
+          assert.equal((yield* runtime.compactThread.pipe(Effect.result))._tag, "Failure");
           yield* runtime.close;
         }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
