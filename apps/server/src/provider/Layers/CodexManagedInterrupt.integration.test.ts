@@ -600,4 +600,228 @@ describe("managed admission across interruption and resume", () => {
         }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
   }
+
+  const managedFixture = (name: string, script: Record<string, unknown>, extra: object = {}) =>
+    Effect.gen(function* () {
+      const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), `managed-${name}-`));
+      const scriptPath = yield* writeScript(directory, { recordLifecycle: true, ...script });
+      let unconfirmedCloses = 0;
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make(`managed-${name}`),
+        binaryPath: peerPath,
+        cwd: directory,
+        runtimeMode: "full-access",
+        managedInterrupt: true,
+        onManagedCloseUnconfirmed: () => {
+          unconfirmedCloses++;
+        },
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+        ...extra,
+      });
+      const events: ProviderEvent[] = [];
+      const ready = yield* Deferred.make<void>();
+      const unconfirmed = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => {
+          events.push(event);
+          if (event.method === "session/interrupt-unconfirmed")
+            return Deferred.succeed(unconfirmed, undefined);
+          if (event.method === "serverRequest/resolved") return Deferred.succeed(ready, undefined);
+          return Effect.void;
+        }),
+        Effect.forkScoped,
+      );
+      return {
+        directory,
+        scriptPath,
+        runtime,
+        events,
+        ready,
+        unconfirmed,
+        closes: () => unconfirmedCloses,
+      };
+    });
+  const lifecycleOf = (scriptPath: string) =>
+    NodeFS.existsSync(`${scriptPath}.lifecycle`)
+      ? NodeFS.readFileSync(`${scriptPath}.lifecycle`, "utf8").trim().split("\n")
+      : [];
+
+  for (const interruptWorks of [true, false]) {
+    it.live(
+      `close settles an active turn before sweeping terminals: ${interruptWorks ? "settled" : "unsettled"}`,
+      () => {
+        let directory = "";
+        return Effect.gen(function* () {
+          const f = yield* managedFixture("close-active", {
+            turnIds: ["owned-turn"],
+            managedTerminals: [{ kind: "owned" }],
+            ...(interruptWorks ? {} : { failInterruptFor: wireFixture.rootThreadId }),
+          });
+          directory = f.directory;
+          yield* f.runtime.start();
+          yield* f.runtime.sendTurn({ input: "fixture" });
+          yield* Deferred.await(f.ready).pipe(Effect.timeout("10 seconds"));
+          yield* f.runtime.close;
+          const events = lifecycleOf(f.scriptPath);
+          assert.equal(events[0], "interrupt:owned-turn");
+          if (interruptWorks) {
+            assert.equal(f.closes(), 0);
+            assert.include(events, "terminate:1");
+          } else {
+            assert.equal(f.closes(), 1);
+          }
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(NodeServices.layer),
+          Effect.ensuring(
+            Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+          ),
+        );
+      },
+    );
+  }
+
+  it.live("observed unknown command ownership closes admission immediately", () => {
+    let directory = "";
+    return Effect.gen(function* () {
+      const command = (processId: string) => ({
+        method: "item/started",
+        params: {
+          threadId: wireFixture.rootThreadId,
+          turnId: "owned-turn",
+          startedAtMs: 1,
+          item: {
+            id: "conflicted",
+            type: "commandExecution",
+            command: "fixture",
+            cwd: "/tmp",
+            status: "inProgress",
+            commandActions: [],
+            processId,
+          },
+        },
+      });
+      const f = yield* managedFixture("ownership-unknown", {
+        turnIds: ["owned-turn", "refused-turn"],
+        notifications: [command("7"), command("8")],
+      });
+      directory = f.directory;
+      yield* f.runtime.start();
+      yield* f.runtime.sendTurn({ input: "fixture" });
+      yield* Deferred.await(f.unconfirmed).pipe(Effect.timeout("10 seconds"));
+      assert.equal((yield* f.runtime.getSession).status, "error");
+      assert.equal(
+        (yield* f.runtime.sendTurn({ input: "refused" }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* f.runtime.close;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  });
+
+  for (const mode of ["error", "malformed"] as const) {
+    it.live(`an accepted turn whose start response fails closes admission: ${mode}`, () => {
+      let directory = "";
+      return Effect.gen(function* () {
+        const f = yield* managedFixture("start-failure", {
+          turnIds: ["first-turn", "uncertain-turn"],
+          failTurnStartResponse: { index: 2, mode },
+        });
+        directory = f.directory;
+        yield* f.runtime.start();
+        yield* f.runtime.sendTurn({ input: "first" });
+        assert.equal(
+          (yield* f.runtime.sendTurn({ input: "uncertain" }).pipe(Effect.result))._tag,
+          "Failure",
+        );
+        yield* Deferred.await(f.unconfirmed).pipe(Effect.timeout("10 seconds"));
+        assert.equal((yield* f.runtime.getSession).status, "error");
+        assert.equal(
+          (yield* f.runtime.sendTurn({ input: "refused" }).pipe(Effect.result))._tag,
+          "Failure",
+        );
+        assert.include(lifecycleOf(f.scriptPath), "interrupt:uncertain-turn");
+        yield* f.runtime.close;
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(NodeServices.layer),
+        Effect.ensuring(
+          Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+        ),
+      );
+    });
+  }
+
+  it.live("an approval that arrives after admission closed cannot be accepted", () => {
+    let directory = "";
+    return Effect.gen(function* () {
+      const command = (processId: string) => ({
+        method: "item/started",
+        params: {
+          threadId: wireFixture.rootThreadId,
+          turnId: "owned-turn",
+          startedAtMs: 1,
+          item: {
+            id: "conflicted",
+            type: "commandExecution",
+            command: "fixture",
+            cwd: "/tmp",
+            status: "inProgress",
+            commandActions: [],
+            processId,
+          },
+        },
+      });
+      const f = yield* managedFixture("approval-closed", {
+        turnIds: ["owned-turn"],
+        notifications: [command("7"), command("8")],
+        serverRequests: [
+          {
+            method: "item/commandExecution/requestApproval",
+            label: "late-approval",
+            params: {
+              threadId: "${threadId}",
+              turnId: "${turnId}",
+              itemId: "late-approval",
+              startedAtMs: 1,
+              command: "more work",
+              cwd: "/tmp",
+            },
+          },
+        ],
+      });
+      directory = f.directory;
+      yield* f.runtime.start();
+      yield* f.runtime.sendTurn({ input: "fixture" });
+      yield* Deferred.await(f.unconfirmed).pipe(Effect.timeout("10 seconds"));
+      // The events stream is a queue with one reader (the fixture), so poll it.
+      let request: ProviderEvent | undefined;
+      for (let i = 0; i < 200 && !request; i++) {
+        request = f.events.find((e) => e.method === "item/commandExecution/requestApproval");
+        if (!request) yield* Effect.sleep("25 millis");
+      }
+      assert.isDefined(request);
+      const requestId = request!.requestId!;
+      assert.equal(
+        (yield* f.runtime.respondToRequest(requestId, "accept").pipe(Effect.result))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* f.runtime.respondToRequest(requestId, "decline").pipe(Effect.result))._tag,
+        "Success",
+      );
+      yield* f.runtime.close;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  });
 });

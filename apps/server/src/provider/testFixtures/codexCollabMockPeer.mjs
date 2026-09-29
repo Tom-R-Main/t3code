@@ -17,6 +17,11 @@ const fixture = JSON.parse(
 const script = JSON.parse(NodeFS.readFileSync(process.env.T3_CODEX_COLLAB_SCRIPT, "utf8"));
 
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
+// Ordered record of lifecycle effects (interrupts and terminations) for tests.
+const lifecycle = (entry) => {
+  if (script.recordLifecycle)
+    NodeFS.appendFileSync(`${process.env.T3_CODEX_COLLAB_SCRIPT}.lifecycle`, `${entry}\n`);
+};
 let turnStartCount = 0;
 let activeTurn;
 const terminals = new Map();
@@ -115,6 +120,7 @@ rl.on("line", async (line) => {
     });
     terminals.delete(t.processId);
     NodeFS.appendFileSync(`${process.env.T3_CODEX_COLLAB_SCRIPT}.terminated`, `${t.processId}\n`);
+    lifecycle(`terminate:${t.processId}`);
     write({ id, result: { terminated: true } });
     return;
   }
@@ -281,6 +287,20 @@ rl.on("line", async (line) => {
       });
       return;
     }
+    const failure = script.failTurnStartResponse;
+    if (failure && failure.index === turnStartCount) {
+      // Codex accepted the turn (it starts), but the response is lost or unusable.
+      activeTurn = turn;
+      write({
+        jsonrpc: "2.0",
+        method: "turn/started",
+        params: { threadId: script.rootThreadId, turn },
+      });
+      if (failure.mode === "error")
+        write({ id, error: { code: -32000, message: "scripted turn/start response failure" } });
+      else write({ id, result: { turn: { id: 5 } } });
+      return;
+    }
     activeTurn = turn;
     write({ id, result: { ...fixture.responses.turnStart, turn } });
     const rootThreadId = script.rootThreadId;
@@ -394,6 +414,7 @@ rl.on("line", async (line) => {
   }
   if (method === "turn/interrupt") {
     interruptCount++;
+    lifecycle(`interrupt:${message.params?.turnId}`);
     // Record which thread/turn was interrupted (append-only sidecar file the
     // test reads) so Stop coverage can assert every live child was reached.
     // failInterruptFor simulates a dead child whose interrupt errors.

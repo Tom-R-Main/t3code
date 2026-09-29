@@ -464,5 +464,62 @@ export function makeManagedCommandOwnership() {
         }),
       ),
     );
-  return { observe, targets, cleanup, verified, completed, awaitTerminals };
+  /**
+   * Close-time settlement of every live provider turn in this app-server and of
+   * spawned children that have not started or closed: interrupt each live turn,
+   * await its terminal receipt, repeat until nothing is live. Any timeout,
+   * unknown ownership or unsettled child is reported as unsettled (false).
+   */
+  const settleForClose = (client: Client) =>
+    Effect.gen(function* () {
+      const pendingAnywhere = () =>
+        [...spawns.keys()].filter(
+          (thread) => !startedThreads.has(thread) && !closedThreads.has(thread),
+        );
+      for (let pass = 0; pass < 8; pass++) {
+        if (incomplete) return false;
+        const live = [...liveTurns];
+        const pending = pendingAnywhere();
+        if (live.length === 0 && pending.length === 0) return true;
+        yield* Effect.forEach(
+          live,
+          ([threadId, turnId]) =>
+            client
+              .request("turn/interrupt", { threadId, turnId })
+              .pipe(Effect.timeout("3 seconds"), Effect.ignore),
+          { concurrency: 8, discard: true },
+        );
+        if (live.length > 0 && (yield* awaitTerminals(live).pipe(Effect.option))._tag === "None")
+          return false;
+        if (pending.length > 0) {
+          const moved = yield* Effect.callback<void>((resume) => {
+            const notify = () => {
+              if (pendingAnywhere().length < pending.length || liveTurns.size > 0)
+                resume(Effect.yieldNow);
+            };
+            listeners.add(notify);
+            notify();
+            return Effect.sync(() => {
+              listeners.delete(notify);
+            });
+          }).pipe(Effect.timeoutOption("10 seconds"));
+          if (moved._tag === "None") return false;
+        }
+      }
+      return false;
+    }).pipe(
+      Effect.timeout("25 seconds"),
+      Effect.catchCause(() => Effect.succeed(false)),
+    );
+  return {
+    observe,
+    targets,
+    cleanup,
+    verified,
+    completed,
+    awaitTerminals,
+    settleForClose,
+    /** Observed history that cannot establish ownership (conflicts, bounds). */
+    incomplete: () => incomplete,
+  };
 }

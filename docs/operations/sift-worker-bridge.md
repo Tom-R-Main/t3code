@@ -243,13 +243,41 @@ session that was already running also refuses new turns once the taint is set.
 
 #### Admission
 
-One predicate decides admission for a managed session, read live each time: no
-interruption in progress, no unconfirmed cleanup or unknown ownership, no turn
-that crossed an interruption, and no process taint. It gates every point that
-starts provider work or reports the session ready or running: before and after
-`turn/start` (including after the turn is recorded), compaction, the
-`turn/started` and `turn/completed` status updates, rollback, the end of an
-interruption, and session start. Any closed check leaves the session in error.
+Principle: any uncertainty about owned provider work closes managed admission
+until Stop or a host restart of T3; only positive proof reopens it.
+
+One predicate decides admission, read live each time: no interruption in
+progress, no unconfirmed cleanup, no turn that crossed an interruption or whose
+start outcome is uncertain, no observed conflict in command ownership history,
+no close in progress, and no process taint. It gates every point that starts or
+continues provider work or reports the session ready or running: before and
+after `turn/start` (including after the turn is recorded), compaction, accepting
+an approval, answering a question, the `turn/started` and `turn/completed`
+status updates, rollback, the end of an interruption, and session start. A
+closed check leaves the session in error. Closing admission is sticky, cancels
+parked approvals, and a root turn the provider starts while admission is closed
+is interrupted. It does not stop a turn already running; Stop does.
+
+Provider requests and their failure paths:
+
+| Request                          | Creates or continues work         | Rejection, decode failure, timeout or abort                                                                       |
+| -------------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `turn/start`                     | Yes                               | Treated as possibly accepted: admission closes, and any root turn seen starting since the request is interrupted. |
+| approval accept, question answer | Yes (continues a turn)            | Refused while admission is closed; declining or cancelling stays allowed.                                         |
+| `thread/compact/start`           | Summarizes history; runs no tools | Refused while admission is closed. A failed compaction cannot leave commands, so it does not close admission.     |
+| `thread/rollback`                | No                                | History only; failure leaves status unchanged.                                                                    |
+| `thread/start`, `thread/resume`  | Opens the session                 | Failure fails `start`; the session is never admitted and close still settles and sweeps.                          |
+| `turn/interrupt`                 | No (reduces work)                 | Failure leaves cleanup unconfirmed, which closes admission.                                                       |
+
+Ownership history that the tracker cannot establish (a command item reported
+under two turns or process ids, a bound exceeded) closes admission as soon as it
+is observed.
+
+Close is a proof in two steps: first every live turn (and any spawned child that
+has not started or closed) is interrupted and its terminal receipt awaited, then
+every loaded thread's background terminals are terminated with confirmation and
+a final listing must be empty. Either step failing, or unknown ownership, taints
+the process.
 
 Bridge changes stay in `apps/server/src/sift/`, `apps/server/integration/siftBridge*`,
 `packages/contracts/src/siftBridge.ts`, its export in `packages/contracts/src/index.ts`,

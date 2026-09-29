@@ -1405,6 +1405,11 @@ export const makeCodexSessionRuntime = (
     // A turn/start whose response arrived after an interruption began. Sticky:
     // no later interruption result can make that admission owned again.
     let managedAdmissionCrossed = false;
+    // Set when close begins: no admission while the close proof is in progress.
+    let managedClosing = false;
+    // Root turns the provider reported starting, so an uncertain turn/start can
+    // learn which turn it may have created.
+    const managedRootTurnsSeen = new Set<string>();
     /**
      * The single managed admission predicate, read live at every point that
      * admits a turn or moves the session to ready/running: not interrupting,
@@ -1416,6 +1421,8 @@ export const makeCodexSessionRuntime = (
       (!managedInterruptActive &&
         !managedInterruptUnconfirmed &&
         !managedAdmissionCrossed &&
+        !managedClosing &&
+        !managedOwnership.incomplete() &&
         options.managedProcessTaint?.() !== true);
     let managedAdmissionEpoch = 0;
     const managedInterruptedTurns = new Set<string>();
@@ -1591,6 +1598,20 @@ export const makeCodexSessionRuntime = (
           ),
         ),
       );
+
+    /**
+     * Uncertainty about owned provider work closes managed admission until Stop:
+     * the flag is sticky, parked approvals are cancelled (they would let the
+     * provider run more commands), and the session reports the reason.
+     */
+    const closeManagedAdmission = (reason: string) =>
+      Effect.gen(function* () {
+        managedInterruptUnconfirmed = true;
+        yield* settlePendingApprovals("cancel");
+        yield* updateSession(sessionRef, { status: "error", lastError: reason });
+        yield* emitSessionEvent("session/interrupt-unconfirmed", reason);
+      });
+    let managedOwnershipReported = false;
 
     /**
      * Registers v2 collab children and re-emits their notifications as
@@ -2428,6 +2449,25 @@ export const makeCodexSessionRuntime = (
             )
               managedTurnCompletions.set(notification.params.turn.id, notification);
             managedOwnership.observe(method, params);
+            if (notification.method === "turn/started" && notification.params.threadId === root) {
+              if (managedRootTurnsSeen.size >= 4096) managedRootTurnsSeen.clear();
+              managedRootTurnsSeen.add(notification.params.turn.id);
+              // A root turn the provider starts while admission is closed was
+              // never admitted: interrupt it (outside this handler, bounded).
+              if (!managedAdmissionOpen() && !managedInterruptActive && root !== undefined)
+                yield* client
+                  .request("turn/interrupt", {
+                    threadId: root,
+                    turnId: notification.params.turn.id,
+                  })
+                  .pipe(Effect.timeout("3 seconds"), Effect.ignore, Effect.forkIn(runtimeScope));
+            }
+            if (managedOwnership.incomplete() && !managedOwnershipReported) {
+              managedOwnershipReported = true;
+              yield* closeManagedAdmission(
+                "Command ownership history is incomplete; stop the session before sending another turn.",
+              );
+            }
           }
           yield* Queue.offer(serverNotifications, makeCodexServerNotification(method, params));
         }),
@@ -2580,14 +2620,19 @@ export const makeCodexSessionRuntime = (
       if (alreadyClosed) {
         return;
       }
+      managedClosing = true;
       yield* settlePendingApprovals("cancel");
       yield* settlePendingUserInputs({});
       // The app-server about to be closed is the only one that can see its
       // background terminals. Terminate them with confirmation now; otherwise
       // report the process as tainted so no later managed session is admitted.
       if (options.managedInterrupt === true) {
-        const confirmed = yield* terminateLoadedThreadTerminals(client.raw);
-        if (!confirmed) yield* Effect.sync(() => options.onManagedCloseUnconfirmed?.());
+        // Settle live work first: an empty terminal list proves nothing while a
+        // turn could still start another command.
+        const settled = yield* managedOwnership.settleForClose(client.raw);
+        const swept = yield* terminateLoadedThreadTerminals(client.raw);
+        if (!settled || !swept || managedOwnership.incomplete())
+          yield* Effect.sync(() => options.onManagedCloseUnconfirmed?.());
       }
       yield* updateSession(sessionRef, {
         status: "closed",
@@ -2664,14 +2709,40 @@ export const makeCodexSessionRuntime = (
               { method: "turn/start" },
             );
           }
-          const rawResponse = yield* client.raw.request("turn/start", params);
-          const response = yield* decodeV2TurnStartResponse(rawResponse).pipe(
-            Effect.mapError((error) =>
-              CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
-                "decode-response-payload",
-                error,
-                { method: "turn/start" },
+          const rootTurnsBefore = new Set(managedRootTurnsSeen);
+          // Once sent, a turn/start without a decoded success (rejection,
+          // decode failure, timeout or interruption) may still have created a
+          // turn: close admission and interrupt any turn it can be tied to.
+          const uncertainStart = Effect.gen(function* () {
+            managedAdmissionCrossed = true;
+            yield* Effect.forEach(
+              [...managedRootTurnsSeen].filter((turn) => !rootTurnsBefore.has(turn)),
+              (turn) =>
+                client
+                  .request("turn/interrupt", { threadId: providerThreadId, turnId: turn })
+                  .pipe(Effect.timeout("3 seconds"), Effect.ignore),
+              { discard: true },
+            );
+            yield* closeManagedAdmission(
+              "A turn/start outcome is uncertain; termination is unconfirmed. Stop the session before sending another turn.",
+            );
+          });
+          const response = yield* client.raw.request("turn/start", params).pipe(
+            Effect.flatMap((rawResponse) =>
+              decodeV2TurnStartResponse(rawResponse).pipe(
+                Effect.mapError((error) =>
+                  CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
+                    "decode-response-payload",
+                    error,
+                    { method: "turn/start" },
+                  ),
+                ),
               ),
+            ),
+            Effect.onExit((exit) =>
+              options.managedInterrupt === true && Exit.isFailure(exit)
+                ? uncertainStart
+                : Effect.void,
             ),
           );
           const turnId = TurnId.make(response.turn.id);
@@ -2913,6 +2984,11 @@ export const makeCodexSessionRuntime = (
         }),
       respondToRequest: (requestId, decision) =>
         Effect.gen(function* () {
+          // Accepting lets the provider run more commands: an admission.
+          if ((decision === "accept" || decision === "acceptForSession") && !managedAdmissionOpen())
+            return yield* CodexErrors.CodexAppServerRequestError.internalError(
+              "Managed command termination is pending or unconfirmed; only decline or cancel is allowed.",
+            );
           const pending = (yield* Ref.get(pendingApprovalsRef)).get(requestId);
           if (!pending) {
             return yield* new CodexSessionRuntimePendingApprovalNotFoundError({
@@ -2942,6 +3018,11 @@ export const makeCodexSessionRuntime = (
         }),
       respondToUserInput: (requestId, answers) =>
         Effect.gen(function* () {
+          // Answering continues the provider turn: an admission.
+          if (!managedAdmissionOpen())
+            return yield* CodexErrors.CodexAppServerRequestError.internalError(
+              "Managed command termination is pending or unconfirmed; the turn cannot continue.",
+            );
           const pending = (yield* Ref.get(pendingUserInputsRef)).get(requestId);
           if (!pending) {
             return yield* new CodexSessionRuntimePendingUserInputNotFoundError({
