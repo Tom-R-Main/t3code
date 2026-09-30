@@ -63,7 +63,22 @@ rl.on("line", async (line) => {
     // Releases the oldest held turn/start response.
     const held = heldTurnStarts.shift();
     write({ id, result: { threadId: script.rootThreadId } });
+    if (script.heldTurnStartReleaseError) {
+      // Codex started the turn, but the response the runtime receives is an error.
+      activeTurn = held.turn;
+      write({ method: "turn/started", params: { threadId: script.rootThreadId, turn: held.turn } });
+      write({
+        id: held.id,
+        error: { code: -32000, message: "scripted turn/start response failure" },
+      });
+      return;
+    }
     write({ id: held.id, result: { ...fixture.responses.turnStart, turn: held.turn } });
+    if (script.startHeldTurnOnRelease) {
+      // The released turn runs: Codex reports it started after the response.
+      activeTurn = held.turn;
+      write({ method: "turn/started", params: { threadId: script.rootThreadId, turn: held.turn } });
+    }
     return;
   }
   if (method === "feedback/upload" && pendingReload !== undefined) {

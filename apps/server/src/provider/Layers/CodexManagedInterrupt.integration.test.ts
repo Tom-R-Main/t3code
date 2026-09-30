@@ -909,6 +909,113 @@ describe("managed admission across interruption and resume", () => {
     );
   });
 
+  for (const startSucceeds of [true, false]) {
+    it.live(
+      `an interrupt during the first in-flight turn/start fences it: ${startSucceeds ? "turn settled, admission reopens" : "start fails, admission stays closed"}`,
+      () => {
+        let directory = "";
+        return Effect.gen(function* () {
+          const fenced = yield* Deferred.make<void>();
+          const f = yield* managedFixture(
+            "first-start-fence",
+            {
+              turnIds: ["first-turn", "next-turn"],
+              holdTurnStarts: [1],
+              startHeldTurnOnRelease: true,
+              ...(startSucceeds ? {} : { heldTurnStartReleaseError: true }),
+              // No processes; an interrupted root turn reports its terminal receipt.
+              managedTerminals: [],
+            },
+            { testHooks: { afterInterruptFence: Deferred.succeed(fenced, undefined) } },
+          );
+          directory = f.directory;
+          yield* f.runtime.start();
+          const sending = yield* f.runtime
+            .sendTurn({ input: "first" })
+            .pipe(Effect.result, Effect.forkScoped);
+          // The first turn/start is held by the peer: no response, no turn/started.
+          yield* Deferred.await(f.ready).pipe(Effect.timeout("10 seconds"));
+          assert.isUndefined((yield* f.runtime.getSession).activeTurnId);
+          const interrupting = yield* f.runtime.interruptTurn().pipe(Effect.forkScoped);
+          yield* Deferred.await(fenced).pipe(Effect.timeout("10 seconds"));
+          // While the fenced start is unresolved, admission is closed.
+          assert.equal(
+            (yield* f.runtime.sendTurn({ input: "during fence" }).pipe(Effect.result))._tag,
+            "Failure",
+          );
+          yield* f.runtime.uploadFeedback("release held start").pipe(Effect.result);
+          yield* Fiber.join(interrupting);
+          // The delayed start is never admitted, and the turn it produced is interrupted.
+          assert.equal((yield* Fiber.join(sending))._tag, "Failure");
+          assert.include(lifecycleOf(f.scriptPath), "interrupt:first-turn");
+          const session = yield* f.runtime.getSession;
+          assert.isUndefined(session.activeTurnId);
+          if (startSucceeds) {
+            // The produced turn was interrupted and proven settled.
+            assert.equal(session.status, "ready");
+            // Its completion is published once the settlement is proven.
+            yield* pollUntil(() =>
+              f.events.some(
+                (e) => e.method === "turn/completed" && String(e.turnId) === "first-turn",
+              ),
+            );
+            const next = yield* f.runtime.sendTurn({ input: "after stop" });
+            assert.equal(next.turnId, "next-turn");
+          } else {
+            // The start's outcome is uncertain: admission stays closed until Stop.
+            yield* Deferred.await(f.unconfirmed).pipe(Effect.timeout("10 seconds"));
+            assert.equal(session.status, "error");
+            assert.equal(
+              (yield* f.runtime.sendTurn({ input: "refused" }).pipe(Effect.result))._tag,
+              "Failure",
+            );
+          }
+          yield* f.runtime.close;
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(NodeServices.layer),
+          Effect.ensuring(
+            Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+          ),
+        );
+      },
+    );
+  }
+
+  it.live("an interrupt whose fenced start never resolves stays unconfirmed", () => {
+    let directory = "";
+    return Effect.gen(function* () {
+      const f = yield* managedFixture("first-start-unresolved", {
+        turnIds: ["first-turn"],
+        holdTurnStarts: [1],
+        managedTerminals: [],
+      });
+      directory = f.directory;
+      yield* f.runtime.start();
+      yield* f.runtime.sendTurn({ input: "first" }).pipe(Effect.result, Effect.forkScoped);
+      yield* Deferred.await(f.ready).pipe(Effect.timeout("10 seconds"));
+      // The fence waits out its bound; the start is still unresolved.
+      yield* f.runtime.interruptTurn();
+      yield* Deferred.await(f.unconfirmed).pipe(Effect.timeout("10 seconds"));
+      assert.equal((yield* f.runtime.getSession).status, "error");
+      assert.equal(
+        (yield* f.runtime.sendTurn({ input: "refused" }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      // Released after the fence closed: the start crosses and is refused.
+      yield* f.runtime.uploadFeedback("release held start").pipe(Effect.result);
+      yield* pollUntil(() => lifecycleOf(f.scriptPath).includes("interrupt:first-turn"));
+      assert.equal((yield* f.runtime.getSession).status, "error");
+      yield* f.runtime.close;
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      ),
+    );
+  });
+
   for (const resolves of [true, false]) {
     it.live(
       `close waits for an in-flight turn/start: ${resolves ? "resolves late" : "never resolves"}`,
