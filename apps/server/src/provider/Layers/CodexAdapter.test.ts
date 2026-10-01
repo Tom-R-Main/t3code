@@ -753,6 +753,80 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
   });
 
+  for (const closeConfirmed of [true, false]) {
+    it.effect(
+      `a sibling's admission is untouched while another session's close proof runs: ${closeConfirmed ? "proof succeeds" : "proof fails"}`,
+      () => {
+        const runtimeFactory = makeRuntimeFactory();
+        return Effect.gen(function* () {
+          const adapter = yield* CodexAdapter;
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("closing"),
+            runtimeMode: "full-access",
+          });
+          const closing = runtimeFactory.lastRuntime!;
+          yield* adapter.startSession({
+            provider: ProviderDriverKind.make("codex"),
+            threadId: asThreadId("sibling"),
+            runtimeMode: "full-access",
+          });
+          const sibling = runtimeFactory.lastRuntime!;
+          let finishClose!: () => void;
+          let closeBegan = false;
+          closing.closeImpl.mockImplementation(
+            () =>
+              new Promise<undefined>((resolve) => {
+                closeBegan = true;
+                finishClose = () => {
+                  if (closeConfirmed) closing.options.onManagedCloseConfirmed?.();
+                  else closing.options.onManagedCloseUnconfirmed?.();
+                  resolve(undefined);
+                };
+              }),
+          );
+          const stopping = yield* adapter.stopSession(asThreadId("closing")).pipe(Effect.forkChild);
+          for (let i = 0; i < 100; i++) {
+            if (closeBegan) break;
+            yield* Effect.yieldNow;
+          }
+          NodeAssert.ok(closeBegan);
+          // The close in progress fences only the closing session's own work.
+          NodeAssert.equal(sibling.options.managedProcessTaint?.(), false);
+          finishClose();
+          yield* Fiber.join(stopping);
+          // Only a failed proof taints the process, and siblings read it live.
+          NodeAssert.equal(sibling.options.managedProcessTaint?.(), !closeConfirmed);
+          yield* adapter.stopSession(asThreadId("sibling"));
+        }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+      },
+    );
+  }
+
+  it.effect("a close that ends without reporting its proof taints the process", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("silent"),
+        runtimeMode: "full-access",
+      });
+      const silent = runtimeFactory.lastRuntime!;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("silent-sibling"),
+        runtimeMode: "full-access",
+      });
+      const sibling = runtimeFactory.lastRuntime!;
+      // Neither callback runs: the close is unproven.
+      silent.closeImpl.mockImplementation(() => Promise.resolve(undefined));
+      yield* adapter.stopSession(asThreadId("silent"));
+      NodeAssert.equal(sibling.options.managedProcessTaint?.(), true);
+      yield* adapter.stopSession(asThreadId("silent-sibling"));
+    }).pipe(Effect.provide(managedLayer(runtimeFactory, { T3_SIFT_MANAGED_ACCESS: "1" })));
+  });
+
   it.effect(
     "enables managed interruption and publishes unconfirmed termination as an error",
     () => {

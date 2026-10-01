@@ -178,6 +178,16 @@ receipts (completed, interrupted or failed) before reconciling processes; an acc
 a synthesized completion. Turns whose preparation crossed an interrupt must be
 submitted again. A turn whose `turn/start` response arrives after an interrupt
 began is interrupted and refused, and the session stays unconfirmed until Stop.
+The exception is an interrupt issued while a `turn/start` is in flight and no
+turn is recorded yet (typically the first turn, before its response or
+`turn/started`): the interrupt fences the in-flight starts instead of returning.
+It advances the admission epoch, waits (bounded) for every such start to
+resolve, and adopts the turn each one produced: the start is refused rather than
+admitted, the turn is interrupted, and the interruption confirms only after that
+turn's terminal receipt and a confirmed cleanup of its work. A fenced start that
+fails or ends uncertainly closes admission until Stop, and a start still
+unresolved at the bound leaves the interruption unconfirmed; one that resolves
+after the fence closed is refused as a crossed turn.
 A resumed managed session (any session started with a resume cursor, including
 one that falls back to a fresh thread) is refused until two things hold. First,
 the host has attested that the previous app-server's process tree is gone
@@ -240,6 +250,10 @@ the attestation above, once the host has confirmed the tree is gone).
 Managed session starts in one T3 server wait for every close-time proof still
 in progress before starting, and every session reads the taint live, so a
 session that was already running also refuses new turns once the taint is set.
+A close in progress is not itself taint: it closes admission only for the
+closing session's own work. A sibling session's admitted turn is unaffected by
+another session's close proof and by its success; only a close that ends
+unproven taints the process.
 
 #### Admission
 
@@ -249,7 +263,7 @@ until Stop or a host restart of T3; only positive proof reopens it.
 One predicate decides admission, read live each time: no interruption in
 progress, no unconfirmed cleanup, no turn that crossed an interruption or whose
 start outcome is uncertain, no observed conflict in command ownership history,
-no close in progress, and no process taint. It gates every point that starts or
+no close of this session in progress, and no process taint. It gates every point that starts or
 continues provider work or reports the session ready or running: before and
 after `turn/start` (including after the turn is recorded), compaction, accepting
 an approval, answering a question, the `turn/started` and `turn/completed`
@@ -287,12 +301,15 @@ Close is a proof in two steps: first every live turn (and any spawned child that
 has not started or closed) is interrupted and its terminal receipt awaited, then
 every loaded thread's background terminals are terminated with confirmation and
 a final listing must be empty. Either step failing, or unknown ownership, taints
-the process. The proof is taint-by-default: a close counts as unproven from the
-moment Stop or replacement begins it until the runtime reports the completed
-proof, so an interrupted Stop or replacement fiber leaves the process tainted.
+the process. The proof is taint-by-default: a close that ends in any way
+without the runtime reporting the completed proof (failure, no report, or an
+interrupted Stop or replacement fiber) taints the process before the close is
+released to waiting starts. While the proof runs, only the closing session is
+fenced.
 An interrupted interruption leaves admission closed. A `turn/start` is live work
-from the moment it is sent until the turn is fully recorded: close waits
-(bounded) for every such request to resolve before settling and sweeping, and
+from the moment it is sent until the turn is fully recorded: close, and an
+interrupt that finds no recorded turn, wait (bounded) for every such request to
+resolve before settling, and
 any other exit in that window, including interruption of the caller after a
 successful response, closes admission and interrupts the turn. A start that
 resolves after a close proof completed re-taints the process.

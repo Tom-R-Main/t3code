@@ -2283,9 +2283,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   // Close-time cleanup proofs still running for managed sessions in this
   // process. A managed start waits for all of them before reading the taint.
   const managedClosesInFlight = new Set<Deferred.Deferred<void>>();
-  // Closes begun but not yet proven. Counted as taint until each proves itself,
-  // so an interrupted Stop or replacement cannot leave the process untainted.
-  let unprovenManagedCloses = 0;
+  // A close in progress is not taint: it fences only the closing session's own
+  // work (the runtime closes that session's admission when close begins). A
+  // close that ends without its proof, including one whose Stop was
+  // interrupted, sets managedProcessTainted before its in-flight entry
+  // resolves, so later starts and every live sibling then read the taint.
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2327,12 +2329,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(managedResume ? { managedResumeAttested } : {}),
           ...(managed
             ? {
-                managedProcessTaint: () => managedProcessTainted || unprovenManagedCloses > 0,
+                managedProcessTaint: () => managedProcessTainted,
                 onManagedCloseConfirmed: () => {
-                  if (managedCloseProof.requested && !managedCloseProof.proven) {
-                    managedCloseProof.proven = true;
-                    unprovenManagedCloses--;
-                  }
+                  if (managedCloseProof.requested) managedCloseProof.proven = true;
                 },
                 onManagedCloseUnconfirmed: () => {
                   managedProcessTainted = true;
@@ -2741,31 +2740,37 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     session: CodexAdapterSessionContext,
   ) {
-    if (session.stopped) {
-      return;
-    }
-    session.stopped = true;
-    sessions.delete(session.threadId);
-    // Taint by default: this close is unproven until the runtime reports proof.
-    if (session.managedCloseProof && !session.managedCloseProof.requested) {
-      session.managedCloseProof.requested = true;
-      unprovenManagedCloses++;
-    }
-    // Registered before any await, so a concurrent managed start observes it.
-    const closing = isManagedAccessEnabled(options?.environment ?? process.env)
-      ? Deferred.makeUnsafe<void>()
-      : undefined;
-    if (closing) managedClosesInFlight.add(closing);
-    yield* session.runtime.close.pipe(
-      Effect.ignore,
-      Effect.ensuring(
-        closing
-          ? Effect.sync(() => managedClosesInFlight.delete(closing)).pipe(
-              Effect.andThen(Deferred.succeed(closing, undefined)),
-            )
-          : Effect.void,
-      ),
+    // Marking the session stopped, registering the close and installing its
+    // finalizer happen with interruption masked, so no interruption point lies
+    // between them; only the runtime close itself is interruptible.
+    const began = yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (session.stopped) return false;
+        session.stopped = true;
+        sessions.delete(session.threadId);
+        const proof = session.managedCloseProof;
+        if (proof) proof.requested = true;
+        // Registered before any await, so a concurrent managed start observes it.
+        const closing = isManagedAccessEnabled(options?.environment ?? process.env)
+          ? Deferred.makeUnsafe<void>()
+          : undefined;
+        if (closing) managedClosesInFlight.add(closing);
+        // Taint by default: however the close ends (failure, interruption of
+        // the Stop, or a runtime that never reports), an unproven close taints
+        // the process before its in-flight entry resolves.
+        yield* restore(session.runtime.close).pipe(
+          Effect.ignore,
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (proof && !proof.proven) managedProcessTainted = true;
+              if (closing) managedClosesInFlight.delete(closing);
+            }).pipe(Effect.andThen(closing ? Deferred.succeed(closing, undefined) : Effect.void)),
+          ),
+        );
+        return true;
+      }),
     );
+    if (!began) return;
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
   });

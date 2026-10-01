@@ -201,8 +201,13 @@ export interface CodexSessionRuntimeOptions {
    * so an interrupted or failed close leaves the process tainted.
    */
   readonly onManagedCloseConfirmed?: () => void;
-  /** Test seam only: runs after a successful turn/start response is decoded. */
-  readonly testHooks?: { readonly afterTurnStartResponse?: Effect.Effect<void> };
+  /** Test seams only. */
+  readonly testHooks?: {
+    /** Runs after a successful turn/start response is decoded. */
+    readonly afterTurnStartResponse?: Effect.Effect<void>;
+    /** Runs after an interruption fences in-flight turn/start requests. */
+    readonly afterInterruptFence?: Effect.Effect<void>;
+  };
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
@@ -1415,9 +1420,38 @@ export const makeCodexSessionRuntime = (
     let managedAdmissionCrossed = false;
     // Set when close begins: no admission while the close proof is in progress.
     let managedClosing = false;
-    // turn/start requests sent but not yet resolved and recorded; close waits
-    // for these, since each can still create a turn.
+    // turn/start requests sent but not yet resolved and recorded; close and an
+    // interruption with no recorded turn wait for these, since each can still
+    // create a turn.
     let managedStartsInFlight = 0;
+    const managedStartDrainWaiters = new Set<Deferred.Deferred<void>>();
+    // Open while an interruption that found no recorded turn waits for the
+    // starts in flight when it began: a start sent under the preceding epoch
+    // records the turn it produced here instead of being admitted, and that
+    // interruption interrupts and settles it.
+    let managedStartFence:
+      | { readonly epoch: number; open: boolean; readonly turns: Set<string> }
+      | undefined;
+    const endManagedStart = Effect.suspend(() => {
+      managedStartsInFlight--;
+      if (managedStartsInFlight > 0) return Effect.void;
+      const waiters = [...managedStartDrainWaiters];
+      managedStartDrainWaiters.clear();
+      return Effect.forEach(waiters, (waiter) => Deferred.succeed(waiter, undefined), {
+        discard: true,
+      });
+    });
+    /** True once no turn/start is in flight; false if some remain at the bound. */
+    const awaitManagedStartsDrained = Effect.suspend(() => {
+      if (managedStartsInFlight === 0) return Effect.succeed(true);
+      const waiter = Deferred.makeUnsafe<void>();
+      managedStartDrainWaiters.add(waiter);
+      return Deferred.await(waiter).pipe(
+        Effect.timeoutOption("10 seconds"),
+        Effect.map((drained) => drained._tag === "Some"),
+        Effect.ensuring(Effect.sync(() => managedStartDrainWaiters.delete(waiter))),
+      );
+    });
     // Set once this session's close proof completed; a later start invalidates it.
     let managedCloseProven = false;
     // Root turns the provider reported starting, so an uncertain turn/start can
@@ -2685,12 +2719,7 @@ export const makeCodexSessionRuntime = (
         yield* Effect.gen(function* () {
           // A sent turn/start can still create a turn: wait (bounded) for every
           // one to resolve; a turn it produced is then live and settled below.
-          let startsResolved = false;
-          for (let poll = 0; poll < 400 && !startsResolved; poll++) {
-            if (managedStartsInFlight === 0) startsResolved = true;
-            else yield* Effect.sleep("25 millis");
-          }
-          if (!startsResolved) return false;
+          if (!(yield* awaitManagedStartsDrained)) return false;
           const settled = yield* managedOwnership.settleForClose(client.raw);
           const swept = yield* terminateLoadedThreadTerminals(client.raw);
           return settled && swept && !managedOwnership.incomplete() && managedStartsInFlight === 0;
@@ -2807,17 +2836,18 @@ export const makeCodexSessionRuntime = (
             );
           });
           if (options.managedInterrupt === true) {
-            managedStartsInFlight++;
             // Close may have begun since the admission checks above; nothing is
             // sent yet, so this start simply does not happen.
-            if (managedClosing) {
-              managedStartsInFlight--;
+            if (managedClosing)
               return yield* CodexErrors.CodexAppServerRequestError.internalError(
                 "The managed session is closing.",
                 undefined,
                 { method: "turn/start" },
               );
-            }
+            // No interruption point lies between the epoch check above and this
+            // count, so an interruption that sees no start in flight cannot miss
+            // one that is about to be sent.
+            managedStartsInFlight++;
           }
           return yield* Effect.gen(function* () {
             const response = yield* client.raw
@@ -2836,6 +2866,32 @@ export const makeCodexSessionRuntime = (
                 ),
               );
             startedTurnId = response.turn.id;
+            // An interruption that began while this start was in flight, with no
+            // turn recorded, fenced it: hand the turn to that interruption (which
+            // interrupts it and proves it settled) instead of admitting it. The
+            // hand-off is synchronous; if this fiber ends before it, the
+            // uncertain-start path closes admission instead.
+            const fence = managedStartFence;
+            if (
+              options.managedInterrupt === true &&
+              fence !== undefined &&
+              fence.open &&
+              fence.epoch === admissionEpoch + 1 &&
+              fence.epoch === managedAdmissionEpoch &&
+              managedInterruptedTurns.size < 4096
+            ) {
+              outcomeHandled = true;
+              managedInterruptedTurns.add(response.turn.id);
+              fence.turns.add(response.turn.id);
+              yield* client
+                .request("turn/interrupt", { threadId: providerThreadId, turnId: response.turn.id })
+                .pipe(Effect.timeout("3 seconds"), Effect.ignore);
+              return yield* CodexErrors.CodexAppServerRequestError.internalError(
+                "The turn was interrupted before it was admitted.",
+                undefined,
+                { method: "turn/start" },
+              );
+            }
             if (options.testHooks?.afterTurnStartResponse)
               yield* options.testHooks.afterTurnStartResponse;
             const turnId = TurnId.make(response.turn.id);
@@ -2898,7 +2954,7 @@ export const makeCodexSessionRuntime = (
               Effect.gen(function* () {
                 if (options.managedInterrupt !== true) return;
                 if (Exit.isFailure(exit) && !outcomeHandled) yield* uncertainStart;
-                managedStartsInFlight--;
+                yield* endManagedStart;
               }),
             ),
           );
@@ -2909,11 +2965,24 @@ export const makeCodexSessionRuntime = (
           const session = yield* Ref.get(sessionRef);
           if (options.managedInterrupt) {
             if (managedInterruptActive) return;
-            const effectiveTurnId = turnId ?? session.activeTurnId;
-            if (!effectiveTurnId || managedInterruptedTurns.has(effectiveTurnId)) return;
+            const requestedTurnId = turnId ?? session.activeTurnId;
+            // A turn/start sent before this interrupt, with no provider turn id
+            // recorded yet, is live work: fence it rather than return. The
+            // turn it produces is adopted as a target of this interruption.
+            const fencingStarts = requestedTurnId === undefined && managedStartsInFlight > 0;
+            if (
+              !fencingStarts &&
+              (!requestedTurnId || managedInterruptedTurns.has(requestedTurnId))
+            )
+              return;
             managedInterruptActive = true;
             managedAdmissionEpoch++;
+            const fence = fencingStarts
+              ? { epoch: managedAdmissionEpoch, open: true, turns: new Set<string>() }
+              : undefined;
+            managedStartFence = fence;
             if (managedInterruptedTurns.size >= 4096) {
+              if (fence) fence.open = false;
               managedInterruptActive = false;
               managedInterruptUnconfirmed = true;
               yield* updateSession(sessionRef, {
@@ -2927,9 +2996,23 @@ export const makeCodexSessionRuntime = (
               );
               return;
             }
-            managedInterruptedTurns.add(effectiveTurnId);
-            const targets = managedOwnership.targets(providerThreadId, effectiveTurnId);
-            const ownershipVerified = managedOwnership.verified(providerThreadId);
+            let startsDrained = true;
+            let targetTurns: ReadonlyArray<string>;
+            if (fence) {
+              if (options.testHooks?.afterInterruptFence)
+                yield* options.testHooks.afterInterruptFence;
+              // Every fenced start either records its turn in the fence, or
+              // fails and closes admission itself (uncertain start). A start
+              // still unresolved at the bound leaves this interruption
+              // unconfirmed; one resolving after the fence closes is refused
+              // as a crossed turn.
+              startsDrained = yield* awaitManagedStartsDrained;
+              fence.open = false;
+              targetTurns = [...fence.turns];
+            } else {
+              managedInterruptedTurns.add(requestedTurnId!);
+              targetTurns = [requestedTurnId!];
+            }
             const interruptTarget = (threadId: string, targetTurnId: string) =>
               client.request("turn/interrupt", { threadId, turnId: targetTurnId }).pipe(
                 Effect.asVoid,
@@ -2953,68 +3036,88 @@ export const makeCodexSessionRuntime = (
                   return Effect.fail(error);
                 }),
               );
-            const result = yield* Effect.gen(function* () {
-              yield* settlePendingApprovals("cancel");
-              yield* settlePendingUserInputs({});
-              const children = yield* Effect.forEach(
-                [...targets].filter(
-                  ([threadId, targetTurnId]) =>
-                    threadId !== providerThreadId &&
-                    !managedOwnership.completed(threadId, targetTurnId),
-                ),
-                ([threadId, targetTurnId]) =>
-                  interruptTarget(threadId, targetTurnId).pipe(
-                    Effect.timeout("3 seconds"),
-                    Effect.result,
+            // Interrupts one owned root turn, then proves its children, terminal
+            // receipt and command cleanup.
+            const proveTurn = (effectiveTurnId: string) => {
+              const targets = managedOwnership.targets(providerThreadId, effectiveTurnId);
+              const ownershipVerified = managedOwnership.verified(providerThreadId);
+              return Effect.gen(function* () {
+                yield* settlePendingApprovals("cancel");
+                yield* settlePendingUserInputs({});
+                const children = yield* Effect.forEach(
+                  [...targets].filter(
+                    ([threadId, targetTurnId]) =>
+                      threadId !== providerThreadId &&
+                      !managedOwnership.completed(threadId, targetTurnId),
                   ),
-                { concurrency: 8 },
-              ).pipe(Effect.timeoutOption("10 seconds"));
-              yield* interruptTarget(providerThreadId, effectiveTurnId).pipe(
-                Effect.timeout("10 seconds"),
+                  ([threadId, targetTurnId]) =>
+                    interruptTarget(threadId, targetTurnId).pipe(
+                      Effect.timeout("3 seconds"),
+                      Effect.result,
+                    ),
+                  { concurrency: 8 },
+                ).pipe(Effect.timeoutOption("10 seconds"));
+                yield* interruptTarget(providerThreadId, effectiveTurnId).pipe(
+                  Effect.timeout("10 seconds"),
+                );
+                if (
+                  !ownershipVerified ||
+                  children._tag === "None" ||
+                  children.value.some((result) => result._tag === "Failure")
+                )
+                  return {
+                    confirmed: false,
+                    reason: "Child ownership or interruption could not be confirmed.",
+                    terminated: 0,
+                  };
+                yield* managedOwnership.awaitTerminals(targets);
+                // A queued root turn Codex starts after this interrupt is itself
+                // interrupted (turn/started handler); its terminal receipt must
+                // arrive before this turn's cleanup can see a stable scope.
+                for (let round = 0; round < 3; round++) {
+                  const pending = [...managedUnadmittedRootTurns]
+                    .filter(
+                      (turn) =>
+                        !targetTurns.includes(turn) &&
+                        !managedOwnership.completed(providerThreadId, turn),
+                    )
+                    .map((turn) => [providerThreadId, turn] as const);
+                  if (pending.length === 0) break;
+                  yield* managedOwnership.awaitTerminals(pending);
+                }
+                return yield* managedOwnership.cleanup(client.raw, targets, providerThreadId);
+              }).pipe(
+                Effect.timeout("30 seconds"),
+                Effect.catchCause(() =>
+                  Effect.succeed({
+                    confirmed: false,
+                    reason:
+                      "Managed interruption or command cleanup failed; termination is unconfirmed.",
+                    terminated: 0,
+                  }),
+                ),
               );
-              if (
-                !ownershipVerified ||
-                children._tag === "None" ||
-                children.value.some((result) => result._tag === "Failure")
-              )
-                return {
-                  confirmed: false,
-                  reason: "Child ownership or interruption could not be confirmed.",
-                  terminated: 0,
-                };
-              yield* managedOwnership.awaitTerminals(targets);
-              // A queued root turn Codex starts after this interrupt is itself
-              // interrupted (turn/started handler); its terminal receipt must
-              // arrive before this turn's cleanup can see a stable scope.
-              for (let round = 0; round < 3; round++) {
-                const pending = [...managedUnadmittedRootTurns]
-                  .filter(
-                    (turn) =>
-                      turn !== effectiveTurnId &&
-                      !managedOwnership.completed(providerThreadId, turn),
-                  )
-                  .map((turn) => [providerThreadId, turn] as const);
-                if (pending.length === 0) break;
-                yield* managedOwnership.awaitTerminals(pending);
-              }
-              return yield* managedOwnership.cleanup(client.raw, targets, providerThreadId);
-            }).pipe(
-              Effect.timeout("30 seconds"),
-              Effect.catchCause(() =>
-                Effect.succeed({
-                  confirmed: false,
-                  reason:
-                    "Managed interruption or command cleanup failed; termination is unconfirmed.",
-                  terminated: 0,
-                }),
-              ),
-            );
+            };
+            const results: Array<{ readonly confirmed: boolean; readonly reason: string }> = [];
+            for (const target of targetTurns) results.push(yield* proveTurn(target));
+            if (!startsDrained)
+              results.push({
+                confirmed: false,
+                reason:
+                  "A turn/start in flight at interruption did not resolve; termination is unconfirmed.",
+              });
+            const failedResult = results.find((result) => !result.confirmed);
+            const result = failedResult ??
+              results[0] ?? {
+                confirmed: true,
+                reason: "No turn was started before the interruption.",
+              };
             // Settle root turns that started while this interruption ran: each
             // needs its terminal receipt and a confirmed cleanup of its own work.
             let unadmittedSettled = true;
             for (let round = 0; round < 3 && unadmittedSettled; round++) {
               const unsettled = [...managedUnadmittedRootTurns].filter(
-                (turn) => turn !== effectiveTurnId && !managedSettledRootTurns.has(turn),
+                (turn) => !targetTurns.includes(turn) && !managedSettledRootTurns.has(turn),
               );
               if (unsettled.length === 0) break;
               for (const turn of unsettled) {
@@ -3034,16 +3137,20 @@ export const makeCodexSessionRuntime = (
             }
             if (
               [...managedUnadmittedRootTurns].some(
-                (turn) => turn !== effectiveTurnId && !managedSettledRootTurns.has(turn),
+                (turn) => !targetTurns.includes(turn) && !managedSettledRootTurns.has(turn),
               )
             )
               unadmittedSettled = false;
-            const completion = managedTurnCompletions.get(effectiveTurnId);
+            const completions = targetTurns.map((turn) => ({
+              turn,
+              completion: managedTurnCompletions.get(turn),
+            }));
             // Unconfirmed is sticky for the session: a later cleanup is scoped to
             // its own turn, so it cannot prove an earlier failure's commands gone.
             const previouslyUnconfirmed = managedInterruptUnconfirmed;
             if (!unadmittedSettled) managedInterruptUnconfirmed = true;
-            if (!result.confirmed || completion === undefined) managedInterruptUnconfirmed = true;
+            if (!result.confirmed || completions.some(({ completion }) => completion === undefined))
+              managedInterruptUnconfirmed = true;
             managedInterruptActive = false;
             // Ready requires the live admission predicate, not this cleanup alone.
             const confirmed = managedAdmissionOpen();
@@ -3061,14 +3168,16 @@ export const makeCodexSessionRuntime = (
             });
             // The raw notification consumer may still have the terminal event
             // queued. The cancellation marker suppresses it in either ordering.
-            if (confirmed && completion) {
-              yield* emitEvent({
-                kind: "notification",
-                threadId: options.threadId,
-                turnId: effectiveTurnId,
-                method: "turn/completed",
-                payload: completion.params,
-              });
+            if (confirmed) {
+              for (const { turn, completion } of completions)
+                if (completion)
+                  yield* emitEvent({
+                    kind: "notification",
+                    threadId: options.threadId,
+                    turnId: TurnId.make(turn),
+                    method: "turn/completed",
+                    payload: completion.params,
+                  });
               yield* emitSessionEvent("session/ready", result.reason);
             } else {
               yield* emitSessionEvent("session/interrupt-unconfirmed", reason);
