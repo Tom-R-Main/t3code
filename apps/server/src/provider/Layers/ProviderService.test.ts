@@ -5288,6 +5288,23 @@ describe("Sift managed access", () => {
     ),
   );
 
+  it.effect("revokes state left on an active managed session when routing to it", () =>
+    withProvider(managedEnvironment, ({ provider, mcpRegistry, codex }) =>
+      Effect.gen(function* () {
+        const threadId = asThreadId("thread-managed-active");
+        yield* startCodex(provider, threadId);
+        const priorToken = yield* seedPriorMcpSession(threadId);
+
+        yield* provider.sendTurn({ threadId, input: "continue", attachments: [] });
+
+        assert.equal(codex.startSession.mock.calls.length, 1);
+        assert.equal(codex.sendTurn.mock.calls.length, 1);
+        assert.equal(yield* mcpRegistry.resolve(priorToken), undefined);
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+      }),
+    ),
+  );
+
   it.effect("still issues MCP access to an interactive session", () =>
     withProvider({}, ({ provider, mcpRegistry, mcpAtLaunch }) =>
       Effect.gen(function* () {

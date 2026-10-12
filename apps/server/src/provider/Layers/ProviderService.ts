@@ -1334,6 +1334,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     }
     const instanceId = yield* requireBindingInstanceId(input.operation, binding);
     const adapter = yield* registry.getByInstance(instanceId);
+    // Fork: an active managed session is routed without prepareMcpSession, so
+    // revoke here any t3-code credential that reached the thread some other way.
+    if (isManagedAccessEnabled(options?.environment ?? process.env)) {
+      yield* clearMcpSession(input.threadId);
+    }
 
     const hasRequestedSession = yield* adapter.hasSession(input.threadId);
     if (hasRequestedSession) {

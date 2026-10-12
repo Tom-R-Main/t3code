@@ -127,9 +127,10 @@ HTTP a managed session may reach only `GET /api/auth/session`,
 `GET /api/orchestration/threads/<bound thread>`.
 
 Managed mode also gives provider sessions no `t3-code` MCP access. Each session
-start and recovery revokes any MCP credential the thread holds, clears its
-provider-session record and issues no replacement, so no adapter registers the
-`t3-code` server or passes a bearer token to the provider process. Interactive
+start, recovery and request routed to an existing session revokes any MCP
+credential the thread holds and clears its provider-session record. No
+replacement is issued, so no adapter registers the `t3-code` server or passes a
+bearer token to the provider process. Interactive
 T3 still issues one credential per session with `pull-requests`, plus `preview`
 and `device` when the settings allow them.
 
