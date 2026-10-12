@@ -126,13 +126,14 @@ HTTP a managed session may reach only `GET /api/auth/session`,
 `POST /api/auth/websocket-ticket`, `GET /ws`, and
 `GET /api/orchestration/threads/<bound thread>`.
 
-Managed mode also gives provider sessions no `t3-code` MCP access. Each session
-start, recovery and request routed to an existing session revokes any MCP
-credential the thread holds and clears its provider-session record. No
-replacement is issued, so no adapter registers the `t3-code` server or passes a
-bearer token to the provider process. Interactive
-T3 still issues one credential per session with `pull-requests`, plus `preview`
-and `device` when the settings allow them.
+Managed mode also gives provider sessions no `t3-code` MCP access. Before a
+session starts or recovers, and whenever a request is routed to a running
+session, T3 revokes any MCP credential the thread holds, clears its MCP provider
+state and issues no replacement. New provider launches receive neither the
+`t3-code` server registration nor a bearer token. Revocation does not remove a
+token from a running process's environment, but `/mcp` rejects it once it is
+revoked. Interactive T3 still issues one credential per session with
+`pull-requests`, plus `preview` and `device` when the settings allow them.
 
 Managed mode refuses to start, and a running server refuses managed requests
 and `attach`, while the server environment sets `GIT_DIR`, `GIT_WORK_TREE`,
