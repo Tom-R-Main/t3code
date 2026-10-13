@@ -51,6 +51,8 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { HttpServer } from "effect/unstable/http";
+import * as NetAddress from "effect/unstable/net/NetAddress";
 
 import {
   ProviderAdapterRequestError,
@@ -74,6 +76,9 @@ import {
   SqlitePersistenceMemory,
 } from "../../persistence/Layers/Sqlite.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
@@ -5148,5 +5153,175 @@ describe("agent browser access", () => {
       );
       assert.deepEqual(issued, [{ threadId, capabilities: ["preview", "pull-requests"] }]);
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("Sift managed access", () => {
+  const registryLayer = McpSessionRegistry.layer.pipe(
+    Layer.provide(
+      Layer.succeed(
+        HttpServer.HttpServer,
+        HttpServer.HttpServer.of({
+          address: NetAddress.inetAddressFromIpStringUnsafe("127.0.0.1", 43123),
+          serve: (() => Effect.void) as HttpServer.HttpServer["Service"]["serve"],
+        }),
+      ),
+    ),
+    Layer.provide(
+      Layer.succeed(
+        ServerEnvironment.ServerEnvironment,
+        ServerEnvironment.ServerEnvironment.of({
+          getEnvironmentId: Effect.succeed(EnvironmentId.make("environment-managed")),
+          getDescriptor: Effect.die("unused"),
+        }),
+      ),
+    ),
+    Layer.provide(NodeServices.layer),
+  );
+
+  // Runs `body` against a provider service whose MCP registry is the real,
+  // module-global one. The fake adapter records the MCP session it could read
+  // at launch, which is what every real adapter turns into its MCP registration
+  // and bearer environment.
+  const withProvider = <A, E>(
+    environment: NodeJS.ProcessEnv,
+    body: (input: {
+      readonly provider: ProviderService.ProviderService["Service"];
+      readonly mcpRegistry: McpSessionRegistry.McpSessionRegistry["Service"];
+      readonly codex: ReturnType<typeof makeFakeCodexAdapter>;
+      readonly mcpAtLaunch: Array<McpProviderSession.McpProviderSessionConfig | undefined>;
+    }) => Effect.Effect<A, E>,
+  ) =>
+    Effect.gen(function* () {
+      const codex = makeFakeCodexAdapter();
+      const launch = codex.startSession.getMockImplementation()!;
+      const mcpAtLaunch: Array<McpProviderSession.McpProviderSessionConfig | undefined> = [];
+      codex.startSession.mockImplementation((input: ProviderSessionStartInput) => {
+        mcpAtLaunch.push(McpProviderSession.readMcpProviderSession(input.threadId));
+        return launch(input);
+      });
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+      );
+      const providerLayer = makeProviderServiceLive({ environment }).pipe(
+        Layer.provide(
+          Layer.succeed(
+            ProviderAdapterRegistry.ProviderAdapterRegistry,
+            makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
+          ),
+        ),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(serverConfigTestLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+        Layer.provide(NodeServices.layer),
+      );
+      return yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const mcpRegistry = yield* McpSessionRegistry.McpSessionRegistry;
+        return yield* body({ provider, mcpRegistry, codex, mcpAtLaunch });
+      }).pipe(Effect.provide(Layer.merge(providerLayer, registryLayer)));
+    });
+
+  const managedEnvironment = { T3_SIFT_MANAGED_ACCESS: "1" };
+
+  // Leaves a live credential and provider session for `threadId`, the state an
+  // earlier issuance would have left behind.
+  const seedPriorMcpSession = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const credential = yield* McpSessionRegistry.issueActiveMcpCredential({
+        threadId,
+        providerInstanceId: codexInstanceId,
+        capabilities: new Set(["preview"]),
+      });
+      assert.ok(credential);
+      McpProviderSession.setMcpProviderSession(credential.config);
+      return credential.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    });
+
+  const startCodex = (provider: ProviderService.ProviderService["Service"], threadId: ThreadId) =>
+    provider.startSession(threadId, {
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      cwd: fixtureCwd("project-managed-mcp"),
+      runtimeMode: "full-access",
+    });
+
+  it.effect("launches a managed session without MCP and revokes an earlier credential", () =>
+    withProvider(managedEnvironment, ({ provider, mcpRegistry, mcpAtLaunch }) =>
+      Effect.gen(function* () {
+        const threadId = asThreadId("thread-managed-start");
+        const priorToken = yield* seedPriorMcpSession(threadId);
+        assert.equal((yield* mcpRegistry.resolve(priorToken))?.threadId, threadId);
+
+        yield* startCodex(provider, threadId);
+
+        assert.deepEqual(mcpAtLaunch, [undefined]);
+        assert.equal(yield* mcpRegistry.resolve(priorToken), undefined);
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+      }),
+    ),
+  );
+
+  it.effect("recovers a managed session without MCP and revokes state left before recovery", () =>
+    withProvider(managedEnvironment, ({ provider, mcpRegistry, codex, mcpAtLaunch }) =>
+      Effect.gen(function* () {
+        const threadId = asThreadId("thread-managed-recovery");
+        yield* startCodex(provider, threadId);
+        yield* codex.stopAll();
+        const priorToken = yield* seedPriorMcpSession(threadId);
+
+        yield* provider.sendTurn({ threadId, input: "resume", attachments: [] });
+
+        assert.equal(codex.startSession.mock.calls.length, 2);
+        assert.deepEqual(mcpAtLaunch, [undefined, undefined]);
+        assert.equal(yield* mcpRegistry.resolve(priorToken), undefined);
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+      }),
+    ),
+  );
+
+  it.effect("revokes state left on an active managed session when routing to it", () =>
+    withProvider(managedEnvironment, ({ provider, mcpRegistry, codex }) =>
+      Effect.gen(function* () {
+        const threadId = asThreadId("thread-managed-active");
+        yield* startCodex(provider, threadId);
+        const priorToken = yield* seedPriorMcpSession(threadId);
+
+        yield* provider.sendTurn({ threadId, input: "continue", attachments: [] });
+
+        assert.equal(codex.startSession.mock.calls.length, 1);
+        assert.equal(codex.sendTurn.mock.calls.length, 1);
+        assert.equal(yield* mcpRegistry.resolve(priorToken), undefined);
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+      }),
+    ),
+  );
+
+  it.effect("still issues MCP access to an interactive session", () =>
+    withProvider({}, ({ provider, mcpRegistry, mcpAtLaunch }) =>
+      Effect.gen(function* () {
+        const threadId = asThreadId("thread-interactive-mcp");
+        const priorToken = yield* seedPriorMcpSession(threadId);
+
+        yield* startCodex(provider, threadId);
+
+        assert.equal(mcpAtLaunch.length, 1);
+        const launched = mcpAtLaunch[0];
+        assert.ok(launched);
+        assert.equal(launched.threadId, threadId);
+        assert.ok(launched.capabilities.has("pull-requests"));
+        assert.equal(yield* mcpRegistry.resolve(priorToken), undefined);
+        const token = launched.authorizationHeader.replace(/^Bearer\s+/, "");
+        assert.equal((yield* mcpRegistry.resolve(token))?.threadId, threadId);
+      }),
+    ),
   );
 });

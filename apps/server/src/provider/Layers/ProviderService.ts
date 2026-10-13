@@ -85,6 +85,7 @@ import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import { isManagedAccessEnabled } from "../../sift/ManagedAccess.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 const isModelSelection = Schema.is(ModelSelection);
 const encodePromptJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -256,6 +257,8 @@ export interface ProviderServiceLiveOptions {
    * test see whether a credential was requested at all.
    */
   readonly issueMcpCredential?: typeof McpSessionRegistry.issueActiveMcpCredential;
+  /** Environment read for Sift managed access. Defaults to `process.env`. */
+  readonly environment?: NodeJS.ProcessEnv;
 }
 
 interface TurnAnalyticsMetadata {
@@ -942,6 +945,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     Effect.gen(function* () {
+      // Fork: a Sift managed worker gets no t3-code MCP authority. Clear what an
+      // earlier start or recovery left for this thread and issue nothing, so no
+      // adapter registers the server or receives its bearer token.
+      if (isManagedAccessEnabled(options?.environment ?? process.env)) {
+        yield* clearMcpSession(threadId);
+        return undefined;
+      }
       const capabilities = yield* agentAccessCapabilities(threadId);
       const credential = yield* issueMcpCredential({ threadId, providerInstanceId, capabilities });
       if (credential) {
@@ -1324,6 +1334,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     }
     const instanceId = yield* requireBindingInstanceId(input.operation, binding);
     const adapter = yield* registry.getByInstance(instanceId);
+    // Fork: an active managed session is routed without prepareMcpSession, so
+    // revoke here any t3-code credential that reached the thread some other way.
+    if (isManagedAccessEnabled(options?.environment ?? process.env)) {
+      yield* clearMcpSession(input.threadId);
+    }
 
     const hasRequestedSession = yield* adapter.hasSession(input.threadId);
     if (hasRequestedSession) {
