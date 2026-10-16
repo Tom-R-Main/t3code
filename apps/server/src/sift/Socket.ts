@@ -23,7 +23,7 @@ const failure = (code: string, message: string) => ({
 // The socket directory is provisioned by the host, outside the writable checkout.
 // Unix owner permissions limit exposure; signed host requests authorize access.
 // No HTTP routes or T3 pairing scopes are widened by this opt-in transport.
-export async function listenSiftSocket(path: string, handle: (input: unknown) => Promise<unknown>) {
+export async function listenSiftSocket(path: string, handle: (input: unknown, signal: AbortSignal) => Promise<unknown>) {
   if (!NodePath.isAbsolute(path) || Buffer.byteLength(path) > 100)
     throw new Error("Invalid Sift socket path.");
   const directory = await NodeFSP.lstat(NodePath.dirname(path));
@@ -65,11 +65,15 @@ export async function listenSiftSocket(path: string, handle: (input: unknown) =>
     }
     sockets.add(socket);
     socket.on("error", () => socket.destroy());
-    socket.on("close", () => sockets.delete(socket));
+    const controller = new AbortController();
+    socket.on("close", () => { sockets.delete(socket); controller.abort(); });
+    // A client that half-closes its request must not leave preflight running.
+    socket.on("end", () => controller.abort());
     socket.setTimeout(30_000, () => socket.destroy());
     let input = Buffer.alloc(0);
     let received = false;
     const reply = (value: unknown) => {
+      if (socket.destroyed || controller.signal.aborted) return;
       const encoded = JSON.stringify(value);
       socket.end(
         (Buffer.byteLength(encoded) > SIFT_BRIDGE_MAX_RESPONSE_BYTES
@@ -104,7 +108,7 @@ export async function listenSiftSocket(path: string, handle: (input: unknown) =>
         reply(failure("INVALID_REQUEST", "Invalid JSON request."));
         return;
       }
-      void handle(parsed).then(reply, () =>
+      void handle(parsed, controller.signal).then(reply, () =>
         reply(failure("INVALID_REQUEST", "Invalid or unavailable bridge request.")),
       );
     });
@@ -136,7 +140,7 @@ export const listenEffectSiftSocket = <E>(
   handle: (input: unknown, authorize?: () => void) => Effect.Effect<unknown, E>,
   publicKey: NodeCrypto.KeyObject,
 ) =>
-  listenSiftSocket(path, async (input) => {
+  listenSiftSocket(path, async (input, signal) => {
     let request: unknown;
     try {
       request = authenticateSiftRequest(input, publicKey);
@@ -147,6 +151,10 @@ export const listenEffectSiftSocket = <E>(
       handle(request, () => {
         authenticateSiftRequest(input, publicKey);
       }),
+      // Cancellation changes only the new read/preparation flow. Existing
+      // effectful commands keep their durable lost-response reconciliation.
+      { signal: request !== null && typeof request === "object" &&
+          "operation" in request && request.operation === "workerPolicy/read" ? signal : undefined },
     );
   });
 

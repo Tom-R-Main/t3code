@@ -66,3 +66,12 @@ describe("mergeProviderInstanceEnvironment", () => {
     });
   });
 });
+
+it("preserves the launcher worker policy despite provider settings overlays", () => {
+  const baseEnv = { CODEX_RESTRICTED_WORKER: "1", CODEX_WORKER_POLICY_V1: "sealed-launch-policy", PATH: "/bin" };
+  expect(mergeProviderInstanceEnvironment([
+    { name: "CODEX_RESTRICTED_WORKER", value: "", sensitive: false },
+    { name: "CODEX_WORKER_POLICY_V1", value: "replacement", sensitive: false },
+    { name: "CUSTOM_VALUE", value: "kept", sensitive: false },
+  ], baseEnv)).toEqual({ ...baseEnv, CUSTOM_VALUE: "kept" });
+});

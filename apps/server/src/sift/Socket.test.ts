@@ -63,3 +63,29 @@ it("refuses shared directories and preserves a preexisting ordinary file", async
     await NodeFSP.rm(directory, { recursive: true, force: true });
   }
 });
+
+it("interrupts an in-flight handler when its private client disconnects", async () => {
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-socket-cancel-"));
+  const socketPath = NodePath.join(directory, "bridge.sock");
+  let started!: () => void;
+  let cancelled!: () => void;
+  const entered = new Promise<void>((resolve) => { started = resolve; });
+  const aborted = new Promise<void>((resolve) => { cancelled = resolve; });
+  const close = await listenSiftSocket(socketPath, async (_input, signal) => {
+    started();
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => { cancelled(); resolve(); }, { once: true }));
+    return { ok: true };
+  });
+  const socket = NodeNet.createConnection(socketPath);
+  try {
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write('{"id":"preflight"}\n');
+    await entered;
+    socket.destroy();
+    await aborted;
+  } finally {
+    socket.destroy();
+    await close();
+    await NodeFSP.rm(directory, { recursive: true, force: true });
+  }
+});

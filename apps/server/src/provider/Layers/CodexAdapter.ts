@@ -2594,6 +2594,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
   });
 
+  const readWorkerPolicy: NonNullable<CodexAdapterShape["readWorkerPolicy"]> = (threadId, challenge, prepare) =>
+    requireSession(threadId).pipe(
+      Effect.flatMap((session) => session.runtime.readWorkerPolicy
+        ? session.runtime.readWorkerPolicy(challenge, prepare)
+        : Effect.fail(new ProviderAdapterValidationError({
+            provider: PROVIDER, operation: "workerPolicy/read", issue: "Worker policy inspection is unavailable.",
+          }))),
+      Effect.mapError((cause) => cause._tag === "ProviderAdapterSessionNotFoundError" || cause._tag === "ProviderAdapterValidationError"
+        ? cause : mapCodexRuntimeError(threadId, "workerPolicy/read", cause)),
+    );
+
   const readThread: CodexAdapterShape["readThread"] = (threadId) =>
     requireSession(threadId).pipe(
       Effect.flatMap((session) => session.runtime.readThread),
@@ -2742,6 +2753,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     compaction: { type: "native", start: compactThread },
     interruptTurn,
     readThread,
+    readWorkerPolicy,
     rollbackThread,
     uploadFeedback,
     respondToRequest,

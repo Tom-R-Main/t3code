@@ -44,6 +44,14 @@ export const SiftBridgeRequest = Schema.Union([
     requestId: Identifier,
     answers: ProviderUserInputAnswers,
   }),
+  // Host-only process attestation: never starts or recovers a provider session.
+  Schema.Struct({
+    ...Base,
+    operation: Schema.Literal("workerPolicy/read"),
+    threadId: Identifier,
+    challenge: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+    prepare: Schema.optional(Schema.Boolean),
+  }),
   // Mints a one-time pairing credential for a T3 client limited to this attempt.
   // The server must run with T3_SIFT_MANAGED_ACCESS=1 or the bridge refuses.
   Schema.Struct({

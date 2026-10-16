@@ -18,6 +18,7 @@ import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { makeSiftBridge } from "./Bridge.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
 
 const testLayer = (directory: string) =>
   OrchestrationLayerLive.pipe(
@@ -392,6 +393,61 @@ it.effect("terminalizes a guarded reservation when dispatch throws before persis
       const events = yield* handle({ ...request, operation: "events", afterSequence: 0 });
       if (!events.ok || !("events" in events.result)) throw new Error("Events unavailable");
       expect(events.result.events.some(event => event.type === "thread.approval-response-requested")).toBe(false);
+    }).pipe(Effect.provide(testLayer(directory)));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("forwards worker-policy inspection only to an exact ready assignment without dispatching a turn", () =>
+  Effect.gen(function* () {
+    const directory = yield* Effect.acquireRelease(
+      Effect.promise(() => NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-worker-policy-"))),
+      (directory) => Effect.promise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
+    );
+    yield* Effect.gen(function* () {
+      const engine = yield* OrchestrationEngineService;
+      const calls: Array<{ threadId: string; challenge: string; prepare: boolean }> = [];
+      let expired = false;
+      const attestation = { coverageComplete: false, configSha256: null, challenge: "fresh-challenge" };
+      // The bridge reads only this optional private method. No startSession or
+      // sendTurn implementation exists, so an accidental inference call fails.
+      const inspection = {
+        readWorkerPolicy: (threadId: ThreadId, challenge: string, prepare: boolean) =>
+          Effect.sync(() => {
+            calls.push({ threadId, challenge, prepare });
+            if (challenge === "expire") expired = true;
+            return { attestation, providerThreadId: "native-bound-thread" };
+          }),
+      } as ProviderService["Service"];
+      const handle = yield* makeSiftBridge.pipe(Effect.provideService(ProviderService, inspection));
+      const unbound = yield* handle({ ...request, operation: "workerPolicy/read", threadId: "arbitrary", challenge: "fresh-challenge" });
+      expect(!unbound.ok && unbound.error.code).toBe("NOT_BOUND");
+      const bound = yield* handle({ ...request, operation: "bind", checkoutPath: directory,
+        modelSelection: { instanceId: "codex", model: "gpt-5.4" }, runtimeMode: "approval-required" });
+      if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding fixture failed");
+      const threadId = bound.result.threadId;
+      const beforeSequence = yield* engine.latestSequence;
+      const input = { ...request, operation: "workerPolicy/read", threadId, challenge: "fresh-challenge", prepare: true };
+      for (const changed of [
+        { ...input, threadId: "arbitrary" },
+        { ...input, binding: { ...binding, workItemId: "other-work" } },
+        { ...input, challenge: "😀".repeat(65) },
+        { ...input, challenge: "line\nbreak" },
+      ]) expect((yield* handle(changed)).ok).toBe(false);
+      expect(calls).toEqual([]);
+      const response = yield* handle(input);
+      expect(response.ok && response.result).toEqual({ attestation, providerThreadId: "native-bound-thread" });
+      expect(calls).toEqual([{ threadId, challenge: "fresh-challenge", prepare: true }]);
+      expect(yield* engine.latestSequence).toBe(beforeSequence);
+      const expiredResponse = yield* handle({ ...input, challenge: "expire" }, () => {
+        if (expired) throw new Error("Expired host signature");
+      });
+      expect(!expiredResponse.ok && expiredResponse.error.code).toBe("AUTHORIZATION_FAILED");
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE sift_bridge_binding SET ready_generation = 0 WHERE slot = 1`;
+      const notReady = yield* handle(input);
+      expect(!notReady.ok && notReady.error.code).toBe("WORKER_POLICY_BINDING_MISMATCH");
+      expect(calls).toHaveLength(2);
+      expect(yield* engine.latestSequence).toBe(beforeSequence);
     }).pipe(Effect.provide(testLayer(directory)));
   }).pipe(Effect.scoped),
 );

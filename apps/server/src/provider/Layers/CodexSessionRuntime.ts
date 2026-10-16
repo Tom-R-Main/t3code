@@ -54,6 +54,7 @@ import {
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
+import { isWorkerPolicyChallenge, readWorkerPolicyLaunch } from "../../sift/WorkerPolicy.ts";
 import {
   buildCodexDeveloperInstructions,
   type T3CodeToolAvailability,
@@ -221,6 +222,9 @@ export interface CodexThreadSnapshot {
 }
 
 export interface CodexSessionRuntimeShape {
+  readonly readWorkerPolicy?: (
+    challenge: string, prepare: boolean,
+  ) => Effect.Effect<{ readonly attestation: unknown; readonly providerThreadId: string }, CodexSessionRuntimeError>;
   readonly start: () => Effect.Effect<ProviderSession, CodexSessionRuntimeError>;
   readonly getSession: Effect.Effect<ProviderSession>;
   readonly sendTurn: (
@@ -2636,6 +2640,24 @@ export const makeCodexSessionRuntime = (
             turnId: effectiveTurnId,
           });
         }),
+      readWorkerPolicy: (challenge, prepare) => Effect.gen(function* () {
+        if (!isWorkerPolicyChallenge(challenge) || !readWorkerPolicyLaunch(env) ||
+          (yield* Ref.get(closedRef)))
+          return yield* new CodexApprovalDecisionError({ code: "WORKER_POLICY_UNAVAILABLE" });
+        const providerThreadId = yield* readProviderThreadId;
+        const result = yield* client.raw.request("workerPolicy/read", {
+          threadId: providerThreadId, challenge, prepare,
+        });
+        if (!result || typeof result !== "object" || !("attestation" in result))
+          return yield* new CodexApprovalDecisionError({ code: "WORKER_POLICY_INVALID_RESPONSE" });
+        // Raw attestation stays opaque: the controller independently verifies
+        // process/config/binding/registry. False coverage is never upgraded.
+        return { attestation: result.attestation, providerThreadId };
+      }).pipe(
+        Effect.timeout("15 seconds"),
+        Effect.mapError((cause) => cause instanceof CodexApprovalDecisionError ? cause
+          : new CodexApprovalDecisionError({ code: "WORKER_POLICY_UNAVAILABLE" })),
+      ),
       readThread: Effect.gen(function* () {
         const providerThreadId = yield* readProviderThreadId;
         return yield* readCodexThread(client, providerThreadId);

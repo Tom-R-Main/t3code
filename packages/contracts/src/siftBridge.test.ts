@@ -23,3 +23,12 @@ describe("Sift guarded decision wire", () => {
     expect(() => decode({ ...base, decision: "decline", feedback: "  " })).toThrow();
   });
 });
+
+it("carries bounded worker-policy requests without granting a turn operation", () => {
+  const input = { id: "preflight", binding: base.binding, operation: "workerPolicy/read",
+    threadId: "bound-thread", challenge: "challenge", prepare: true };
+  expect(decode(input)).toEqual(input);
+  expect(() => decode({ ...input, challenge: "" })).toThrow();
+  expect(() => decode({ ...input, challenge: "x".repeat(257) })).toThrow();
+  expect(() => decode({ ...input, prepare: "true" })).toThrow();
+});

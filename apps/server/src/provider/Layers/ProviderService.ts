@@ -1953,6 +1953,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const readWorkerPolicy: NonNullable<ProviderServiceMethod<"readWorkerPolicy">> = Effect.fn("readWorkerPolicy")(
+    function* (threadId, challenge, prepare) {
+      const routed = yield* resolveRoutableSession({
+        threadId, operation: "ProviderService.readWorkerPolicy", allowRecovery: false,
+      });
+      if (!routed.isActive || routed.adapter.provider !== "codex" || !routed.adapter.readWorkerPolicy)
+        return yield* new ProviderValidationError({
+          operation: "ProviderService.readWorkerPolicy",
+          issue: "An already-loaded Codex session with worker-policy support is required.",
+        });
+      return yield* routed.adapter.readWorkerPolicy(routed.threadId, challenge, prepare);
+    },
+  );
+
   const respondToRequest: ProviderServiceMethod<"respondToRequest"> = Effect.fn("respondToRequest")(
     function* (rawInput) {
       const input = yield* decodeInputOrValidationError({
@@ -2410,6 +2424,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     compactThread,
     interruptTurn,
     respondToRequest,
+    readWorkerPolicy,
     respondToUserInput,
     stopSession,
     listSessions,

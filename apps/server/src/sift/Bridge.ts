@@ -25,6 +25,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
+import { isWorkerPolicyChallenge } from "./WorkerPolicy.ts";
 import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
 import {
   MANAGED_ROLE_SCOPES,
@@ -74,6 +76,7 @@ export const makeSiftBridge = Effect.gen(function* () {
   const engine = yield* OrchestrationEngineService;
   const mutex = yield* Semaphore.make(1);
   // Present in the server; absent in engine-only harnesses, where attach fails.
+  const providerService = yield* Effect.serviceOption(ProviderService);
   const environmentAuth = yield* Effect.serviceOption(EnvironmentAuth);
   yield* ensureManagedAccessTables;
   const revokeManagedCredentials = Effect.gen(function* () {
@@ -239,6 +242,20 @@ export const makeSiftBridge = Effect.gen(function* () {
         "BINDING_CONFLICT",
         "Assignment identity or lease generation does not match.",
       );
+    if (request.operation === "workerPolicy/read") {
+      // Attestation may inspect only the assignment's existing live provider.
+      // It cannot use ensureReady/recovery to create or resume a thread.
+      if (rows[0].ready_generation !== binding.binding.leaseGeneration ||
+        request.threadId !== threadId || !isWorkerPolicyChallenge(request.challenge))
+        return yield* fail("WORKER_POLICY_BINDING_MISMATCH", "An exact ready assignment thread and bounded challenge are required.");
+      if (Option.isNone(providerService) || !providerService.value.readWorkerPolicy)
+        return yield* fail("WORKER_POLICY_UNAVAILABLE", "Worker policy inspection is unavailable.");
+      yield* checkAuthorization;
+      const result = yield* providerService.value.readWorkerPolicy(threadId, request.challenge, request.prepare ?? false)
+        .pipe(Effect.timeout("15 seconds"));
+      yield* checkAuthorization;
+      return result;
+    }
     if (rows[0].ready_generation !== binding.binding.leaseGeneration)
       yield* ensureReady(binding, rows[0].created_at);
     if (request.operation === "detach") {
@@ -438,7 +455,10 @@ export const makeSiftBridge = Effect.gen(function* () {
     const request = yield* decodeRequest(input, {
       onExcessProperty: "error",
     }).pipe(Effect.mapError(() => fail("INVALID_REQUEST", "Invalid bridge request.")));
-    return yield* execute(request, authorize).pipe(
+    const execution = execute(request, authorize);
+    // Include queueing for the bridge mutex in the bound as well.
+    return yield* (request.operation === "workerPolicy/read"
+      ? execution.pipe(Effect.timeout("15 seconds")) : execution).pipe(
       Effect.map((result) => ({ id: request.id, ok: true as const, result })),
       Effect.catch((error) =>
         Effect.succeed({
