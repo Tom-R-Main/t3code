@@ -10,6 +10,9 @@ import type * as CodexSchema from "effect-codex-app-server/schema";
 const path = await Effect.runPromise(Path.Path.pipe(Effect.provide(NodePath.layer)));
 const scenario = process.argv[2];
 const effectFile = process.argv[3];
+const childApproval = scenario === "child-success" || scenario === "child-stale";
+const approvalThreadId = childApproval ? "child-thread" : "provider-thread";
+const approvalTurnId = childApproval ? "child-turn-1" : "turn-1";
 const fixtureScript = "require('node:fs').writeFileSync(process.argv[1], JSON.stringify({effect:'approved fixture effect',argv0:process.argv0}), {flag:'wx'});";
 const commandScope = effectFile ? {
   version: 1, program: process.argv[4] ?? process.execPath, argv: ["fixture-node-zero", "-e", fixtureScript, effectFile] as const, cwd: path.dirname(effectFile),
@@ -46,7 +49,7 @@ const completeAssistant = (itemId: string, text: string) => {
 createInterface({ input: process.stdin }).on("line", (line: string) => {
   const message = JSON.parse(line) as {
     id?: string | number; method?: string;
-    params?: { expectedTurnId?: string; input?: ReadonlyArray<{ type: string; text?: string }> }; result?: { decision?: string };
+    params?: { threadId?: string; expectedTurnId?: string; input?: ReadonlyArray<{ type: string; text?: string }> }; result?: { decision?: string };
   };
   if (message.method === "initialize") {
     send({ id: message.id, result: { userAgent: "c3a-scripted-peer", codexHome: "/fixture", platformFamily: "unix", platformOs: "linux" } });
@@ -60,8 +63,16 @@ createInterface({ input: process.stdin }).on("line", (line: string) => {
     } });
   } else if (message.method === "turn/start") {
     send({ id: message.id, result: { turn: { id: "turn-1", items: [], status: "inProgress" } } });
+    if (childApproval) {
+      const params: CodexSchema.V2TurnStartedNotification = {
+        threadId: approvalThreadId,
+        turn: { id: scenario === "child-stale" ? "child-turn-2" : approvalTurnId, items: [], status: "inProgress" },
+      };
+      send({ method: "turn/started", params });
+      completeAssistant("child-live-confirmation", "Child turn observation barrier.");
+    }
     send({ jsonrpc: "2.0", id: "approval-1", method: "item/commandExecution/requestApproval", params: {
-      threadId: "provider-thread", turnId: "turn-1", itemId: "item-1", startedAtMs: 1,
+      threadId: approvalThreadId, turnId: approvalTurnId, itemId: "item-1", startedAtMs: 1,
       ...(commandScope
         ? { ...(scenario === "command-legacy" ? {} : { siftCommandScope: commandScope }),
           command: "display text is not execution authority", cwd: commandScope.cwd }
@@ -70,7 +81,7 @@ createInterface({ input: process.stdin }).on("line", (line: string) => {
   } else if (message.method === "fixture/begin") {
     beginId = message.id;
     send({ jsonrpc: "2.0", id: "approval-1", method: "item/commandExecution/requestApproval", params: {
-      threadId: "provider-thread", turnId: "turn-1", itemId: "item-1", startedAtMs: 1,
+      threadId: approvalThreadId, turnId: approvalTurnId, itemId: "item-1", startedAtMs: 1,
       ...(commandScope
         ? { ...(scenario === "command-legacy" ? {} : { siftCommandScope: commandScope }),
           command: "display text is not execution authority", cwd: commandScope.cwd }
@@ -78,7 +89,8 @@ createInterface({ input: process.stdin }).on("line", (line: string) => {
     } });
   } else if (message.method === "turn/steer") {
     events.push("steer");
-    if (message.params?.expectedTurnId !== "turn-1") throw new Error("Feedback did not target the existing turn");
+    if (message.params?.threadId !== approvalThreadId || message.params.expectedTurnId !== approvalTurnId)
+      throw new Error("Feedback did not target the requesting native thread and turn");
     steeredFeedback = message.params.input?.find((item) => item.type === "text")?.text;
     if (scenario === "lost-reply") { process.exitCode = 0; process.stdin.destroy(); return; }
     if (scenario === "stale-turn") {
@@ -102,7 +114,7 @@ createInterface({ input: process.stdin }).on("line", (line: string) => {
       return;
     }
     if (message.result.decision === "decline") completeAssistant("continuation",
-      `Synthetic peer consumed native decline after steering. turn=turn-1 feedback=${JSON.stringify(steeredFeedback)}`,
+      `Synthetic peer consumed native decline after steering. ${childApproval ? `thread=${approvalThreadId} ` : ""}turn=${approvalTurnId} feedback=${JSON.stringify(steeredFeedback)}`,
     );
     if (beginId !== undefined) send({ jsonrpc: "2.0", id: beginId, result: { events } });
   }

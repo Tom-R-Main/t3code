@@ -23,6 +23,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
 import { TextGeneration } from "../src/textGeneration/TextGeneration.ts";
@@ -91,6 +92,7 @@ import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as PullRequestService from "../src/pullRequest/PullRequestService.ts";
 
 import { makeSiftBridge } from "../src/sift/Bridge.ts";
+import { readApprovalEffect } from "../src/sift/ApprovalEffects.ts";
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -183,6 +185,9 @@ const tryRuntimePromise = <A>(operation: string, run: () => Promise<A>) =>
 
 export interface OrchestrationIntegrationHarness {
   readonly siftBridge: Effect.Success<typeof makeSiftBridge>;
+  readonly readApprovalEffect: (commandId: string) => Effect.Effect<
+    Effect.Success<ReturnType<typeof readApprovalEffect>>, never
+  >;
   readonly rootDir: string;
   readonly workspaceDir: string;
   readonly dbPath: string;
@@ -612,6 +617,9 @@ export const makeOrchestrationIntegrationHarness = (
 
     return {
       siftBridge,
+      readApprovalEffect: (commandId) => tryRuntimePromise("read guarded approval receipt", () =>
+        runtime.runPromise(Effect.flatMap(SqlClient.SqlClient, (sql) => readApprovalEffect(sql, commandId))),
+      ).pipe(Effect.orDie),
       rootDir,
       workspaceDir,
       dbPath,
