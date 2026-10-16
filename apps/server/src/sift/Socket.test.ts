@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import { it, expect } from "vite-plus/test";
 import { listenSiftSocket } from "./Socket.ts";
 import { SIFT_BRIDGE_MAX_REQUEST_BYTES } from "../../../../packages/contracts/src/siftBridge.ts";
+import * as Schema from "effect/Schema";
 
 const exchange = (socketPath: string, input: string) =>
   new Promise<string>((resolve, reject) => {
@@ -18,6 +19,27 @@ const exchange = (socketPath: string, input: string) =>
     });
     socket.on("end", () => resolve(response));
   });
+
+it("retains ordinary raw byte limits while allowing only bootstrap envelope framing room", async () => {
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-socket-bootstrap-"));
+  const socketPath = NodePath.join(directory, "bridge.sock");
+  let calls = 0;
+  const close = await listenSiftSocket(socketPath, async () => { calls++; return { ok: true }; });
+  const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+  const decode = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Struct({ ok: Schema.optional(Schema.Boolean),
+    error: Schema.optional(Schema.Struct({ code: Schema.String })) })));
+  try {
+    const padding = " ".repeat(SIFT_BRIDGE_MAX_REQUEST_BYTES);
+    const ordinary = `${encode({ request: { operation: "workerPolicy/read" } })}${padding}\n`;
+    expect(decode(await exchange(socketPath, ordinary)).error?.code).toBe("REQUEST_TOO_LARGE");
+    const bootstrap = `${encode({ request: { operation: "workerPolicy/bootstrap" } })}${padding}\n`;
+    expect(decode(await exchange(socketPath, bootstrap)).ok).toBe(true);
+    expect(calls).toBe(1);
+  } finally {
+    await close();
+    await NodeFSP.rm(directory, { recursive: true, force: true });
+  }
+});
 
 it("uses an owner-only socket, rejects competing listeners, and bounds malformed input", async () => {
   const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-socket-"));

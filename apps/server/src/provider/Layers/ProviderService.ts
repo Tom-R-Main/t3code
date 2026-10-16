@@ -948,7 +948,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       // Fork: a Sift managed worker gets no t3-code MCP authority. Clear what an
       // earlier start or recovery left for this thread and issue nothing, so no
       // adapter registers the server or receives its bearer token.
-      if (isManagedAccessEnabled(options?.environment ?? process.env)) {
+      const environment = options?.environment ?? process.env;
+      if (isManagedAccessEnabled(environment) || environment.CODEX_RESTRICTED_WORKER === "1" ||
+        environment.CODEX_WORKER_POLICY_V1 !== undefined) {
         yield* clearMcpSession(threadId);
         return undefined;
       }

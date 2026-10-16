@@ -111,7 +111,7 @@ jobs:
           import * as NodeFS from 'node:fs';
           import * as NodePath from 'node:path';
           import * as NodeChildProcess from 'node:child_process';
-          const base = '9e66b3d3beb422bd2b3803f7916dee21dbeaf526';
+          const base = '43df2c20e54b915e99e771a844271777b684d03c';
           const output = process.env.SIFT_FORMAT_OUTPUT;
           NodeAssert.ok(output && process.env.GITHUB_ACTIONS === 'true');
           NodeFS.mkdirSync(output, {recursive: true});

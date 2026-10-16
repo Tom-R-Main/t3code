@@ -27,6 +27,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { isWorkerPolicyChallenge } from "./WorkerPolicy.ts";
+import { prepareWorkerBootstrap, WorkerBootstrap, ensureWorkerBootstrapJournal, burnWorkerBootstrap } from "./WorkerBootstrap.ts";
 import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
 import {
   MANAGED_ROLE_SCOPES,
@@ -107,6 +108,9 @@ export const makeSiftBridge = Effect.gen(function* () {
   });
   yield* sql`CREATE TABLE IF NOT EXISTS sift_bridge_binding (slot INTEGER PRIMARY KEY CHECK (slot = 1), payload TEXT NOT NULL, created_at TEXT NOT NULL, ready_generation INTEGER NOT NULL DEFAULT 0)`;
   yield* sql`CREATE TABLE IF NOT EXISTS sift_bridge_commands (command_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)`;
+  // Burned identities survive restart. Never persist bootstrap bytes, hashes of
+  // credentials, decoder errors, or the secret-bearing materialization request.
+  yield* ensureWorkerBootstrapJournal(sql);
 
   const execute = Effect.fn("SiftBridge.execute")(function* (
     request: SiftBridgeRequest,
@@ -247,6 +251,40 @@ export const makeSiftBridge = Effect.gen(function* () {
         "BINDING_CONFLICT",
         "Assignment identity or lease generation does not match.",
       );
+    if (request.operation === "workerPolicy/bootstrap") {
+      if (!authorize || rows[0].ready_generation !== binding.binding.leaseGeneration || request.threadId !== threadId)
+        return yield* fail("WORKER_BOOTSTRAP_UNAVAILABLE", "An authorized exact ready assignment is required.");
+      if (Option.isNone(providerService))
+        return yield* fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable.");
+      const provider = providerService.value;
+      const prepared = yield* prepareWorkerBootstrap(request.materialization, {
+        threadId, providerInstanceId: binding.modelSelection.instanceId,
+        cwd: binding.checkoutPath, model: binding.modelSelection.model,
+      }, process.env).pipe(Effect.mapError(() => fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable.")));
+      let invoked = false;
+      return yield* Effect.gen(function* () {
+        yield* checkAuthorization;
+        // INSERT, never UPSERT/release: timeout, disconnect, lost response and
+        // process failure all require a new host launch/incarnation.
+        yield* burnWorkerBootstrap(sql, { ...prepared.launch, threadId, consumedAt: yield* nowIso }).pipe(
+          Effect.mapError(() => fail("WORKER_BOOTSTRAP_CONSUMED", "Restricted launch identity was consumed or could not be reserved.")),
+        );
+        yield* checkAuthorization;
+        invoked = true;
+        yield* provider.startSession(threadId, {
+          threadId, provider: "codex", providerInstanceId: binding.modelSelection.instanceId,
+          cwd: binding.checkoutPath, modelSelection: binding.modelSelection, runtimeMode: "approval-required",
+        }).pipe(Effect.provideService(WorkerBootstrap, prepared.capability));
+        yield* checkAuthorization;
+        return { threadId, state: "started" as const };
+      }).pipe(
+        Effect.onExit((exit) => exit._tag === "Success" || !invoked ? Effect.void :
+          Effect.suspend(() => provider.stopSession({ threadId })).pipe(
+            Effect.timeout("5 seconds"), Effect.ignoreCause, Effect.uninterruptible)),
+        Effect.ensuring(Effect.sync(prepared.dispose)),
+        Effect.catchCause(() => fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable.")),
+      );
+    }
     if (request.operation === "workerPolicy/read") {
       // Attestation may inspect only the assignment's existing live provider.
       // It cannot use ensureReady/recovery to create or resume a thread.
@@ -495,7 +533,7 @@ export const makeSiftBridge = Effect.gen(function* () {
     }).pipe(Effect.mapError(() => fail("INVALID_REQUEST", "Invalid bridge request.")));
     const execution = execute(request, authorize);
     // Include queueing for the bridge mutex in the bound as well.
-    return yield* (request.operation === "workerPolicy/read"
+    return yield* (request.operation === "workerPolicy/read" || request.operation === "workerPolicy/bootstrap"
       ? execution.pipe(Effect.timeout("15 seconds")) : execution).pipe(
       Effect.map((result) => ({ id: request.id, ok: true as const, result })),
       Effect.catch((error) =>

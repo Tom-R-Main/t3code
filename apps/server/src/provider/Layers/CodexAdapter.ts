@@ -32,6 +32,7 @@ import {
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
 import { isManagedAccessEnabled, priorProcessTreeTerminated } from "../../sift/ManagedAccess.ts";
+import { WorkerBootstrap } from "../../sift/WorkerBootstrap.ts";
 import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
 import * as Crypto from "effect/Crypto";
@@ -2310,6 +2311,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           });
         }
 
+        const environment = options?.environment ?? process.env;
+        if (environment.CODEX_RESTRICTED_WORKER === "1" || environment.CODEX_WORKER_POLICY_V1 !== undefined) {
+          const bootstrap = yield* Effect.serviceOption(WorkerBootstrap);
+          const refused = () => new ProviderAdapterValidationError({
+            provider: PROVIDER, operation: "startSession", issue: "Restricted worker bootstrap unavailable.",
+          });
+          if (Option.isNone(bootstrap) || input.modelSelection?.instanceId !== boundInstanceId ||
+            input.runtimeMode !== "approval-required" || input.resumeCursor !== undefined)
+            return yield* refused();
+          yield* bootstrap.value.assertTarget({
+            threadId: input.threadId, providerInstanceId: boundInstanceId,
+            cwd: input.cwd ?? process.cwd(), model: input.modelSelection.model,
+          }, environment).pipe(Effect.mapError(refused));
+        }
         const existing = sessions.get(input.threadId);
         if (existing && !existing.stopped) {
           yield* Effect.suspend(() => stopSessionInternal(existing));

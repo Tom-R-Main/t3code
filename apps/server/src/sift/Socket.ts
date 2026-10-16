@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import {
   SIFT_BRIDGE_MAX_REQUEST_BYTES,
+  SIFT_BRIDGE_MAX_BOOTSTRAP_ENVELOPE_BYTES,
   SIFT_BRIDGE_MAX_RESPONSE_BYTES,
 } from "../../../../packages/contracts/src/siftBridge.ts";
 import * as Schema from "effect/Schema";
@@ -83,7 +84,7 @@ export async function listenSiftSocket(path: string, handle: (input: unknown, si
     };
     socket.on("data", (chunk: Buffer) => {
       if (received) return;
-      if (input.length + chunk.length > SIFT_BRIDGE_MAX_REQUEST_BYTES) {
+      if (input.length + chunk.length > SIFT_BRIDGE_MAX_BOOTSTRAP_ENVELOPE_BYTES) {
         received = true;
         reply(failure("REQUEST_TOO_LARGE", "Request exceeded its bound."));
         return;
@@ -106,6 +107,16 @@ export async function listenSiftSocket(path: string, handle: (input: unknown, si
         parsed = JSON.parse(input.subarray(0, newline).toString("utf8"));
       } catch {
         reply(failure("INVALID_REQUEST", "Invalid JSON request."));
+        return;
+      }
+      // Only the new signed bootstrap envelope gets additional framing room.
+      // Authentication still precedes execution; ordinary raw byte budgets do
+      // not grow (including whitespace and escaped JSON representation).
+      const bootstrap = parsed !== null && typeof parsed === "object" && "request" in parsed &&
+        parsed.request !== null && typeof parsed.request === "object" && "operation" in parsed.request &&
+        parsed.request.operation === "workerPolicy/bootstrap";
+      if (!bootstrap && input.length > SIFT_BRIDGE_MAX_REQUEST_BYTES) {
+        reply(failure("REQUEST_TOO_LARGE", "Request exceeded its bound."));
         return;
       }
       void handle(parsed, controller.signal).then(reply, () =>
@@ -153,8 +164,8 @@ export const listenEffectSiftSocket = <E>(
       }),
       // Cancellation changes only the new read/preparation flow. Existing
       // effectful commands keep their durable lost-response reconciliation.
-      { signal: request !== null && typeof request === "object" &&
-          "operation" in request && request.operation === "workerPolicy/read" ? signal : undefined },
+      { signal: request !== null && typeof request === "object" && "operation" in request &&
+          (request.operation === "workerPolicy/read" || request.operation === "workerPolicy/bootstrap") ? signal : undefined },
     );
   });
 
