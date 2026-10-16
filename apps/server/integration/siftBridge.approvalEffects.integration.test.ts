@@ -65,7 +65,7 @@ for (const scenario of ["success", "stale-turn", "lost-reply", "scope-mismatch"]
       const base = { id: "guarded", binding: { runtimeId: "runtime", workItemId: "work", leaseGeneration: 1 } };
       const bound = yield* harness.siftBridge({ ...base, operation: "bind", checkoutPath: harness.workspaceDir,
         runtimeMode: "approval-required", modelSelection: { instanceId: "codex", model: "gpt-5.4" } });
-      Assert.equal(bound.ok, true);
+      Assert.ok(bound.ok && "threadId" in bound.result);
       yield* harness.siftBridge({ ...base, operation: "turn", commandId: "turn", text: "Use only the synthetic peer." });
       const events = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
         event.payload.activity.kind === "approval.requested");
@@ -82,16 +82,16 @@ for (const scenario of ["success", "stale-turn", "lost-reply", "scope-mismatch"]
           : { feedback: "Use the retained local fixture." }),
       };
       const first = yield* harness.siftBridge(request);
-      Assert.equal(first.ok && first.result.state, "pending");
+      Assert.equal(first.ok && "state" in first.result && first.result.state, "pending");
       yield* Deferred.await(entered);
       const pendingRetry = yield* harness.siftBridge(request);
-      Assert.equal(pendingRetry.ok && pendingRetry.result.state, "pending");
+      Assert.equal(pendingRetry.ok && "state" in pendingRetry.result && pendingRetry.result.state, "pending");
       Assert.equal(responseCalls, 1);
       yield* Deferred.succeed(release, undefined);
       yield* harness.drainProviderCommands;
       const settled = yield* harness.siftBridge(request);
       if (scenario === "success") {
-        Assert.equal(settled.ok && settled.result.state, "accepted");
+        Assert.equal(settled.ok && "state" in settled.result && settled.result.state, "accepted");
         yield* waitForCompletedAssistantText(harness,
           'Synthetic peer consumed native decline after steering. turn=turn-1 feedback="Use the retained local fixture."');
         const resolved = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
@@ -147,7 +147,7 @@ for (const scenario of ["command-accept", "command-scope-mismatch", "command-leg
       const base = { id: "command-effect", binding: { runtimeId: "runtime-command", workItemId: "work-command", leaseGeneration: 1 } };
       const bound = yield* harness.siftBridge({ ...base, operation: "bind", checkoutPath: harness.workspaceDir,
         runtimeMode: "approval-required", modelSelection: { instanceId: "codex", model: "gpt-5.4" } });
-      Assert.equal(bound.ok, true);
+      Assert.ok(bound.ok && "threadId" in bound.result);
       yield* harness.siftBridge({ ...base, operation: "turn", commandId: "turn", text: "Use only the synthetic command peer." });
       const events = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
         event.payload.activity.kind === "approval.requested");
@@ -173,7 +173,7 @@ for (const scenario of ["command-accept", "command-scope-mismatch", "command-leg
       yield* harness.drainProviderCommands;
       const settled = yield* harness.siftBridge(request);
       if (scenario === "command-accept") {
-        Assert.equal(settled.ok && settled.result.state, "accepted");
+        Assert.equal(settled.ok && "state" in settled.result && settled.result.state, "accepted");
         // An accepted response alone is insufficient: wait for the independently
         // executed child command, then inspect its exclusive-create file effect.
         yield* waitForCompletedAssistantText(harness, "Fixture tool effect completed.");
@@ -193,7 +193,7 @@ for (const scenario of ["command-accept", "command-scope-mismatch", "command-leg
       Assert.equal(responseCalls, 1, "Replaying a decision receipt must not release another command");
       if (scenario === "command-accept") {
         const stale = yield* harness.siftBridge({ ...request, commandId: "different-decision" });
-        Assert.equal(stale.ok && stale.result.state, "failed");
+        Assert.equal(stale.ok && "state" in stale.result && stale.result.state, "failed");
         Assert.equal(responseCalls, 1, "An old decision ID must never reach the provider twice");
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

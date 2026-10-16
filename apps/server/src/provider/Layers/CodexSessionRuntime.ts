@@ -3277,7 +3277,7 @@ export const makeCodexSessionRuntime = (
         return { attestation: result.attestation, providerThreadId };
       }).pipe(
         Effect.timeout("15 seconds"),
-        Effect.mapError((cause) => cause instanceof CodexApprovalDecisionError ? cause
+        Effect.mapError((cause) => Schema.is(CodexApprovalDecisionError)(cause) ? cause
           : new CodexApprovalDecisionError({ code: "WORKER_POLICY_UNAVAILABLE" })),
       ),
       readThread: Effect.gen(function* () {

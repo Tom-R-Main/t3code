@@ -150,7 +150,7 @@ it.effect(
       const first = yield* Effect.gen(function* () {
         const handle = yield* makeSiftBridge;
         const accepted = yield* handle(bind);
-        expect(accepted.ok).toBe(true);
+        if (!accepted.ok || !("threadId" in accepted.result)) throw new Error("Binding fixture failed.");
         const turn = yield* handle({
           ...request,
           operation: "turn",
@@ -194,7 +194,7 @@ it.effect(
           binding: { ...binding, leaseGeneration: 2 },
           expectedPreviousGeneration: 1,
         });
-        expect(advanced.ok && advanced.result.threadId).toBe(
+        expect(advanced.ok && "threadId" in advanced.result && advanced.result.threadId).toBe(
           first.accepted.ok && first.accepted.result.threadId,
         );
         const old = yield* handle({ ...request, operation: "events", afterSequence: 0 });
@@ -236,7 +236,7 @@ it.effect("bounds replay bytes without skipping an oversized event", () =>
         modelSelection: { instanceId: "codex", model: "gpt-5.4" },
         runtimeMode: "approval-required",
       });
-      if (!bound.ok) throw new Error("Binding failed.");
+      if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding failed.");
       const before = yield* engine.latestSequence;
       yield* engine.dispatch({
         type: "thread.activity.append",
@@ -275,7 +275,7 @@ it.effect("resolves each approval request once across clients and restarts", () 
         modelSelection: { instanceId: "codex", model: "gpt-5.4" },
         runtimeMode: "approval-required",
       });
-      if (!bound.ok) throw new Error("Binding failed.");
+      if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding failed.");
       const threadId = ThreadId.make(bound.result.threadId);
       const appendActivity = (id: string, kind: string, payload: Record<string, unknown>) =>
         engine.dispatch({
@@ -298,7 +298,7 @@ it.effect("resolves each approval request once across clients and restarts", () 
         handle({ ...request, operation: "approve", commandId, requestId, decision });
 
       const first = yield* approve("phone", "request-1", "accept");
-      expect(first.ok && first.result.state).toBe("accepted");
+      expect(first.ok && "state" in first.result && first.result.state).toBe("accepted");
       const second = yield* approve("browser", "request-1", "decline");
       expect(second.ok && second.result).toEqual({
         threadId,
@@ -375,7 +375,7 @@ it.effect("terminalizes a guarded reservation when dispatch throws before persis
       }));
       const bound = yield* handle({ ...request, operation: "bind", checkoutPath: directory,
         modelSelection: { instanceId: "codex", model: "gpt-5.4" }, runtimeMode: "approval-required" });
-      if (!bound.ok) throw new Error("Binding failed");
+      if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding failed");
       yield* engine.dispatch({
         type: "thread.activity.append", commandId: CommandId.make("fault-approval"),
         threadId: ThreadId.make(bound.result.threadId), createdAt: "2026-01-01T00:00:00.000Z",
@@ -417,8 +417,8 @@ it.effect("forwards worker-policy inspection only to an exact ready assignment w
             if (challenge === "expire") expired = true;
             return { attestation, providerThreadId: "native-bound-thread" };
           }),
-      } as ProviderService["Service"];
-      const handle = yield* makeSiftBridge.pipe(Effect.provideService(ProviderService, inspection));
+      } satisfies Pick<ProviderService["Service"], "readWorkerPolicy">;
+      const handle = yield* makeSiftBridge.pipe(Effect.provide(Layer.mock(ProviderService)(inspection)));
       const unbound = yield* handle({ ...request, operation: "workerPolicy/read", threadId: "arbitrary", challenge: "fresh-challenge" });
       expect(!unbound.ok && unbound.error.code).toBe("NOT_BOUND");
       const bound = yield* handle({ ...request, operation: "bind", checkoutPath: directory,

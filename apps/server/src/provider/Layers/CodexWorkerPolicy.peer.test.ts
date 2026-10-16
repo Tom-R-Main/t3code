@@ -21,10 +21,11 @@ it.live("reads opaque native attestation on an already-loaded thread without a m
       executorProtocolVersion: "sift-worker-executor-v1", server: "sift", namespace: "sift", tool: "execute",
       rawTool: "execute", endpoint: "http://127.0.0.1:4321/mcp", serverConfigSha256: "b".repeat(64),
       model: "fixture-model", modelProviderId: "fixture-provider", modelProviderSha256: "c".repeat(64) };
+    const launchJson = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(launch);
     const runtime = yield* makeCodexSessionRuntime({
       threadId: ThreadId.make("bound-thread"), binaryPath: process.execPath, cwd: process.cwd(),
       runtimeMode: "approval-required", environment: {
-        CODEX_RESTRICTED_WORKER: "1", CODEX_WORKER_POLICY_V1: JSON.stringify(launch),
+        CODEX_RESTRICTED_WORKER: "1", CODEX_WORKER_POLICY_V1: launchJson,
       },
     }).pipe(Effect.provideService(Crypto.Crypto, crypto), Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, scripted));
     const read = runtime.readWorkerPolicy;
@@ -38,7 +39,8 @@ it.live("reads opaque native attestation on an already-loaded thread without a m
     } });
     const mismatched = yield* read("mismatch", false);
     Assert.equal(mismatched.providerThreadId, "provider-thread", "Mapping must come from the loaded cursor, not attestation fields");
-    Assert.equal(Schema.decodeUnknownSync(Schema.Struct({ threadId: Schema.String }))(mismatched.attestation).threadId, "untrusted-asserted-thread");
+    const mismatchedAttestation = yield* Schema.decodeUnknownEffect(Schema.Struct({ threadId: Schema.String }))(mismatched.attestation);
+    Assert.equal(mismatchedAttestation.threadId, "untrusted-asserted-thread");
     Assert.equal((yield* Effect.flip(read("line\nbreak", true)))._tag, "CodexApprovalDecisionError");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

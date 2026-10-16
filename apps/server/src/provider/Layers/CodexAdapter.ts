@@ -2660,12 +2660,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   });
 
   const readWorkerPolicy: NonNullable<CodexAdapterShape["readWorkerPolicy"]> = (threadId, challenge, prepare) =>
-    requireSession(threadId).pipe(
-      Effect.flatMap((session) => session.runtime.readWorkerPolicy
-        ? session.runtime.readWorkerPolicy(challenge, prepare)
-        : Effect.fail(new ProviderAdapterValidationError({
-            provider: PROVIDER, operation: "workerPolicy/read", issue: "Worker policy inspection is unavailable.",
-          }))),
+    Effect.gen(function* () {
+      const session = yield* requireSession(threadId);
+      if (!session.runtime.readWorkerPolicy) return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER, operation: "workerPolicy/read", issue: "Worker policy inspection is unavailable.",
+      });
+      return yield* session.runtime.readWorkerPolicy(challenge, prepare);
+    }).pipe(
       Effect.mapError((cause) => cause._tag === "ProviderAdapterSessionNotFoundError" || cause._tag === "ProviderAdapterValidationError"
         ? cause : mapCodexRuntimeError(threadId, "workerPolicy/read", cause)),
     );
