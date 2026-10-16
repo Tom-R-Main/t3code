@@ -134,8 +134,7 @@ export const ensureManagedAccessTables = Effect.gen(function* () {
   yield* sql`CREATE TABLE IF NOT EXISTS sift_managed_access_grants (credential_hash TEXT PRIMARY KEY, subject TEXT NOT NULL, session_id TEXT UNIQUE, created_at TEXT NOT NULL)`;
 });
 
-const credentialHash = (credential: string) =>
-  digest(`sift-managed-credential:${credential}`);
+const credentialHash = (credential: string) => digest(`sift-managed-credential:${credential}`);
 
 /** Records a bridge-issued credential; called by the bridge under its mutex. */
 export const recordManagedGrant = (credential: string, subject: string, createdAt: string) =>

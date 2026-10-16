@@ -99,7 +99,7 @@ jobs:
               - --filter=t3...
               - --filter=@t3tools/scripts...
 
-      - name: Collect a bounded formatting patch for changed source only
+      - name: Collect bounded formatting and read-only lint feedback
         env:
           SIFT_FORMAT_OUTPUT: ${{ runner.temp }}/sift-source-format-feedback
         run: |
@@ -137,6 +137,7 @@ jobs:
             const pkg = JSON.parse(NodeFS.readFileSync('package.json', 'utf8'));
             const vite = JSON.parse(NodeFS.readFileSync('node_modules/vite-plus/package.json', 'utf8'));
             NodeAssert.equal(pkg.scripts.fmt, 'vp fmt');
+            NodeAssert.equal(pkg.scripts.lint, 'vp lint --report-unused-disable-directives');
             NodeAssert.equal(pkg.packageManager, 'pnpm@11.10.0');
             NodeAssert.equal(process.version, 'v24.13.1');
             NodeAssert.equal(vite.version, '0.3.3');
@@ -165,6 +166,19 @@ jobs:
             metadata.patchBytes = NodeBuffer.Buffer.byteLength(patch);
             metadata.changedFiles = changed;
             metadata.files = metadata.files.map(file => ({...file, formattedSha256: sha256(NodeFS.readFileSync(file.path))}));
+            // Diagnostics only: never fix source or reinterpret a nonzero lint
+            // exit as qualification. Retain the formatting patch on every exit.
+            const lint = NodeChildProcess.spawnSync('vp', ['lint', '--report-unused-disable-directives'],
+              {encoding: 'utf8', timeout: 180000, maxBuffer: 1048576, stdio: ['ignore', 'pipe', 'pipe']});
+            const lintOutput = NodeBuffer.Buffer.from(`${lint.stdout ?? ''}\n${lint.stderr ?? ''}`);
+            const lintLog = lintOutput.subarray(0, 1048576);
+            NodeFS.writeFileSync(NodePath.join(output, 'lint.log'), lintLog);
+            metadata.lintFeedback = {exitCode: lint.status, signal: lint.signal,
+              errorCode: lint.error?.code ?? null,
+              processOutcome: lint.error || lint.signal !== null || !Number.isInteger(lint.status)
+                ? 'abnormal_exit' : 'normal_exit',
+              logSha256: sha256(lintLog), logBytes: lintLog.length,
+              logTruncated: lintOutput.length > lintLog.length};
             metadata.status = 'feedback_collected';
           } catch (error) {
             metadata.status = 'failed';
