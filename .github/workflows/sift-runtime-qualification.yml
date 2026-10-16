@@ -22,10 +22,6 @@ jobs:
       CI: 'true'
       ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
-      SIFT_QUALIFICATION_OUTPUT: ${{ runner.temp }}/sift-runtime-qualification
-      T3CODE_HOME: ${{ runner.temp }}/sift-qualification-home
-      CODEX_HOME: ${{ runner.temp }}/sift-qualification-codex
-      CLAUDE_CONFIG_DIR: ${{ runner.temp }}/sift-qualification-claude
     steps:
       - name: Checkout the exact pushed revision
         uses: actions/checkout@v6
@@ -51,6 +47,11 @@ jobs:
       # These commands use only protocol peers, temporary SQLite/files/git and
       # private sockets. They never launch a real provider or a model turn.
       - name: Qualify the bounded source changes
+        env:
+          SIFT_QUALIFICATION_OUTPUT: ${{ runner.temp }}/sift-runtime-qualification
+          T3CODE_HOME: ${{ runner.temp }}/sift-qualification-home
+          CODEX_HOME: ${{ runner.temp }}/sift-qualification-codex
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/sift-qualification-claude
         run: node .github/scripts/sift-runtime-qualification.mjs
 
       - name: Upload exact-head test counts and toolchain evidence
