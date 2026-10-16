@@ -275,7 +275,9 @@ it.effect("refuses UI/recovery restricted starts before stopping an existing tru
   }).pipe(
     Effect.scoped,
     Effect.provide(
-      ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(Layer.provideMerge(NodeServices.layer)),
+      ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
+        Layer.provideMerge(NodeServices.layer),
+      ),
     ),
   ),
 );

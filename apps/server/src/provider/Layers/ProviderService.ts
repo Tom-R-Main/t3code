@@ -1459,23 +1459,37 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const freshBootstrap = Option.isSome(bootstrap);
         if (Option.isSome(bootstrap)) {
           const unavailable = () =>
-            toValidationError("ProviderService.startSession", "Restricted worker bootstrap unavailable.");
+            toValidationError(
+              "ProviderService.startSession",
+              "Restricted worker bootstrap unavailable.",
+            );
           if (
-            resolvedProvider !== "codex" || input.resumeCursor !== undefined ||
-            input.cwd === undefined || input.modelSelection?.instanceId !== resolvedInstanceId ||
+            resolvedProvider !== "codex" ||
+            input.resumeCursor !== undefined ||
+            input.cwd === undefined ||
+            input.modelSelection?.instanceId !== resolvedInstanceId ||
             input.runtimeMode !== "approval-required"
-          ) return yield* unavailable();
+          )
+            return yield* unavailable();
           // This capability exists only during the authenticated private start.
           // Validate its complete sealed target before ignoring any retained
           // native cursor. Ordinary starts keep their persisted resume behavior.
-          yield* bootstrap.value.assertTarget({
-            threadId, providerInstanceId: resolvedInstanceId, cwd: input.cwd,
-            model: input.modelSelection.model,
-          }, options?.environment ?? process.env).pipe(Effect.mapError(unavailable));
+          yield* bootstrap.value
+            .assertTarget(
+              {
+                threadId,
+                providerInstanceId: resolvedInstanceId,
+                cwd: input.cwd,
+                model: input.modelSelection.model,
+              },
+              options?.environment ?? process.env,
+            )
+            .pipe(Effect.mapError(unavailable));
         }
         const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
         if (
-          !freshBootstrap && persistedBinding?.provider === resolvedProvider &&
+          !freshBootstrap &&
+          persistedBinding?.provider === resolvedProvider &&
           persistedBinding.providerInstanceId !== resolvedInstanceId &&
           (input.resumeCursor != null || persistedBinding.resumeCursor != null)
         ) {
@@ -1496,10 +1510,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }
         const effectiveResumeCursor = freshBootstrap
           ? undefined
-          : input.resumeCursor ??
+          : (input.resumeCursor ??
             (persistedBinding?.providerInstanceId === resolvedInstanceId
               ? persistedBinding.resumeCursor
-              : undefined);
+              : undefined));
         const effectiveCwd =
           input.cwd ??
           (persistedBinding?.providerInstanceId === resolvedInstanceId
