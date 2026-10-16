@@ -27,6 +27,7 @@ it.effect("keeps malformed-envelope errors free of raw command scope operands", 
       "item/commandExecution/requestApproval", "decode-payload", error,
     ).toProtocolError();
     assert.equal(response.code, -32602);
-    assert.equal(JSON.stringify(response).includes(marker), false);
+    const encoded = yield* Schema.encodeEffect(Schema.UnknownFromJsonString)(response);
+    assert.equal(encoded.includes(marker), false);
   }),
 );
