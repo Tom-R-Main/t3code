@@ -1974,7 +1974,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.thread_id": input.threadId,
           "provider.request_id": input.requestId,
         });
-        yield* routed.adapter.respondToRequest(routed.threadId, input.requestId, input.decision);
+        if (input.decisionContext && routed.adapter.provider !== "codex") {
+          return yield* new ProviderValidationError({
+            operation: "ProviderService.respondToRequest",
+            issue: "This provider does not support guarded decisions or decline feedback.",
+          });
+        }
+        yield* routed.adapter.respondToRequest(routed.threadId, input.requestId, input.decision, input.decisionContext);
         yield* analytics.record("provider.request.responded", {
           provider: routed.adapter.provider,
           decision: input.decision,

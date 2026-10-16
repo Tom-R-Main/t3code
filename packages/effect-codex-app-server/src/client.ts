@@ -9,6 +9,7 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 
 import * as CodexRpc from "./_generated/meta.gen.ts";
 import * as CodexError from "./errors.ts";
+import { CommandApprovalParams } from "./commandApprovalExtensions.ts";
 import * as CodexProtocol from "./protocol.ts";
 import {
   decodeNotificationPayload,
@@ -17,6 +18,10 @@ import {
   runHandler,
 } from "./_internal/shared.ts";
 import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
+
+type ServerRequestParamsByMethod = Omit<
+  CodexRpc.ServerRequestParamsByMethod, "item/commandExecution/requestApproval"
+> & { readonly "item/commandExecution/requestApproval": CommandApprovalParams };
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -50,7 +55,7 @@ export class CodexAppServerClient extends Context.Service<
     readonly handleServerRequest: <M extends CodexRpc.ServerRequestMethod>(
       method: M,
       handler: (
-        payload: CodexRpc.ServerRequestParamsByMethod[M],
+        payload: ServerRequestParamsByMethod[M],
       ) => Effect.Effect<
         CodexRpc.ServerRequestResponsesByMethod[M],
         CodexError.CodexAppServerError
@@ -101,8 +106,9 @@ const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make")(func
   const getServerRequestParamSchema = <M extends CodexRpc.ServerRequestMethod>(
     method: M,
   ):
-    | Schema.Codec<CodexRpc.ServerRequestParamsByMethod[M], CodexRpc.ServerRequestParamsByMethod[M]>
-    | undefined => CodexRpc.SERVER_REQUEST_PARAMS[method] as never;
+    | Schema.Codec<ServerRequestParamsByMethod[M], ServerRequestParamsByMethod[M]>
+    | undefined => (method === "item/commandExecution/requestApproval"
+      ? CommandApprovalParams : CodexRpc.SERVER_REQUEST_PARAMS[method]) as never;
 
   const getServerRequestResponseSchema = <M extends CodexRpc.ServerRequestMethod>(
     method: M,

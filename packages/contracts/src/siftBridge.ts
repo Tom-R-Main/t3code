@@ -1,3 +1,4 @@
+import { ApprovalScope, DeclineFeedback } from "./approvalDecisionContext.ts";
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt } from "./baseSchemas.ts";
 import { ModelSelection, ProviderUserInputAnswers } from "./orchestration.ts";
@@ -32,6 +33,10 @@ export const SiftBridgeRequest = Schema.Union([
     operation: Schema.Literal("approve"),
     requestId: Identifier,
     decision: Schema.Literals(["accept", "decline", "cancel"]),
+    expectedApprovalScope: Schema.optional(ApprovalScope),
+    attemptId: Schema.optional(Identifier),
+    ruleSourceRequestId: Schema.optional(Identifier),
+    feedback: Schema.optional(DeclineFeedback),
   }),
   Schema.Struct({
     ...Command,

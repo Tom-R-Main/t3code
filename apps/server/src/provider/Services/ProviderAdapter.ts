@@ -9,6 +9,7 @@
  */
 import type {
   ApprovalRequestId,
+  ApprovalDecisionContext,
   ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderUserInputAnswers,
@@ -100,6 +101,7 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
+    decisionContext?: ApprovalDecisionContext,
   ) => Effect.Effect<void, TError>;
 
   /**

@@ -39,6 +39,8 @@ import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexErrors from "effect-codex-app-server/errors";
@@ -56,6 +58,7 @@ import {
   ProviderAdapterValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
+import { codexNetworkApprovalTarget } from "./CodexApprovalDecision.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -1357,7 +1360,9 @@ function mapToRuntimeEvents(
             EffectCodexSchema.ServerRequest__CommandExecutionRequestApprovalParams,
             event.payload,
           );
-          return payload?.command ?? payload?.reason ?? undefined;
+          const description = nonEmptyDetail(payload?.command) ?? nonEmptyDetail(payload?.reason);
+          const target = payload ? codexNetworkApprovalTarget(payload) : undefined;
+          return [description, target].filter((part) => part !== undefined).join("\n") || undefined;
         }
         case "item/fileChange/requestApproval": {
           const payload = readPayload(
@@ -1428,6 +1433,8 @@ function mapToRuntimeEvents(
               }
             : {}),
           ...(event.payload !== undefined ? { args: event.payload } : {}),
+          ...(event.approvalScope ? { approvalScope: event.approvalScope } : {}),
+          ...(event.feedbackSupported ? { feedbackSupported: true as const } : {}),
         },
       },
     ];
@@ -1446,6 +1453,8 @@ function mapToRuntimeEvents(
         payload: {
           requestType,
           ...(payload ? { decision: payload.decision } : {}),
+          ...(event.feedbackDelivered ? { feedbackDelivered: true as const } : {}),
+          ...(event.ruleSourceRequestId ? { ruleSourceRequestId: event.ruleSourceRequestId } : {}),
           ...(event.payload !== undefined ? { resolution: event.payload } : {}),
         },
       },
@@ -2238,6 +2247,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("codex");
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const crypto = yield* Crypto.Crypto;
+  const feedbackSql = yield* Effect.serviceOption(SqlClient.SqlClient);
   const serverConfig = yield* Effect.service(ServerConfig);
   const nativeEventLogger =
     options?.nativeEventLogger ??
@@ -2320,7 +2330,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
         );
         const createRuntime = options?.makeRuntime ?? makeCodexSessionRuntime;
-        const runtime = yield* createRuntime(runtimeInput).pipe(
+        const runtimeEffect = createRuntime(runtimeInput);
+        const runtime = yield* (Option.isSome(feedbackSql)
+          ? runtimeEffect.pipe(Effect.provideService(SqlClient.SqlClient, feedbackSql.value))
+          : runtimeEffect).pipe(
           Effect.provideService(Scope.Scope, sessionScope),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
           Effect.provideService(Crypto.Crypto, crypto),
@@ -2641,9 +2654,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       ),
     );
 
-  const respondToRequest: CodexAdapterShape["respondToRequest"] = (threadId, requestId, decision) =>
+  const respondToRequest: CodexAdapterShape["respondToRequest"] = (threadId, requestId, decision, decisionContext) =>
     requireSession(threadId).pipe(
-      Effect.flatMap((session) => session.runtime.respondToRequest(requestId, decision)),
+      Effect.flatMap((session) => session.runtime.respondToRequest(requestId, decision, decisionContext)),
       Effect.mapError((cause) =>
         cause._tag === "ProviderAdapterSessionNotFoundError"
           ? cause

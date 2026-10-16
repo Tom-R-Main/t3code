@@ -1,5 +1,7 @@
 import {
   ApprovalRequestId,
+  type ApprovalDecisionContext,
+  type ApprovalScope,
   DEFAULT_MODEL,
   EventId,
   ProviderDriverKind,
@@ -29,12 +31,25 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
+import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
+
+import {
+  assertApprovalScope,
+  codexNetworkApprovalScope,
+  codexCommandApprovalScope,
+  codexApprovalPublicPayload,
+  CodexApprovalDecisionError,
+  deliverDeclineFeedback,
+  makeDeclineFeedbackJournal,
+} from "./CodexApprovalDecision.ts";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
@@ -223,6 +238,7 @@ export interface CodexSessionRuntimeShape {
   readonly respondToRequest: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
+    decisionContext?: ApprovalDecisionContext,
   ) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly respondToUserInput: (
     requestId: ApprovalRequestId,
@@ -233,6 +249,7 @@ export interface CodexSessionRuntimeShape {
 }
 
 export type CodexSessionRuntimeError =
+  | CodexApprovalDecisionError
   | CodexErrors.CodexAppServerError
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
@@ -290,6 +307,8 @@ interface PendingApproval {
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
+  readonly approvalScope?: ApprovalScope;
+  readonly feedbackSupported?: true;
 }
 
 interface ApprovalCorrelation {
@@ -1299,6 +1318,15 @@ export const makeCodexSessionRuntime = (
     const runtimeScope = yield* Scope.Scope;
     const crypto = yield* Crypto.Crypto;
     const events = yield* Queue.unbounded<ProviderEvent>();
+    const approvalResponseMutex = yield* Semaphore.make(1);
+    const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
+    const feedbackJournal = Option.isSome(sql) ? makeDeclineFeedbackJournal(sql.value) : undefined;
+    // A resumed provider thread still gets a fresh process/session authority.
+    const sessionIncarnation = yield* crypto.randomUUIDv4.pipe(
+      Effect.mapError((cause) => new CodexErrors.CodexAppServerIdentifierGenerationError({
+        purpose: "provider-event", cause,
+      })),
+    );
     const pendingApprovalsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingApproval>());
     const approvalCorrelationsRef = yield* Ref.make(new Map<string, ApprovalCorrelation>());
     const pendingUserInputsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingUserInput>());
@@ -2058,6 +2086,9 @@ export const makeCodexSessionRuntime = (
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4("command-approval-request"));
         const turnId = TurnId.make(payload.turnId);
         const itemId = ProviderItemId.make(payload.itemId);
+        const approvalScope = codexNetworkApprovalScope(sessionIncarnation, payload) ??
+          codexCommandApprovalScope(sessionIncarnation, payload);
+        const feedbackSupported = feedbackJournal !== undefined;
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
 
         yield* Ref.update(pendingApprovalsRef, (current) => {
@@ -2069,6 +2100,8 @@ export const makeCodexSessionRuntime = (
             turnId,
             itemId,
             decision,
+            ...(approvalScope ? { approvalScope } : {}),
+            ...(feedbackSupported ? { feedbackSupported: true as const } : {}),
           });
           return next;
         });
@@ -2091,7 +2124,9 @@ export const makeCodexSessionRuntime = (
           requestKind: "command",
           ...(turnId ? { turnId } : {}),
           ...(itemId ? { itemId } : {}),
-          payload,
+          payload: codexApprovalPublicPayload(payload),
+          ...(approvalScope ? { approvalScope } : {}),
+          ...(feedbackSupported ? { feedbackSupported: true as const } : {}),
         });
 
         const resolved = yield* Deferred.await(decision).pipe(
@@ -2625,7 +2660,7 @@ export const makeCodexSessionRuntime = (
             threadId: providerThreadId,
           });
         }),
-      respondToRequest: (requestId, decision) =>
+      respondToRequest: (requestId, decision, decisionContext) =>
         Effect.gen(function* () {
           const pending = (yield* Ref.get(pendingApprovalsRef)).get(requestId);
           if (!pending) {
@@ -2633,16 +2668,38 @@ export const makeCodexSessionRuntime = (
               requestId,
             });
           }
+          if (decisionContext && decision !== "accept" && decision !== "decline" && decision !== "cancel")
+            return yield* new CodexApprovalDecisionError({ code: "GUARDED_DECISION_MUST_BE_ONE_TIME" });
+          yield* Effect.try({
+            try: () => assertApprovalScope(decisionContext?.expectedApprovalScope, pending.approvalScope),
+            catch: () => new CodexApprovalDecisionError({ code: "APPROVAL_SCOPE_MISMATCH" }),
+          });
+          if (decisionContext?.ruleSourceRequestId && (!decisionContext.expectedApprovalScope || decision !== "accept"))
+            return yield* new CodexApprovalDecisionError({ code: "INVALID_RULE_APPLICATION" });
+          if (decisionContext?.feedback !== undefined) {
+            if (decision !== "decline" || !feedbackJournal || !pending.feedbackSupported || !pending.turnId)
+              return yield* new CodexApprovalDecisionError({ code: "FEEDBACK_UNSUPPORTED" });
+            yield* deliverDeclineFeedback({
+              client, journal: feedbackJournal, requestId,
+              providerThreadId: yield* readProviderThreadId,
+              pendingTurnId: pending.turnId,
+              activeTurnId: Ref.get(sessionRef).pipe(Effect.map((session) => session.activeTurnId ?? undefined)),
+              context: decisionContext,
+            });
+          }
           yield* Ref.update(pendingApprovalsRef, (current) => {
             const next = new Map(current);
             next.delete(requestId);
             return next;
           });
-          yield* Deferred.succeed(pending.decision, decision);
+          const released = yield* Deferred.succeed(pending.decision, decision);
+          if (!released) return yield* new CodexApprovalDecisionError({ code: "APPROVAL_ALREADY_RELEASED" });
           yield* emitEvent({
             kind: "notification",
             threadId: options.threadId,
             method: "item/requestApproval/decision",
+            ...(decisionContext?.feedback !== undefined ? { feedbackDelivered: true as const } : {}),
+            ...(decisionContext?.ruleSourceRequestId ? { ruleSourceRequestId: decisionContext.ruleSourceRequestId } : {}),
             requestId: pending.requestId,
             requestKind: pending.requestKind,
             ...(pending.turnId ? { turnId: pending.turnId } : {}),
@@ -2653,7 +2710,7 @@ export const makeCodexSessionRuntime = (
               decision,
             },
           });
-        }),
+        }).pipe(approvalResponseMutex.withPermit),
       respondToUserInput: (requestId, answers) =>
         Effect.gen(function* () {
           const pending = (yield* Ref.get(pendingUserInputsRef)).get(requestId);

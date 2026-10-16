@@ -1,3 +1,4 @@
+import { ApprovalDecisionContext } from "./approvalDecisionContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
@@ -1360,6 +1361,7 @@ const ThreadApprovalRespondCommand = Schema.Struct({
   requestId: ApprovalRequestId,
   decision: ProviderApprovalDecision,
   createdAt: IsoDateTime,
+  decisionContext: Schema.optional(ApprovalDecisionContext),
 });
 
 const ThreadUserInputRespondCommand = Schema.Struct({
@@ -1924,6 +1926,7 @@ export const ThreadApprovalResponseRequestedPayload = Schema.Struct({
   requestId: ApprovalRequestId,
   decision: ProviderApprovalDecision,
   createdAt: IsoDateTime,
+  decisionContext: Schema.optional(ApprovalDecisionContext),
 });
 
 const ThreadUserInputResponseRequestedPayload = Schema.Struct({
