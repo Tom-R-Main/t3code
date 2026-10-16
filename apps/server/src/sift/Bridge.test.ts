@@ -312,6 +312,42 @@ it.effect("resolves each approval request once across clients and restarts", () 
           .length,
       ).toBe(1);
 
+      const scope = { version: 1, kind: "network", digest: "a".repeat(64) } as const;
+      for (const invalid of [
+        { expectedApprovalScope: scope, decision: "accept" },
+        { feedback: "Try the fixture", decision: "decline" },
+        { attemptId: "attempt", feedback: "Try the fixture", decision: "accept" },
+        { attemptId: "attempt", ruleSourceRequestId: "source", decision: "accept" },
+      ]) {
+        const result = yield* handle({
+          ...request,
+          operation: "approve",
+          commandId: "invalid",
+          requestId: "request-1",
+          ...invalid,
+        });
+        expect(!result.ok && result.error.code).toBe("INVALID_REQUEST");
+      }
+      yield* appendActivity("requested-scoped", "approval.requested", {
+        requestId: "request-scoped",
+      });
+      const scoped = {
+        ...request,
+        operation: "approve",
+        commandId: "scoped",
+        requestId: "request-scoped",
+        decision: "accept",
+        attemptId: "attempt",
+        expectedApprovalScope: scope,
+        ruleSourceRequestId: "request-source",
+      };
+      expect((yield* handle(scoped)).ok).toBe(true);
+      const changedScope = yield* handle({
+        ...scoped,
+        expectedApprovalScope: { ...scope, digest: "b".repeat(64) },
+      });
+      expect(!changedScope.ok && changedScope.error.code).toBe("COMMAND_CONFLICT");
+
       const unknown = yield* approve("unknown", "missing-request", "accept");
       expect(!unknown.ok && unknown.error.code).toBe("UNKNOWN_REQUEST");
       // Standing approvals stay a native-client decision; the socket replies
@@ -334,4 +370,79 @@ it.effect("resolves each approval request once across clients and restarts", () 
       });
     }).pipe(Effect.provide(testLayer(directory)));
   }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "terminalizes a guarded reservation when dispatch throws before persisting its event",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-approval-dispatch-fault-")),
+        ),
+        (directory) =>
+          Effect.promise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
+      );
+      yield* Effect.gen(function* () {
+        const engine = yield* OrchestrationEngineService;
+        let approvalDispatches = 0;
+        const handle = yield* makeSiftBridge.pipe(
+          Effect.provideService(OrchestrationEngineService, {
+            ...engine,
+            dispatch: (command, options) =>
+              command.type === "thread.approval.respond"
+                ? Effect.sync(() => {
+                    approvalDispatches++;
+                  }).pipe(Effect.andThen(Effect.die(new Error("Injected dispatch defect"))))
+                : engine.dispatch(command, options),
+          }),
+        );
+        const bound = yield* handle({
+          ...request,
+          operation: "bind",
+          checkoutPath: directory,
+          modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+          runtimeMode: "approval-required",
+        });
+        if (!bound.ok) throw new Error("Binding failed");
+        yield* engine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make("fault-approval"),
+          threadId: ThreadId.make(bound.result.threadId),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          activity: {
+            id: EventId.make("fault-approval"),
+            kind: "approval.requested",
+            summary: "Approval requested",
+            tone: "approval",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            payload: { requestId: "fault-request" },
+          },
+        });
+        const approve = {
+          ...request,
+          operation: "approve",
+          commandId: "fault-decision",
+          requestId: "fault-request",
+          decision: "decline",
+          attemptId: "attempt",
+          feedback: "Use the existing fixture.",
+        };
+        const first = yield* handle(approve).pipe(Effect.exit);
+        expect(first._tag).toBe("Failure");
+        const retry = yield* handle(approve);
+        expect(retry.ok && retry.result).toEqual({
+          threadId: bound.result.threadId,
+          state: "failed",
+          error: "FEEDBACK_DELIVERY_UNKNOWN",
+        });
+        expect(approvalDispatches).toBe(1);
+        const events = yield* handle({ ...request, operation: "events", afterSequence: 0 });
+        if (!events.ok || !("events" in events.result)) throw new Error("Events unavailable");
+        expect(
+          events.result.events.some((event) => event.type === "thread.approval-response-requested"),
+        ).toBe(false);
+      }).pipe(Effect.provide(testLayer(directory)));
+    }).pipe(Effect.scoped),
 );

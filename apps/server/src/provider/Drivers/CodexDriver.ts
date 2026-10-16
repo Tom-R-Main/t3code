@@ -27,6 +27,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
@@ -114,7 +115,8 @@ export type CodexDriverEnv =
   | Path.Path
   | ProviderEventLoggers
   | ServerConfig
-  | ServerSettingsService;
+  | ServerSettingsService
+  | SqlClient.SqlClient;
 
 export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
   driverKind: DRIVER_KIND,
@@ -127,6 +129,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const feedbackSql = yield* SqlClient.SqlClient;
       const resetCreditCoordinator = yield* CodexResetCreditCoordinator;
       const fileSystem = yield* FileSystem.FileSystem;
       const pathService = yield* Path.Path;
@@ -185,7 +188,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         instanceId,
         environment: processEnv,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
-      });
+      }).pipe(Effect.provideService(SqlClient.SqlClient, feedbackSql));
 
       // Build a managed snapshot whose settings never change — mutations come
       // in as instance rebuilds from the registry rather than in-place

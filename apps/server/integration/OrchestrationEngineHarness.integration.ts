@@ -23,6 +23,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
 import { TextGeneration } from "../src/textGeneration/TextGeneration.ts";
@@ -39,7 +40,10 @@ import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSes
 import { ServerSettingsService } from "../src/serverSettings.ts";
 import * as StorageCleanup from "../src/storageCleanup.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
-import { makeCodexAdapter } from "../src/provider/Layers/CodexAdapter.ts";
+import {
+  makeCodexAdapter,
+  type CodexAdapterLiveOptions,
+} from "../src/provider/Layers/CodexAdapter.ts";
 import {
   NoOpProviderEventLoggers,
   ProviderEventLoggers,
@@ -59,6 +63,7 @@ import { OrchestrationReactorLive } from "../src/orchestration/Layers/Orchestrat
 import { ProviderCommandReactorLive } from "../src/orchestration/Layers/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionLive } from "../src/orchestration/Layers/ProviderRuntimeIngestion.ts";
 import { CheckpointReactor } from "../src/orchestration/Services/CheckpointReactor.ts";
+import { ProviderCommandReactor } from "../src/orchestration/Services/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionService } from "../src/orchestration/Services/ProviderRuntimeIngestion.ts";
 import {
   OrchestrationEngineService,
@@ -90,6 +95,7 @@ import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as PullRequestService from "../src/pullRequest/PullRequestService.ts";
 
 import { makeSiftBridge } from "../src/sift/Bridge.ts";
+import { readApprovalEffect } from "../src/sift/ApprovalEffects.ts";
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -182,6 +188,9 @@ const tryRuntimePromise = <A>(operation: string, run: () => Promise<A>) =>
 
 export interface OrchestrationIntegrationHarness {
   readonly siftBridge: Effect.Success<typeof makeSiftBridge>;
+  readonly readApprovalEffect: (
+    commandId: string,
+  ) => Effect.Effect<Effect.Success<ReturnType<typeof readApprovalEffect>>, never>;
   readonly rootDir: string;
   readonly workspaceDir: string;
   readonly dbPath: string;
@@ -227,6 +236,7 @@ export interface OrchestrationIntegrationHarness {
     ): Effect.Effect<Receipt, never>;
   };
   readonly drainProviderRuntime: Effect.Effect<void>;
+  readonly drainProviderCommands: Effect.Effect<void>;
   readonly drainCheckpointReactor: Effect.Effect<void>;
   readonly dispose: Effect.Effect<void, never>;
 }
@@ -234,6 +244,7 @@ export interface OrchestrationIntegrationHarness {
 interface MakeOrchestrationIntegrationHarnessOptions {
   readonly provider?: ProviderDriverKind;
   readonly realCodex?: boolean;
+  readonly codexRuntimeFactory?: CodexAdapterLiveOptions["makeRuntime"];
   /** Tracer for every fiber the harness runtime runs, including reactors. */
   readonly tracer?: Tracer.Tracer;
 }
@@ -282,7 +293,9 @@ export const makeOrchestrationIntegrationHarness = (
       ProviderAdapterRegistry,
       Effect.gen(function* () {
         const codexSettings = yield* decodeCodexSettings({});
-        const codexAdapter = yield* makeCodexAdapter(codexSettings);
+        const codexAdapter = yield* makeCodexAdapter(codexSettings, {
+          ...(options?.codexRuntimeFactory ? { makeRuntime: options.codexRuntimeFactory } : {}),
+        });
         return makeAdapterRegistryMock({
           [ProviderDriverKind.make("codex")]: codexAdapter,
         });
@@ -291,6 +304,7 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(providerSessionDirectoryLayer),
+      Layer.provideMerge(persistenceLayer),
     );
     const providerEventLoggersLayer = Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers);
     const providerLayer = useRealCodex
@@ -449,6 +463,9 @@ export const makeOrchestrationIntegrationHarness = (
     const reactor = yield* tryRuntimePromise("load OrchestrationReactor service", () =>
       runtime.runPromise(Effect.service(OrchestrationReactor)),
     ).pipe(Effect.orDie);
+    const providerCommands = yield* tryRuntimePromise("load ProviderCommandReactor", () =>
+      runtime.runPromise(Effect.service(ProviderCommandReactor)),
+    ).pipe(Effect.orDie);
     const providerRuntimeIngestion = yield* tryRuntimePromise(
       "load ProviderRuntimeIngestion service",
       () => runtime.runPromise(Effect.service(ProviderRuntimeIngestionService)),
@@ -603,6 +620,12 @@ export const makeOrchestrationIntegrationHarness = (
 
     return {
       siftBridge,
+      readApprovalEffect: (commandId) =>
+        tryRuntimePromise("read guarded approval receipt", () =>
+          runtime.runPromise(
+            Effect.flatMap(SqlClient.SqlClient, (sql) => readApprovalEffect(sql, commandId)),
+          ),
+        ).pipe(Effect.orDie),
       rootDir,
       workspaceDir,
       dbPath,
@@ -617,6 +640,7 @@ export const makeOrchestrationIntegrationHarness = (
       waitForPendingApproval,
       waitForReceipt,
       drainProviderRuntime: providerRuntimeIngestion.drain,
+      drainProviderCommands: providerCommands.drain,
       drainCheckpointReactor: checkpointReactor.drain,
       dispose,
     } satisfies OrchestrationIntegrationHarness;

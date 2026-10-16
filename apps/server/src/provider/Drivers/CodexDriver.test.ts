@@ -1,3 +1,4 @@
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
@@ -31,6 +32,7 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-codex-driver-maintenance-",
 }).pipe(
   Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
   Layer.provideMerge(ServerSettingsService.layerTest()),
   Layer.provideMerge(ModelManifest.layerTest),
   Layer.provideMerge(codexResetCreditLayerTest),

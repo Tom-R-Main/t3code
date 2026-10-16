@@ -512,7 +512,9 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // through this layer. Built-in drivers come from `BUILT_IN_DRIVERS`;
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
-  Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+  Layer.provideMerge(
+    ProviderInstanceRegistryHydrationLive.pipe(Layer.provideMerge(PersistenceLayerLive)),
+  ),
 ).pipe(
   Layer.provideMerge(AntigravityInstallation.layer),
   // Shared native/canonical NDJSON writers used by both the per-instance

@@ -1,3 +1,4 @@
+import { ApprovalScope } from "./approvalDecisionContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
@@ -462,6 +463,8 @@ const RequestOpenedPayload = Schema.Struct({
   appName: Schema.optional(TrimmedNonEmptyStringSchema),
   options: Schema.optional(Schema.Array(ProviderApprovalOption)),
   args: Schema.optional(Schema.Unknown),
+  approvalScope: Schema.optional(ApprovalScope),
+  feedbackSupported: Schema.optional(Schema.Literal(true)),
 });
 export type RequestOpenedPayload = typeof RequestOpenedPayload.Type;
 
@@ -469,6 +472,8 @@ const RequestResolvedPayload = Schema.Struct({
   requestType: CanonicalRequestType,
   decision: Schema.optional(TrimmedNonEmptyStringSchema),
   resolution: Schema.optional(Schema.Unknown),
+  feedbackDelivered: Schema.optional(Schema.Literal(true)),
+  ruleSourceRequestId: Schema.optional(Schema.String),
 });
 export type RequestResolvedPayload = typeof RequestResolvedPayload.Type;
 

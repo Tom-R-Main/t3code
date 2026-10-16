@@ -31,6 +31,16 @@ import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import {
+  approvalEffectErrorCode,
+  beginApprovalEffect,
+  ensureApprovalEffects,
+  finishApprovalEffect,
+  recoverApprovalEffects,
+  reserveApprovalEffect,
+  type ApprovalEffectErrorCode,
+} from "../../sift/ApprovalEffects.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -137,13 +147,13 @@ export function providerErrorLabelFromInstanceHint(input: {
 }
 
 function findProviderAdapterRequestError(
-  cause: Cause.Cause<ProviderServiceError>,
+  cause: Cause.Cause<unknown>,
 ): ProviderAdapterRequestError | undefined {
   const failReason = cause.reasons.find(Cause.isFailReason);
   return isProviderAdapterRequestError(failReason?.error) ? failReason.error : undefined;
 }
 
-function isUnknownPendingApprovalRequestError(cause: Cause.Cause<ProviderServiceError>): boolean {
+function isUnknownPendingApprovalRequestError(cause: Cause.Cause<unknown>): boolean {
   const error = findProviderAdapterRequestError(cause);
   if (error) {
     const detail = error.detail.toLowerCase();
@@ -211,6 +221,9 @@ function buildGeneratedWorktreeBranchName(raw: string): string {
 
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
+  const approvalSql = yield* SqlClient.SqlClient;
+  yield* ensureApprovalEffects(approvalSql);
+  yield* recoverApprovalEffects(approvalSql);
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerAuthService = yield* ProviderAuthService;
@@ -278,6 +291,8 @@ const make = Effect.gen(function* () {
     readonly turnId: TurnId | null;
     readonly createdAt: string;
     readonly requestId?: string;
+    readonly errorCode?: ApprovalEffectErrorCode;
+    readonly decisionCommandId?: string;
   }) =>
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
@@ -296,6 +311,8 @@ const make = Effect.gen(function* () {
             payload: {
               detail: input.detail,
               ...(input.requestId ? { requestId: input.requestId } : {}),
+              ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+              ...(input.decisionCommandId ? { decisionCommandId: input.decisionCommandId } : {}),
             },
             turnId: input.turnId,
             createdAt: input.createdAt,
@@ -1617,44 +1634,79 @@ const make = Effect.gen(function* () {
   const processApprovalResponseRequested = Effect.fn("processApprovalResponseRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.approval-response-requested" }>,
   ) {
-    const thread = yield* resolveThreadShell(event.payload.threadId);
-    if (!thread) {
-      return;
+    const context = event.payload.decisionContext;
+    const guarded =
+      context !== undefined &&
+      Boolean(
+        context.expectedApprovalScope ||
+        context.feedback !== undefined ||
+        context.ruleSourceRequestId,
+      );
+    const effectId = guarded ? event.commandId : null;
+    if (guarded) {
+      if (!effectId) return;
+      // HTTP and WebSocket dispatchers reach this shared reactor without the
+      // private bridge's pre-dispatch reservation. Reserve from the durable
+      // event before claiming; existing terminal/uncertain receipts stay closed.
+      yield* reserveApprovalEffect(
+        approvalSql,
+        effectId,
+        event.payload.requestId,
+        context?.feedback !== undefined,
+      );
+      if (!(yield* beginApprovalEffect(approvalSql, effectId))) return;
     }
-    const hasSession = thread.session && thread.session.status !== "stopped";
-    if (!hasSession) {
-      return yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.approval.respond.failed",
-        summary: "Provider approval response failed",
-        detail: "No active provider session is bound to this thread.",
-        turnId: null,
-        createdAt: event.payload.createdAt,
-        requestId: event.payload.requestId,
+    const failure = (detail: string, errorCode: ApprovalEffectErrorCode) =>
+      Effect.gen(function* () {
+        if (effectId)
+          yield* finishApprovalEffect(approvalSql, effectId, errorCode).pipe(
+            Effect.uninterruptible,
+          );
+        yield* appendProviderFailureActivity({
+          threadId: event.payload.threadId,
+          kind: "provider.approval.respond.failed",
+          summary: "Provider approval response failed",
+          detail,
+          ...(guarded ? { errorCode } : {}),
+          turnId: null,
+          createdAt: event.payload.createdAt,
+          requestId: event.payload.requestId,
+          ...(context ? { decisionCommandId: context.commandId } : {}),
+        });
       });
-    }
-
-    yield* providerService
-      .respondToRequest({
+    yield* Effect.gen(function* () {
+      // Every failure after claiming the effect must leave a terminal receipt,
+      // including a shell lookup failure before the provider call is reached.
+      const thread = yield* resolveThreadShell(event.payload.threadId);
+      if (!thread && !guarded) return;
+      const hasSession = thread?.session && thread.session.status !== "stopped";
+      if (!hasSession) {
+        return yield* failure(
+          "No active provider session is bound to this thread.",
+          "PROVIDER_SESSION_UNAVAILABLE",
+        );
+      }
+      yield* providerService.respondToRequest({
         threadId: event.payload.threadId,
         requestId: event.payload.requestId,
         decision: event.payload.decision,
-      })
-      .pipe(
-        Effect.catchCause((cause) =>
-          appendProviderFailureActivity({
-            threadId: event.payload.threadId,
-            kind: "provider.approval.respond.failed",
-            summary: "Provider approval response failed",
-            detail: isUnknownPendingApprovalRequestError(cause)
-              ? stalePendingRequestDetail("approval", event.payload.requestId)
-              : Cause.pretty(cause),
-            turnId: null,
-            createdAt: event.payload.createdAt,
-            requestId: event.payload.requestId,
-          }),
+        ...(context ? { decisionContext: context } : {}),
+      });
+      if (effectId) yield* finishApprovalEffect(approvalSql, effectId);
+    }).pipe(
+      Effect.catchCause((cause) =>
+        failure(
+          isUnknownPendingApprovalRequestError(cause)
+            ? stalePendingRequestDetail("approval", event.payload.requestId)
+            : Cause.pretty(cause),
+          guarded && Cause.hasInterruptsOnly(cause)
+            ? context?.feedback !== undefined
+              ? "FEEDBACK_DELIVERY_UNKNOWN"
+              : "APPROVAL_EFFECT_UNKNOWN"
+            : approvalEffectErrorCode(cause),
         ),
-      );
+      ),
+    );
   });
 
   const processUserInputResponseRequested = Effect.fn("processUserInputResponseRequested")(

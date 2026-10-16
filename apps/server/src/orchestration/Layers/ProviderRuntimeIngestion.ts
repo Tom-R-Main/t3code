@@ -507,6 +507,8 @@ export function runtimeEventToActivities(
             ...(event.payload.detail ? { detail: event.payload.detail } : {}),
             ...(event.payload.appName ? { appName: event.payload.appName } : {}),
             ...(event.payload.options ? { options: event.payload.options } : {}),
+            ...(event.payload.approvalScope ? { approvalScope: event.payload.approvalScope } : {}),
+            ...(event.payload.feedbackSupported ? { feedbackSupported: true } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -531,6 +533,10 @@ export function runtimeEventToActivities(
             ...(requestKind ? { requestKind } : {}),
             requestType: event.payload.requestType,
             ...(event.payload.decision ? { decision: event.payload.decision } : {}),
+            ...(event.payload.feedbackDelivered ? { feedbackDelivered: true } : {}),
+            ...(event.payload.ruleSourceRequestId
+              ? { ruleSourceRequestId: event.payload.ruleSourceRequestId }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,

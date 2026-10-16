@@ -1,3 +1,4 @@
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 /**
  * Multi-instance validation slices for `ProviderInstanceRegistryLive`.
  *
@@ -226,6 +227,7 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
     prefix: "provider-instance-registry-test",
   }).pipe(
     Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
     Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
     Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(TestHttpClientLive),
@@ -454,6 +456,7 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       }),
     ),
     Layer.provideMerge(infraLayer),
+    Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
     Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
     Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(TestHttpClientLive),

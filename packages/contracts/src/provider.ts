@@ -1,3 +1,4 @@
+import { ApprovalDecisionContext, ApprovalScope } from "./approvalDecisionContext.ts";
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
@@ -106,6 +107,7 @@ export const ProviderRespondToRequestInput = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   decision: ProviderApprovalDecision,
+  decisionContext: Schema.optional(ApprovalDecisionContext),
 });
 export type ProviderRespondToRequestInput = typeof ProviderRespondToRequestInput.Type;
 
@@ -158,5 +160,9 @@ export const ProviderEvent = Schema.Struct({
   requestKind: Schema.optional(ProviderRequestKind),
   textDelta: Schema.optional(Schema.String),
   payload: Schema.optional(Schema.Unknown),
+  approvalScope: Schema.optional(ApprovalScope),
+  feedbackSupported: Schema.optional(Schema.Literal(true)),
+  feedbackDelivered: Schema.optional(Schema.Literal(true)),
+  ruleSourceRequestId: Schema.optional(Schema.String),
 });
 export type ProviderEvent = typeof ProviderEvent.Type;
