@@ -274,8 +274,9 @@ it.effect("refuses UI/recovery restricted starts before stopping an existing tru
     NodeAssert.equal(existing.closeImpl.mock.calls.length, 0);
   }).pipe(
     Effect.scoped,
-    Effect.provide(ServerConfig.layerTest(process.cwd(), process.cwd())),
-    Effect.provide(NodeServices.layer),
+    Effect.provide(
+      ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(Layer.provideMerge(NodeServices.layer)),
+    ),
   ),
 );
 const validationLayer = it.layer(

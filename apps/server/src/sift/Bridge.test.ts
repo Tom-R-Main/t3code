@@ -632,7 +632,7 @@ it.effect(
         expect(yield* encodeStateJson(state)).not.toContain(
           fixture.materialization.input.authorization,
         );
-      }).pipe(Effect.provide(bootstrapLayer), Effect.provide(testLayer(directory)));
+      }).pipe(Effect.provide(bootstrapLayer.pipe(Layer.provideMerge(testLayer(directory)))));
       // Rebuild layers/bridge against the retained database, without carrying a
       // capability or payload forward from the previous in-memory bridge.
       yield* Effect.gen(function* () {
@@ -669,6 +669,6 @@ it.effect(
             ))._tag,
           ).toBe("Failure");
         expect((yield* sql`SELECT * FROM sift_worker_consumed_launches`).length).toBe(1);
-      }).pipe(Effect.provide(bootstrapLayer), Effect.provide(testLayer(directory)));
+      }).pipe(Effect.provide(bootstrapLayer.pipe(Layer.provideMerge(testLayer(directory)))));
     }).pipe(Effect.scoped),
 );

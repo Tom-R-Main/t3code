@@ -119,6 +119,7 @@ try {
               "src/provider/ProviderInstanceEnvironment.test.ts",
               "src/provider/Layers/CodexWorkerPolicy.peer.test.ts",
               "src/provider/Layers/CodexAdapter.test.ts",
+              "src/provider/Layers/ProviderService.test.ts",
             ]
           : []),
       ],
