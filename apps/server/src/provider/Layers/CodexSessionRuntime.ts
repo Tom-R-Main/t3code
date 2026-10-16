@@ -338,6 +338,7 @@ export class CodexSessionRuntimeThreadIdMissingError extends Schema.TaggedError<
 }
 
 interface PendingApproval {
+  readonly providerThreadId?: string;
   readonly requestId: ApprovalRequestId;
   readonly jsonRpcId: string;
   readonly requestKind: ProviderRequestKind;
@@ -2250,6 +2251,7 @@ export const makeCodexSessionRuntime = (
             requestId,
             jsonRpcId: payload.approvalId ?? payload.itemId,
             requestKind: "command",
+            providerThreadId: payload.threadId,
             turnId,
             itemId,
             decision,
@@ -3326,13 +3328,21 @@ export const makeCodexSessionRuntime = (
           if (decisionContext?.ruleSourceRequestId && (!decisionContext.expectedApprovalScope || decision !== "accept"))
             return yield* new CodexApprovalDecisionError({ code: "INVALID_RULE_APPLICATION" });
           if (decisionContext?.feedback !== undefined) {
-            if (decision !== "decline" || !feedbackJournal || !pending.feedbackSupported || !pending.turnId)
+            if (decision !== "decline" || !feedbackJournal || !pending.feedbackSupported || !pending.turnId || !pending.providerThreadId)
               return yield* new CodexApprovalDecisionError({ code: "FEEDBACK_UNSUPPORTED" });
+            const requestingProviderThreadId = pending.providerThreadId;
             yield* deliverDeclineFeedback({
               client, journal: feedbackJournal, requestId,
-              providerThreadId: yield* readProviderThreadId,
+              providerThreadId: requestingProviderThreadId,
               pendingTurnId: pending.turnId,
-              activeTurnId: Ref.get(sessionRef).pipe(Effect.map((session) => session.activeTurnId ?? undefined)),
+              activeTurnId: Effect.gen(function* () {
+                const session = yield* Ref.get(sessionRef);
+                if (currentProviderThreadId(session) === requestingProviderThreadId)
+                  return session.activeTurnId ?? undefined;
+                // A child approval belongs to its own live native turn. Never
+                // steer the parent or substitute its active turn on a miss.
+                return (yield* Ref.get(collabChildLiveTurnsRef)).get(requestingProviderThreadId);
+              }),
               context: decisionContext,
             });
           }
