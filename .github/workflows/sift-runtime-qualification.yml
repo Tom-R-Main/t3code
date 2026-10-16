@@ -1,0 +1,64 @@
+name: Sift runtime qualification
+
+on:
+  push:
+    branches:
+      - codex/uix-c3a-exact-decisions
+      - codex/uix-c4-executor-bridge
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sift-runtime-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  model_free:
+    name: Model-free contracts, approval effects and typechecks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CI: 'true'
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - name: Checkout the exact pushed revision
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Set up pinned Vite+, Node and locked scoped dependencies
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          version: '0.3.3'
+          node-version: '24.13.1'
+          cache: true
+          run-install: |
+            args:
+              - --frozen-lockfile
+              - --filter=@t3tools/monorepo
+              - --filter=t3...
+
+      # These commands use only protocol peers, temporary SQLite/files/git and
+      # private sockets. They never launch a real provider or a model turn.
+      - name: Qualify the bounded source changes
+        env:
+          SIFT_QUALIFICATION_OUTPUT: ${{ runner.temp }}/sift-runtime-qualification
+          T3CODE_HOME: ${{ runner.temp }}/sift-qualification-home
+          CODEX_HOME: ${{ runner.temp }}/sift-qualification-codex
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/sift-qualification-claude
+        run: node .github/scripts/sift-runtime-qualification.mjs
+
+      - name: Upload exact-head test counts and toolchain evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sift-runtime-qualification-${{ github.sha }}
+          path: ${{ runner.temp }}/sift-runtime-qualification/
+          if-no-files-found: error
+          retention-days: 14
