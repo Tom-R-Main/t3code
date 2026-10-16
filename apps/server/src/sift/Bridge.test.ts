@@ -195,7 +195,7 @@ it.effect(
           expectedPreviousGeneration: 1,
         });
         expect(advanced.ok && "threadId" in advanced.result && advanced.result.threadId).toBe(
-          first.accepted.ok && first.accepted.result.threadId,
+          first.accepted.ok && "threadId" in first.accepted.result && first.accepted.result.threadId,
         );
         const old = yield* handle({ ...request, operation: "events", afterSequence: 0 });
         expect(!old.ok && old.error.code).toBe("BINDING_CONFLICT");
