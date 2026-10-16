@@ -21,6 +21,9 @@ const failure = (code: string) => new CodexApprovalDecisionError({ code });
 const digest = (value: string) => NodeCrypto.createHash("sha256").update(value).digest("hex");
 
 function canonicalNetworkHost(host: string): string | undefined {
+  // Node's URL-backed IDNA conversion can discard a path/query or decode a
+  // percent escape. Reject URL syntax first: this authority is a typed host.
+  if (/[\\/:@*?#%\s\u0000-\u001f\u007f]/.test(host)) return undefined;
   const canonical = domainToASCII(host.toLowerCase().replace(/\.$/, ""));
   return canonical && canonical.length <= 253 && canonical.split(".").every((label) =>
     /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) ? canonical : undefined;

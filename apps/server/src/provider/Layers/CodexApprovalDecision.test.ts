@@ -10,6 +10,7 @@ import * as CodexSchema from "effect-codex-app-server/schema";
 import {
   assertApprovalScope,
   codexNetworkApprovalScope,
+  codexNetworkApprovalTarget,
   codexCommandApprovalScope,
   codexApprovalPublicPayload,
   CodexApprovalDecisionError,
@@ -40,16 +41,22 @@ describe("Codex exact network approval authority", () => {
       codexNetworkApprovalScope("session-1", { ...payload, networkApprovalContext: { host: "example.com", protocol: "http" } }),
     ]) Assert.throws(() => assertApprovalScope(first, changed), /APPROVAL_SCOPE_MISMATCH/);
     Assert.throws(() => assertApprovalScope(first, undefined), /APPROVAL_SCOPE_MISMATCH/);
+    // A literal internal host is still exact authority; URL-shaped strings are
+    // rejected separately rather than forbidding legitimate single-label hosts.
+    Assert.equal(codexNetworkApprovalScope("session-1", {
+      ...payload, networkApprovalContext: { host: "simple", protocol: "https" },
+    })?.kind, "network");
   });
 
   it("does not reinterpret V2 command strings, display actions, or policy prefixes as exact argv", () => {
     Assert.equal(codexNetworkApprovalScope("session-1", {
       ...payload, networkApprovalContext: null, proposedExecpolicyAmendment: ["git"],
     }), undefined);
-    for (const host of ["https://example.com", "*.example.com", "example.com/path", "example.com:443", "user@example.com", ""]) {
-      Assert.equal(codexNetworkApprovalScope("session-1", {
-        ...payload, networkApprovalContext: { host, protocol: "https" },
-      }), undefined);
+    for (const host of ["https://example.com", "*.example.com", "example.com/path", "example.com:443", "user@example.com", "",
+      "example.com?query", "example.com#fragment", "example.com\\path", "%65xample.com", "example.com\n", " example.com"]) {
+      const input = { ...payload, networkApprovalContext: { host, protocol: "https" as const } };
+      Assert.equal(codexNetworkApprovalScope("session-1", input), undefined, `Invalid host: ${JSON.stringify(host)}`);
+      Assert.equal(codexNetworkApprovalTarget(input), undefined, `Invalid target display: ${JSON.stringify(host)}`);
     }
   });
 });
