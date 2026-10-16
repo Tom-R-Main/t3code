@@ -7,6 +7,7 @@ import {
   CommandId,
   MessageId,
   ModelSelection,
+  ProviderDriverKind,
   type OrchestrationCommand,
   type OrchestrationEvent,
 } from "@t3tools/contracts";
@@ -27,7 +28,12 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { isWorkerPolicyChallenge } from "./WorkerPolicy.ts";
-import { prepareWorkerBootstrap, WorkerBootstrap, ensureWorkerBootstrapJournal, burnWorkerBootstrap } from "./WorkerBootstrap.ts";
+import {
+  prepareWorkerBootstrap,
+  WorkerBootstrap,
+  ensureWorkerBootstrapJournal,
+  burnWorkerBootstrap,
+} from "./WorkerBootstrap.ts";
 import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
 import {
   MANAGED_ROLE_SCOPES,
@@ -252,49 +258,99 @@ export const makeSiftBridge = Effect.gen(function* () {
         "Assignment identity or lease generation does not match.",
       );
     if (request.operation === "workerPolicy/bootstrap") {
-      if (!authorize || rows[0].ready_generation !== binding.binding.leaseGeneration || request.threadId !== threadId)
-        return yield* fail("WORKER_BOOTSTRAP_UNAVAILABLE", "An authorized exact ready assignment is required.");
+      if (
+        !authorize ||
+        rows[0].ready_generation !== binding.binding.leaseGeneration ||
+        request.threadId !== threadId
+      )
+        return yield* fail(
+          "WORKER_BOOTSTRAP_UNAVAILABLE",
+          "An authorized exact ready assignment is required.",
+        );
       if (Option.isNone(providerService))
-        return yield* fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable.");
+        return yield* fail(
+          "WORKER_BOOTSTRAP_UNAVAILABLE",
+          "Restricted worker bootstrap unavailable.",
+        );
       const provider = providerService.value;
-      const prepared = yield* prepareWorkerBootstrap(request.materialization, {
-        threadId, providerInstanceId: binding.modelSelection.instanceId,
-        cwd: binding.checkoutPath, model: binding.modelSelection.model,
-      }, process.env).pipe(Effect.mapError(() => fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable.")));
+      const prepared = yield* prepareWorkerBootstrap(
+        request.materialization,
+        {
+          threadId,
+          providerInstanceId: binding.modelSelection.instanceId,
+          cwd: binding.checkoutPath,
+          model: binding.modelSelection.model,
+        },
+        process.env,
+      ).pipe(
+        Effect.mapError(() =>
+          fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable."),
+        ),
+      );
       let invoked = false;
       return yield* Effect.gen(function* () {
         yield* checkAuthorization;
         // INSERT, never UPSERT/release: timeout, disconnect, lost response and
         // process failure all require a new host launch/incarnation.
-        yield* burnWorkerBootstrap(sql, { ...prepared.launch, threadId, consumedAt: yield* nowIso }).pipe(
-          Effect.mapError(() => fail("WORKER_BOOTSTRAP_CONSUMED", "Restricted launch identity was consumed or could not be reserved.")),
+        yield* burnWorkerBootstrap(sql, {
+          ...prepared.launch,
+          threadId,
+          consumedAt: yield* nowIso,
+        }).pipe(
+          Effect.mapError(() =>
+            fail(
+              "WORKER_BOOTSTRAP_CONSUMED",
+              "Restricted launch identity was consumed or could not be reserved.",
+            ),
+          ),
         );
         yield* checkAuthorization;
         invoked = true;
-        yield* provider.startSession(threadId, {
-          threadId, provider: "codex", providerInstanceId: binding.modelSelection.instanceId,
-          cwd: binding.checkoutPath, modelSelection: binding.modelSelection, runtimeMode: "approval-required",
-        }).pipe(Effect.provideService(WorkerBootstrap, prepared.capability));
+        yield* provider
+          .startSession(threadId, {
+            threadId,
+            provider: ProviderDriverKind.make("codex"),
+            providerInstanceId: binding.modelSelection.instanceId,
+            cwd: binding.checkoutPath,
+            modelSelection: binding.modelSelection,
+            runtimeMode: "approval-required",
+          })
+          .pipe(Effect.provideService(WorkerBootstrap, prepared.capability));
         yield* checkAuthorization;
         return { threadId, state: "started" as const };
       }).pipe(
-        Effect.onExit((exit) => exit._tag === "Success" || !invoked ? Effect.void :
-          Effect.suspend(() => provider.stopSession({ threadId })).pipe(
-            Effect.timeout("5 seconds"), Effect.ignoreCause, Effect.uninterruptible)),
+        Effect.onExit((exit) =>
+          exit._tag === "Success" || !invoked
+            ? Effect.void
+            : Effect.suspend(() => provider.stopSession({ threadId })).pipe(
+                Effect.timeout("5 seconds"),
+                Effect.ignoreCause,
+                Effect.uninterruptible,
+              ),
+        ),
         Effect.ensuring(Effect.sync(prepared.dispose)),
-        Effect.catchCause(() => fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable.")),
+        Effect.catchCause(() =>
+          fail("WORKER_BOOTSTRAP_UNAVAILABLE", "Restricted worker bootstrap unavailable."),
+        ),
       );
     }
     if (request.operation === "workerPolicy/read") {
       // Attestation may inspect only the assignment's existing live provider.
       // It cannot use ensureReady/recovery to create or resume a thread.
-      if (rows[0].ready_generation !== binding.binding.leaseGeneration ||
-        request.threadId !== threadId || !isWorkerPolicyChallenge(request.challenge))
-        return yield* fail("WORKER_POLICY_BINDING_MISMATCH", "An exact ready assignment thread and bounded challenge are required.");
+      if (
+        rows[0].ready_generation !== binding.binding.leaseGeneration ||
+        request.threadId !== threadId ||
+        !isWorkerPolicyChallenge(request.challenge)
+      )
+        return yield* fail(
+          "WORKER_POLICY_BINDING_MISMATCH",
+          "An exact ready assignment thread and bounded challenge are required.",
+        );
       if (Option.isNone(providerService) || !providerService.value.readWorkerPolicy)
         return yield* fail("WORKER_POLICY_UNAVAILABLE", "Worker policy inspection is unavailable.");
       yield* checkAuthorization;
-      const result = yield* providerService.value.readWorkerPolicy(threadId, request.challenge, request.prepare ?? false)
+      const result = yield* providerService.value
+        .readWorkerPolicy(threadId, request.challenge, request.prepare ?? false)
         .pipe(Effect.timeout("15 seconds"));
       yield* checkAuthorization;
       return result;
@@ -533,8 +589,11 @@ export const makeSiftBridge = Effect.gen(function* () {
     }).pipe(Effect.mapError(() => fail("INVALID_REQUEST", "Invalid bridge request.")));
     const execution = execute(request, authorize);
     // Include queueing for the bridge mutex in the bound as well.
-    return yield* (request.operation === "workerPolicy/read" || request.operation === "workerPolicy/bootstrap"
-      ? execution.pipe(Effect.timeout("15 seconds")) : execution).pipe(
+    return yield* (
+      request.operation === "workerPolicy/read" || request.operation === "workerPolicy/bootstrap"
+        ? execution.pipe(Effect.timeout("15 seconds"))
+        : execution
+    ).pipe(
       Effect.map((result) => ({ id: request.id, ok: true as const, result })),
       Effect.catch((error) =>
         Effect.succeed({

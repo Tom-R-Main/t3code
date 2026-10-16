@@ -23,29 +23,47 @@ const WorkerPolicyLaunch = Schema.Struct({
   configSha256: Digest,
 });
 export function isWorkerPolicyChallenge(value: string): boolean {
-  return NodeBuffer.Buffer.byteLength(value) >= 1 && NodeBuffer.Buffer.byteLength(value) <= 256 &&
+  return (
+    NodeBuffer.Buffer.byteLength(value) >= 1 &&
+    NodeBuffer.Buffer.byteLength(value) <= 256 &&
     !/[\u0000-\u001f\u007f]/.test(value) &&
     !Array.from(value).some((character) => {
       const point = character.codePointAt(0)!;
       return point >= 0xd800 && point <= 0xdfff;
-    });
+    })
+  );
 }
 
 // Only launcher-owned environment carries worker authority. Never recover it
 // from a prompt, bridge bind, or mutable provider-instance configuration.
-export function readWorkerPolicyLaunch(environment: NodeJS.ProcessEnv): typeof WorkerPolicyLaunch.Type | undefined {
-  if (environment.CODEX_RESTRICTED_WORKER !== "1" || !environment.CODEX_WORKER_POLICY_V1 ||
-    NodeBuffer.Buffer.byteLength(environment.CODEX_WORKER_POLICY_V1) > 16384) return undefined;
+export function readWorkerPolicyLaunch(
+  environment: NodeJS.ProcessEnv,
+): typeof WorkerPolicyLaunch.Type | undefined {
+  if (
+    environment.CODEX_RESTRICTED_WORKER !== "1" ||
+    !environment.CODEX_WORKER_POLICY_V1 ||
+    NodeBuffer.Buffer.byteLength(environment.CODEX_WORKER_POLICY_V1) > 16384
+  )
+    return undefined;
   try {
     const launch = Schema.decodeUnknownSync(Schema.fromJsonString(WorkerPolicyLaunch))(
-      environment.CODEX_WORKER_POLICY_V1, { onExcessProperty: "error" },
+      environment.CODEX_WORKER_POLICY_V1,
+      { onExcessProperty: "error" },
     );
-    if (Object.values(launch).some((value) => typeof value === "string" && (
-      /[\u0000-\u001f\u007f]/.test(value) || Array.from(value).some((character) => {
-        const point = character.codePointAt(0)!;
-        return point >= 0xd800 && point <= 0xdfff;
-      })
-    ))) return undefined;
+    if (
+      Object.values(launch).some(
+        (value) =>
+          typeof value === "string" &&
+          (/[\u0000-\u001f\u007f]/.test(value) ||
+            Array.from(value).some((character) => {
+              const point = character.codePointAt(0)!;
+              return point >= 0xd800 && point <= 0xdfff;
+            })),
+      )
+    )
+      return undefined;
     return launch;
-  } catch { return undefined; }
+  } catch {
+    return undefined;
+  }
 }

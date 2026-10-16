@@ -24,7 +24,10 @@ const failure = (code: string, message: string) => ({
 // The socket directory is provisioned by the host, outside the writable checkout.
 // Unix owner permissions limit exposure; signed host requests authorize access.
 // No HTTP routes or T3 pairing scopes are widened by this opt-in transport.
-export async function listenSiftSocket(path: string, handle: (input: unknown, signal: AbortSignal) => Promise<unknown>) {
+export async function listenSiftSocket(
+  path: string,
+  handle: (input: unknown, signal: AbortSignal) => Promise<unknown>,
+) {
   if (!NodePath.isAbsolute(path) || Buffer.byteLength(path) > 100)
     throw new Error("Invalid Sift socket path.");
   const directory = await NodeFSP.lstat(NodePath.dirname(path));
@@ -67,7 +70,10 @@ export async function listenSiftSocket(path: string, handle: (input: unknown, si
     sockets.add(socket);
     socket.on("error", () => socket.destroy());
     const controller = new AbortController();
-    socket.on("close", () => { sockets.delete(socket); controller.abort(); });
+    socket.on("close", () => {
+      sockets.delete(socket);
+      controller.abort();
+    });
     // A client that half-closes its request must not leave preflight running.
     socket.on("end", () => controller.abort());
     socket.setTimeout(30_000, () => socket.destroy());
@@ -112,8 +118,13 @@ export async function listenSiftSocket(path: string, handle: (input: unknown, si
       // Only the new signed bootstrap envelope gets additional framing room.
       // Authentication still precedes execution; ordinary raw byte budgets do
       // not grow (including whitespace and escaped JSON representation).
-      const bootstrap = parsed !== null && typeof parsed === "object" && "request" in parsed &&
-        parsed.request !== null && typeof parsed.request === "object" && "operation" in parsed.request &&
+      const bootstrap =
+        parsed !== null &&
+        typeof parsed === "object" &&
+        "request" in parsed &&
+        parsed.request !== null &&
+        typeof parsed.request === "object" &&
+        "operation" in parsed.request &&
         parsed.request.operation === "workerPolicy/bootstrap";
       if (!bootstrap && input.length > SIFT_BRIDGE_MAX_REQUEST_BYTES) {
         reply(failure("REQUEST_TOO_LARGE", "Request exceeded its bound."));
@@ -164,8 +175,16 @@ export const listenEffectSiftSocket = <E>(
       }),
       // Cancellation changes only the new read/preparation flow. Existing
       // effectful commands keep their durable lost-response reconciliation.
-      { signal: request !== null && typeof request === "object" && "operation" in request &&
-          (request.operation === "workerPolicy/read" || request.operation === "workerPolicy/bootstrap") ? signal : undefined },
+      {
+        signal:
+          request !== null &&
+          typeof request === "object" &&
+          "operation" in request &&
+          (request.operation === "workerPolicy/read" ||
+            request.operation === "workerPolicy/bootstrap")
+            ? signal
+            : undefined,
+      },
     );
   });
 

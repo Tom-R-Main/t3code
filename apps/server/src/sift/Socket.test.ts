@@ -24,10 +24,19 @@ it("retains ordinary raw byte limits while allowing only bootstrap envelope fram
   const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-socket-bootstrap-"));
   const socketPath = NodePath.join(directory, "bridge.sock");
   let calls = 0;
-  const close = await listenSiftSocket(socketPath, async () => { calls++; return { ok: true }; });
+  const close = await listenSiftSocket(socketPath, async () => {
+    calls++;
+    return { ok: true };
+  });
   const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
-  const decode = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Struct({ ok: Schema.optional(Schema.Boolean),
-    error: Schema.optional(Schema.Struct({ code: Schema.String })) })));
+  const decode = Schema.decodeUnknownSync(
+    Schema.fromJsonString(
+      Schema.Struct({
+        ok: Schema.optional(Schema.Boolean),
+        error: Schema.optional(Schema.Struct({ code: Schema.String })),
+      }),
+    ),
+  );
   try {
     const padding = " ".repeat(SIFT_BRIDGE_MAX_REQUEST_BYTES);
     const ordinary = `${encode({ request: { operation: "workerPolicy/read" } })}${padding}\n`;
@@ -91,11 +100,24 @@ it("interrupts an in-flight handler when its private client disconnects", async 
   const socketPath = NodePath.join(directory, "bridge.sock");
   let started!: () => void;
   let cancelled!: () => void;
-  const entered = new Promise<void>((resolve) => { started = resolve; });
-  const aborted = new Promise<void>((resolve) => { cancelled = resolve; });
+  const entered = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const aborted = new Promise<void>((resolve) => {
+    cancelled = resolve;
+  });
   const close = await listenSiftSocket(socketPath, async (_input, signal) => {
     started();
-    await new Promise<void>((resolve) => signal.addEventListener("abort", () => { cancelled(); resolve(); }, { once: true }));
+    await new Promise<void>((resolve) =>
+      signal.addEventListener(
+        "abort",
+        () => {
+          cancelled();
+          resolve();
+        },
+        { once: true },
+      ),
+    );
     return { ok: true };
   });
   const socket = NodeNet.createConnection(socketPath);

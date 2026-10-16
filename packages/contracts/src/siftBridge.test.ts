@@ -37,8 +37,14 @@ describe("Sift guarded decision wire", () => {
 });
 
 it("carries bounded worker-policy requests without granting a turn operation", () => {
-  const input = { id: "preflight", binding: base.binding, operation: "workerPolicy/read",
-    threadId: "bound-thread", challenge: "challenge", prepare: true };
+  const input = {
+    id: "preflight",
+    binding: base.binding,
+    operation: "workerPolicy/read",
+    threadId: "bound-thread",
+    challenge: "challenge",
+    prepare: true,
+  };
   expect(decode(input)).toEqual(input);
   expect(() => decode({ ...input, challenge: "" })).toThrow();
   expect(() => decode({ ...input, challenge: "x".repeat(257) })).toThrow();
@@ -46,8 +52,16 @@ it("carries bounded worker-policy requests without granting a turn operation", (
 });
 
 it("requires the complete private bootstrap materialization and rejects ordinary command fields", () => {
-  const input = { id: "bootstrap", binding: base.binding, operation: "workerPolicy/bootstrap", threadId: "bound-thread" };
-  for (const changed of [input, { ...input, materialization: {} },
-    { ...input, operation: "workerPolicy/read", challenge: "fresh", materialization: {} }])
+  const input = {
+    id: "bootstrap",
+    binding: base.binding,
+    operation: "workerPolicy/bootstrap",
+    threadId: "bound-thread",
+  };
+  for (const changed of [
+    input,
+    { ...input, materialization: {} },
+    { ...input, operation: "workerPolicy/read", challenge: "fresh", materialization: {} },
+  ])
     expect(() => decode(changed, { onExcessProperty: "error" })).toThrow();
 });

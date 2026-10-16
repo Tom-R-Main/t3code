@@ -81,7 +81,8 @@ const program = Effect.gen(function* () {
     }
     const result = yield* harness.siftBridge(request, authorize);
     if (request.operation === "bind" && result.ok) {
-      if (!("threadId" in result.result)) throw new Error("Binding response is missing its thread identity.");
+      if (!("threadId" in result.result))
+        throw new Error("Binding response is missing its thread identity.");
       threadId = ThreadId.make(result.result.threadId);
     }
     return result;

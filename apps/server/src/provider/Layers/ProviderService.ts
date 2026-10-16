@@ -949,8 +949,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       // earlier start or recovery left for this thread and issue nothing, so no
       // adapter registers the server or receives its bearer token.
       const environment = options?.environment ?? process.env;
-      if (isManagedAccessEnabled(environment) || environment.CODEX_RESTRICTED_WORKER === "1" ||
-        environment.CODEX_WORKER_POLICY_V1 !== undefined) {
+      if (
+        isManagedAccessEnabled(environment) ||
+        environment.CODEX_RESTRICTED_WORKER === "1" ||
+        environment.CODEX_WORKER_POLICY_V1 !== undefined
+      ) {
         yield* clearMcpSession(threadId);
         return undefined;
       }
@@ -1970,19 +1973,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
-  const readWorkerPolicy: NonNullable<ProviderServiceMethod<"readWorkerPolicy">> = Effect.fn("readWorkerPolicy")(
-    function* (threadId, challenge, prepare) {
-      const routed = yield* resolveRoutableSession({
-        threadId, operation: "ProviderService.readWorkerPolicy", allowRecovery: false,
+  const readWorkerPolicy: NonNullable<ProviderServiceMethod<"readWorkerPolicy">> = Effect.fn(
+    "readWorkerPolicy",
+  )(function* (threadId, challenge, prepare) {
+    const routed = yield* resolveRoutableSession({
+      threadId,
+      operation: "ProviderService.readWorkerPolicy",
+      allowRecovery: false,
+    });
+    if (!routed.isActive || routed.adapter.provider !== "codex" || !routed.adapter.readWorkerPolicy)
+      return yield* new ProviderValidationError({
+        operation: "ProviderService.readWorkerPolicy",
+        issue: "An already-loaded Codex session with worker-policy support is required.",
       });
-      if (!routed.isActive || routed.adapter.provider !== "codex" || !routed.adapter.readWorkerPolicy)
-        return yield* new ProviderValidationError({
-          operation: "ProviderService.readWorkerPolicy",
-          issue: "An already-loaded Codex session with worker-policy support is required.",
-        });
-      return yield* routed.adapter.readWorkerPolicy(routed.threadId, challenge, prepare);
-    },
-  );
+    return yield* routed.adapter.readWorkerPolicy(routed.threadId, challenge, prepare);
+  });
 
   const respondToRequest: ProviderServiceMethod<"respondToRequest"> = Effect.fn("respondToRequest")(
     function* (rawInput) {

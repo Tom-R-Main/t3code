@@ -100,7 +100,10 @@ export interface ProviderServiceShape {
     threadId: ThreadId,
     challenge: string,
     prepare: boolean,
-  ) => Effect.Effect<{ readonly attestation: unknown; readonly providerThreadId: string }, ProviderServiceError>;
+  ) => Effect.Effect<
+    { readonly attestation: unknown; readonly providerThreadId: string },
+    ProviderServiceError
+  >;
 
   /** Read capabilities for the adapter bound to a configured provider instance. */
   readonly getCapabilities: (

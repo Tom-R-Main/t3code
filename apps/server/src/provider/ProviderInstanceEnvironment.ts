@@ -14,8 +14,11 @@ export function mergeProviderInstanceEnvironment(
   for (const variable of environment) {
     // A restricted worker's immutable launcher policy cannot be replaced or
     // disabled by mutable provider settings (including an empty-string value).
-    if ((baseEnv.CODEX_RESTRICTED_WORKER === "1" || baseEnv.CODEX_WORKER_POLICY_V1 !== undefined) &&
-      (variable.name === "CODEX_RESTRICTED_WORKER" || variable.name === "CODEX_WORKER_POLICY_V1")) continue;
+    if (
+      (baseEnv.CODEX_RESTRICTED_WORKER === "1" || baseEnv.CODEX_WORKER_POLICY_V1 !== undefined) &&
+      (variable.name === "CODEX_RESTRICTED_WORKER" || variable.name === "CODEX_WORKER_POLICY_V1")
+    )
+      continue;
     // Child processes do not apply shell expansion to environment values.
     next[variable.name] =
       variable.name === "CODEX_HOME" || variable.name === "CLAUDE_CONFIG_DIR"
