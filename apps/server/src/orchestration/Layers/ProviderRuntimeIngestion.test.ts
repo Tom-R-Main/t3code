@@ -535,6 +535,90 @@ describe("ProviderRuntimeIngestion", () => {
     ]);
   });
 
+  // Codex reports an interrupt as turn/completed with an "interrupted" status,
+  // not as an aborted turn. The session and the latest turn must still say so,
+  // and a blocking question the turn left open is dismissed.
+  it.each(["interrupted", "cancelled"] as const)(
+    "records a Codex turn completed as %s as an interrupted turn",
+    async (state) => {
+      const harness = await createHarness();
+      const threadId = asThreadId("thread-1");
+      const turnId = asTurnId(`codex-${state}-turn`);
+      const base = { provider: ProviderDriverKind.make("codex"), threadId, turnId };
+      harness.emit({
+        ...base,
+        type: "turn.started",
+        eventId: asEventId(`codex-${state}-started`),
+        createdAt: "2026-01-01T00:00:01.000Z",
+      });
+      harness.emit({
+        ...base,
+        type: "user-input.requested",
+        eventId: asEventId(`codex-${state}-question`),
+        requestId: RuntimeRequestId.make(`codex-${state}-question`),
+        createdAt: "2026-01-01T00:00:01.500Z",
+        payload: {
+          questions: [
+            {
+              id: "choice",
+              header: "Choice",
+              question: "Pick one",
+              options: [{ label: "A", description: "Option A" }],
+            },
+          ],
+        },
+      });
+      harness.emit({
+        ...base,
+        type: "turn.completed",
+        eventId: asEventId(`codex-${state}-completed`),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        payload: { state },
+      });
+
+      await harness.drain();
+      const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+      expect(thread?.session).toMatchObject({
+        status: "interrupted",
+        activeTurnId: null,
+        lastError: null,
+      });
+      expect(thread?.latestTurn).toMatchObject({ turnId, state: "interrupted" });
+      expect(
+        thread?.activities.filter(
+          (activity) =>
+            activity.kind === "user-input.resolved" &&
+            (activity.payload as { requestId?: string }).requestId === `codex-${state}-question`,
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("keeps a Codex turn completed normally as ready and completed", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("codex-completed-turn");
+    const base = { provider: ProviderDriverKind.make("codex"), threadId, turnId };
+    harness.emit({
+      ...base,
+      type: "turn.started",
+      eventId: asEventId("codex-completed-started"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    harness.emit({
+      ...base,
+      type: "turn.completed",
+      eventId: asEventId("codex-completed-completed"),
+      createdAt: "2026-01-01T00:00:02.000Z",
+      payload: { state: "completed" },
+    });
+
+    await harness.drain();
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.session).toMatchObject({ status: "ready", activeTurnId: null });
+    expect(thread?.latestTurn).toMatchObject({ turnId, state: "completed" });
+  });
+
   it.each(["turn.completed", "turn.aborted"] as const)(
     "finalizes old buffered text on late %s without stopping the newer turn",
     async (terminalType) => {

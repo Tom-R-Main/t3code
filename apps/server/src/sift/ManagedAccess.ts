@@ -41,6 +41,22 @@ export const isManagedAccessEnabled = (env: NodeJS.ProcessEnv = process.env): bo
   env[MANAGED_ACCESS_ENV] === "1";
 
 /**
+ * Host attestation for a managed resume. The Sift host daemon sets it when it
+ * launches this T3 server after stopping the previous one for the same runtime:
+ * the value is the decimal process-group id of the previous T3 server, and it
+ * may be set only after the host confirmed that no process descended from that
+ * server remains, including commands in their own session or process group
+ * (for example under a PTY); an empty process group alone is not sufficient. Background terminals live in the app-server's memory, so nothing in
+ * the provider protocol can reveal processes the previous app-server left.
+ * Unset or malformed, a managed resume stays refused until Stop.
+ */
+export const PRIOR_PROCESS_TREE_TERMINATED_ENV = "T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED";
+export const priorProcessTreeTerminated = (env: NodeJS.ProcessEnv = process.env): boolean => {
+  const value = env[PRIOR_PROCESS_TREE_TERMINATED_ENV];
+  return value !== undefined && /^[1-9][0-9]{0,9}$/.test(value) && Number(value) <= 2_147_483_647;
+};
+
+/**
  * Variables that make git operate on a repository, work tree, index, or object
  * store other than the one found from `cwd`. T3's VCS and review services
  * inherit the server environment, so any of these would let the containment
