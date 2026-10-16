@@ -47,6 +47,8 @@ import {
   type CodexThreadSnapshot,
 } from "./CodexSessionRuntime.ts";
 import { makeCodexAdapter } from "./CodexAdapter.ts";
+import { prepareWorkerBootstrap, WorkerBootstrap } from "../../sift/WorkerBootstrap.ts";
+import { workerBootstrapFixture } from "../testUtils/workerBootstrapFixture.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 // Test-local service tag so the rest of the file can keep using `yield* CodexAdapter`.
@@ -231,6 +233,54 @@ const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory
 });
 
 const validationRuntimeFactory = makeRuntimeFactory();
+it.effect("refuses UI/recovery restricted starts before stopping an existing trusted session", () =>
+  Effect.gen(function* () {
+    const fixture = workerBootstrapFixture(process.cwd());
+    const runtimeFactory = makeRuntimeFactory();
+    const adapter = yield* makeCodexAdapter(
+      decodeCodexSettings({ binaryPath: "/opt/sift/codex" }),
+      {
+        environment: fixture.environment,
+        makeRuntime: runtimeFactory.factory,
+      },
+    );
+    const input = {
+      ...fixture.target,
+      modelSelection: {
+        instanceId: fixture.target.providerInstanceId,
+        model: fixture.target.model,
+      },
+      runtimeMode: "approval-required" as const,
+    };
+    const denied = yield* Effect.flip(adapter.startSession(input));
+    NodeAssert.equal(denied._tag, "ProviderAdapterValidationError");
+    NodeAssert.equal(runtimeFactory.factory.mock.calls.length, 0);
+    const prepared = yield* prepareWorkerBootstrap(
+      fixture.materialization,
+      fixture.target,
+      fixture.environment,
+    );
+    yield* Effect.addFinalizer(() => Effect.sync(prepared.dispose));
+    yield* adapter
+      .startSession(input)
+      .pipe(Effect.provideService(WorkerBootstrap, prepared.capability));
+    const existing = runtimeFactory.lastRuntime;
+    NodeAssert.ok(existing);
+    NodeAssert.equal(
+      (yield* Effect.flip(adapter.startSession(input)))._tag,
+      "ProviderAdapterValidationError",
+    );
+    NodeAssert.equal(runtimeFactory.factory.mock.calls.length, 1);
+    NodeAssert.equal(existing.closeImpl.mock.calls.length, 0);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  ),
+);
 const validationLayer = it.layer(
   Layer.effect(
     CodexAdapter,

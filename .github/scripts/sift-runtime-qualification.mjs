@@ -114,9 +114,12 @@ try {
         ...(process.env.GITHUB_REF_NAME === branches[1]
           ? [
               "src/sift/WorkerPolicy.test.ts",
+              "src/sift/WorkerBootstrap.test.ts",
               "src/sift/Socket.test.ts",
               "src/provider/ProviderInstanceEnvironment.test.ts",
               "src/provider/Layers/CodexWorkerPolicy.peer.test.ts",
+              "src/provider/Layers/CodexAdapter.test.ts",
+              "src/provider/Layers/ProviderService.test.ts",
             ]
           : []),
       ],

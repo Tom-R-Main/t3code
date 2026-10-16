@@ -29,6 +29,8 @@
         "integration/siftBridge.fixture.ts",
         // Approval tests spawn this protocol peer by pathname.
         "src/provider/testUtils/codexApprovalDecisionPeer.ts",
+        // Worker-policy tests spawn this FD3/protocol peer by pathname.
+        "src/provider/testUtils/codexWorkerPolicyPeer.ts",
       ],
       // Keep the transitive Effect runtime pinned for standalone npm installs.
       // The Vite+ web build prerequisite.

@@ -86,6 +86,7 @@ import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { isManagedAccessEnabled } from "../../sift/ManagedAccess.ts";
+import { WorkerBootstrap } from "../../sift/WorkerBootstrap.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 const isModelSelection = Schema.is(ModelSelection);
 const encodePromptJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -948,7 +949,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       // Fork: a Sift managed worker gets no t3-code MCP authority. Clear what an
       // earlier start or recovery left for this thread and issue nothing, so no
       // adapter registers the server or receives its bearer token.
-      if (isManagedAccessEnabled(options?.environment ?? process.env)) {
+      const environment = options?.environment ?? process.env;
+      if (
+        isManagedAccessEnabled(environment) ||
+        environment.CODEX_RESTRICTED_WORKER === "1" ||
+        environment.CODEX_WORKER_POLICY_V1 !== undefined
+      ) {
         yield* clearMcpSession(threadId);
         return undefined;
       }
@@ -1449,8 +1455,40 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             `Provider instance '${resolvedInstanceId}' is disabled in T3 Code settings.`,
           );
         }
+        const bootstrap = yield* Effect.serviceOption(WorkerBootstrap);
+        const freshBootstrap = Option.isSome(bootstrap);
+        if (Option.isSome(bootstrap)) {
+          const unavailable = () =>
+            toValidationError(
+              "ProviderService.startSession",
+              "Restricted worker bootstrap unavailable.",
+            );
+          if (
+            resolvedProvider !== "codex" ||
+            input.resumeCursor !== undefined ||
+            input.cwd === undefined ||
+            input.modelSelection?.instanceId !== resolvedInstanceId ||
+            input.runtimeMode !== "approval-required"
+          )
+            return yield* unavailable();
+          // This capability exists only during the authenticated private start.
+          // Validate its complete sealed target before ignoring any retained
+          // native cursor. Ordinary starts keep their persisted resume behavior.
+          yield* bootstrap.value
+            .assertTarget(
+              {
+                threadId,
+                providerInstanceId: resolvedInstanceId,
+                cwd: input.cwd,
+                model: input.modelSelection.model,
+              },
+              options?.environment ?? process.env,
+            )
+            .pipe(Effect.mapError(unavailable));
+        }
         const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(threadId));
         if (
+          !freshBootstrap &&
           persistedBinding?.provider === resolvedProvider &&
           persistedBinding.providerInstanceId !== resolvedInstanceId &&
           (input.resumeCursor != null || persistedBinding.resumeCursor != null)
@@ -1470,11 +1508,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             );
           }
         }
-        const effectiveResumeCursor =
-          input.resumeCursor ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
-            ? persistedBinding.resumeCursor
-            : undefined);
+        const effectiveResumeCursor = freshBootstrap
+          ? undefined
+          : (input.resumeCursor ??
+            (persistedBinding?.providerInstanceId === resolvedInstanceId
+              ? persistedBinding.resumeCursor
+              : undefined));
         const effectiveCwd =
           input.cwd ??
           (persistedBinding?.providerInstanceId === resolvedInstanceId
@@ -1968,6 +2007,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const readWorkerPolicy: NonNullable<ProviderServiceMethod<"readWorkerPolicy">> = Effect.fn(
+    "readWorkerPolicy",
+  )(function* (threadId, challenge, prepare) {
+    const routed = yield* resolveRoutableSession({
+      threadId,
+      operation: "ProviderService.readWorkerPolicy",
+      allowRecovery: false,
+    });
+    if (!routed.isActive || routed.adapter.provider !== "codex" || !routed.adapter.readWorkerPolicy)
+      return yield* new ProviderValidationError({
+        operation: "ProviderService.readWorkerPolicy",
+        issue: "An already-loaded Codex session with worker-policy support is required.",
+      });
+    return yield* routed.adapter.readWorkerPolicy(routed.threadId, challenge, prepare);
+  });
+
   const respondToRequest: ProviderServiceMethod<"respondToRequest"> = Effect.fn("respondToRequest")(
     function* (rawInput) {
       const input = yield* decodeInputOrValidationError({
@@ -2430,6 +2485,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     compactThread,
     interruptTurn,
     respondToRequest,
+    readWorkerPolicy,
     respondToUserInput,
     stopSession,
     listSessions,

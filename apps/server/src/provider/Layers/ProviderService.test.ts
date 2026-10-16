@@ -57,6 +57,7 @@ import * as NetAddress from "effect/unstable/net/NetAddress";
 
 import {
   ProviderAdapterRequestError,
+  ProviderAdapterValidationError,
   ProviderAdapterSessionNotFoundError,
   ProviderUnsupportedError,
   ProviderValidationError,
@@ -84,6 +85,8 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { prepareWorkerBootstrap, WorkerBootstrap } from "../../sift/WorkerBootstrap.ts";
+import { workerBootstrapFixture } from "../testUtils/workerBootstrapFixture.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -1550,6 +1553,148 @@ it.effect(
 
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "ProviderServiceLive starts a fresh private native thread after retained SQLite restart without resuming the old cursor",
+  () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-private-bootstrap-restart-")),
+        ),
+        (directory) =>
+          Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true })),
+      );
+      const cwd = NodeFS.realpathSync(tempDir);
+      const fixture = workerBootstrapFixture(cwd);
+      const threadId = fixture.target.threadId;
+      const persistence = makeSqlitePersistenceLive(NodePath.join(cwd, "runtime.sqlite"));
+      const repository = ProviderSessionRuntime.layer.pipe(Layer.provide(persistence));
+      const directory = ProviderSessionDirectoryLive.pipe(Layer.provide(repository));
+      const providerLayer = (
+        adapter: ProviderAdapterShape<ProviderAdapterError>,
+        environment: NodeJS.ProcessEnv,
+      ) =>
+        makeProviderServiceLive({ environment }).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(
+                ProviderAdapterRegistry.ProviderAdapterRegistry,
+                makeStaticInstanceRegistry([[codexInstanceId, adapter]]),
+              ),
+              directory,
+              defaultServerSettingsLayer,
+              serverConfigTestLayer,
+              AnalyticsService.layerTest,
+              Layer.succeed(
+                ProviderEventLoggers.ProviderEventLoggers,
+                ProviderEventLoggers.NoOpProviderEventLoggers,
+              ),
+            ).pipe(Layer.provideMerge(NodeServices.layer)),
+          ),
+        );
+      const input = {
+        threadId,
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        cwd,
+        runtimeMode: "approval-required" as const,
+        modelSelection: { instanceId: codexInstanceId, model: fixture.target.model },
+      };
+      const original = makeFakeCodexAdapter();
+      yield* Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        yield* service.startSession(threadId, input);
+      }).pipe(Effect.provide(providerLayer(original.adapter, {})));
+      const retained = yield* Effect.gen(function* () {
+        const service = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        return yield* service.getBinding(threadId);
+      }).pipe(Effect.provide(directory));
+      if (Option.isNone(retained)) throw new Error("Retained provider binding missing.");
+      const retainedCursor = retained.value.resumeCursor;
+      assert.deepEqual(retainedCursor, { opaque: `resume-${threadId}` });
+
+      const restarted = makeFakeCodexAdapter();
+      const freshCursor = { nativeThread: "fresh-provider-thread" };
+      const restricted: ProviderAdapterShape<ProviderAdapterError> = {
+        ...restarted.adapter,
+        startSession: (request) =>
+          Effect.gen(function* () {
+            const bootstrap = yield* Effect.serviceOption(WorkerBootstrap);
+            if (Option.isNone(bootstrap) || request.resumeCursor !== undefined) {
+              return yield* new ProviderAdapterValidationError({
+                provider: CODEX_DRIVER,
+                operation: "startSession",
+                issue: "Fresh private capability without native resume required.",
+              });
+            }
+            const bytes = yield* bootstrap.value
+              .consume({
+                ...fixture.target,
+                threadId: request.threadId,
+                cwd: request.cwd ?? "",
+                model: request.modelSelection?.model ?? "",
+                binaryPath: "/opt/sift/codex",
+                homePath: undefined,
+                environment: fixture.environment,
+                launchArgs: undefined,
+                appServerArgs: undefined,
+                hasResumeCursor: false,
+              })
+              .pipe(
+                Effect.mapError(
+                  () =>
+                    new ProviderAdapterValidationError({
+                      provider: CODEX_DRIVER,
+                      operation: "startSession",
+                      issue: "Invalid private capability.",
+                    }),
+                ),
+              );
+            bytes.fill(0);
+            const session = yield* restarted.startSession(request);
+            restarted.updateSession(threadId, (value) => ({ ...value, resumeCursor: freshCursor }));
+            return { ...session, resumeCursor: freshCursor };
+          }),
+      };
+      const prepared = yield* prepareWorkerBootstrap(
+        fixture.materialization,
+        fixture.target,
+        fixture.environment,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(prepared.dispose));
+      yield* Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        for (const changed of [
+          { ...input, resumeCursor: retainedCursor },
+          { ...input, cwd: NodePath.dirname(cwd) },
+          { ...input, modelSelection: { ...input.modelSelection, model: "other" } },
+        ]) {
+          const refused = yield* service.startSession(threadId, changed).pipe(Effect.flip);
+          assert.equal(refused._tag, "ProviderValidationError");
+        }
+        assert.equal(restarted.startSession.mock.calls.length, 0);
+        const session = yield* service.startSession(threadId, input);
+        assert.deepEqual(session.resumeCursor, freshCursor);
+        assert.equal(restarted.startSession.mock.calls.length, 1);
+        assert.equal(restarted.startSession.mock.calls[0]?.[0].resumeCursor, undefined);
+        const reused = yield* service.startSession(threadId, input).pipe(Effect.flip);
+        assert.equal(reused._tag, "ProviderValidationError");
+        assert.equal(restarted.startSession.mock.calls.length, 1);
+      }).pipe(
+        Effect.provideService(WorkerBootstrap, prepared.capability),
+        Effect.provide(providerLayer(restricted, fixture.environment)),
+      );
+
+      const ordinary = makeFakeCodexAdapter();
+      yield* Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        yield* service.startSession(threadId, input);
+      }).pipe(Effect.provide(providerLayer(ordinary.adapter, {})));
+      assert.equal(ordinary.startSession.mock.calls.length, 1);
+      assert.deepEqual(ordinary.startSession.mock.calls[0]?.[0].resumeCursor, freshCursor);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {

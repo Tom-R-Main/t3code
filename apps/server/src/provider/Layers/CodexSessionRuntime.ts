@@ -59,6 +59,8 @@ import {
 } from "./CodexManagedInterrupt.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
+import { isWorkerPolicyChallenge, readWorkerPolicyLaunch } from "../../sift/WorkerPolicy.ts";
+import { WorkerBootstrap } from "../../sift/WorkerBootstrap.ts";
 import {
   buildCodexDeveloperInstructions,
   type T3CodeToolAvailability,
@@ -254,6 +256,13 @@ export interface CodexThreadSnapshot {
 }
 
 export interface CodexSessionRuntimeShape {
+  readonly readWorkerPolicy?: (
+    challenge: string,
+    prepare: boolean,
+  ) => Effect.Effect<
+    { readonly attestation: unknown; readonly providerThreadId: string },
+    CodexSessionRuntimeError
+  >;
   readonly start: () => Effect.Effect<ProviderSession, CodexSessionRuntimeError>;
   readonly getSession: Effect.Effect<ProviderSession>;
   readonly sendTurn: (
@@ -1380,7 +1389,7 @@ export const makeCodexSessionRuntime = (
     // `child_process.spawn`; `expandHomePath` lets a configured
     // `CODEX_HOME=~/.codex_work` reach codex as an absolute path.
     const resolvedHomePath = options.homePath ? expandHomePath(options.homePath) : undefined;
-    const env = {
+    const env: NodeJS.ProcessEnv = {
       ...options.environment,
       ...(resolvedHomePath ? { CODEX_HOME: resolvedHomePath } : {}),
     };
@@ -1390,6 +1399,41 @@ export const makeCodexSessionRuntime = (
       env,
       extendEnv,
     });
+    const restricted =
+      env.CODEX_RESTRICTED_WORKER === "1" || env.CODEX_WORKER_POLICY_V1 !== undefined;
+    const bootstrap = yield* Effect.serviceOption(WorkerBootstrap);
+    const bootstrapFailure = () =>
+      new CodexErrors.CodexAppServerSpawnError({
+        command: "restricted app-server",
+        cause: new Error("Restricted worker bootstrap unavailable."),
+      });
+    let bootstrapBytes: Uint8Array | undefined;
+    if (restricted) {
+      if (
+        Option.isNone(bootstrap) ||
+        !options.providerInstanceId ||
+        !options.model ||
+        options.runtimeMode !== "approval-required" ||
+        options.serviceTier !== undefined ||
+        spawnCommand.shell ||
+        spawnCommand.command !== options.binaryPath
+      )
+        return yield* bootstrapFailure();
+      bootstrapBytes = yield* bootstrap.value
+        .consume({
+          threadId: options.threadId,
+          providerInstanceId: options.providerInstanceId,
+          cwd: options.cwd,
+          model: options.model,
+          binaryPath: options.binaryPath,
+          homePath: resolvedHomePath,
+          environment: env,
+          launchArgs: options.launchArgs,
+          appServerArgs: options.appServerArgs,
+          hasResumeCursor: options.resumeCursor !== undefined,
+        })
+        .pipe(Effect.mapError(bootstrapFailure));
+    }
     const child = yield* spawner
       .spawn(
         ChildProcess.make(spawnCommand.command, spawnCommand.args, {
@@ -1398,6 +1442,7 @@ export const makeCodexSessionRuntime = (
           extendEnv,
           forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER,
           shell: spawnCommand.shell,
+          ...(restricted ? { additionalFds: { fd3: { type: "input" as const } } } : {}),
         }),
       )
       .pipe(
@@ -1409,7 +1454,30 @@ export const makeCodexSessionRuntime = (
               cause,
             }),
         ),
+        Effect.onError(() => Effect.sync(() => bootstrapBytes?.fill(0))),
       );
+
+    if (bootstrapBytes) {
+      // The pinned Node sink ends FD3 on upstream completion. Await write + EOF
+      // before creating a client/issuing initialize. No byte enters stdio/logs.
+      const bytes = bootstrapBytes;
+      yield* Effect.suspend(() => Stream.run(Stream.make(bytes), child.getInputFd(3))).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit)
+            ? Effect.void
+            : Effect.suspend(() => child.kill({ killSignal: "SIGKILL" })).pipe(
+                Effect.andThen(child.exitCode),
+                Effect.timeout("3 seconds"),
+                Effect.ignoreCause,
+                Effect.uninterruptible,
+              ),
+        ),
+        Effect.ensuring(Effect.sync(() => bytes.fill(0))),
+        Effect.catchCause(() => bootstrapFailure()),
+      );
+      bootstrapBytes = undefined;
+    }
 
     const clientContext = yield* CodexClient.layerChildProcess(child).pipe(
       Layer.build,
@@ -2680,15 +2748,26 @@ export const makeCodexSessionRuntime = (
 
       const requestedModel = normalizeCodexModelSlug(options.model);
 
-      const opened = yield* openCodexThread({
-        client,
-        threadId: options.threadId,
-        runtimeMode: options.runtimeMode,
-        cwd: options.cwd,
-        requestedModel,
-        serviceTier: options.serviceTier,
-        resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
-      });
+      // A sealed worker loads cwd/model/permissions/reviewer from its native
+      // materialization. Even an ordinary "approval-required" identity override
+      // can conflict with that profile; no public settings are forwarded here.
+      const opened = yield* restricted
+        ? client.request("thread/start", {})
+        : openCodexThread({
+            client,
+            threadId: options.threadId,
+            runtimeMode: options.runtimeMode,
+            cwd: options.cwd,
+            requestedModel,
+            serviceTier: options.serviceTier,
+            resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
+          });
+      if (restricted && (opened.cwd !== options.cwd || opened.model !== options.model))
+        return yield* CodexErrors.CodexAppServerRequestError.internalError(
+          "Restricted worker returned a different sealed session identity.",
+          undefined,
+          { method: "thread/start" },
+        );
 
       const providerThreadId = opened.thread.id;
       // A resumed managed session has no ownership history. Processes left by the
@@ -2815,6 +2894,19 @@ export const makeCodexSessionRuntime = (
             );
           }
           const providerThreadId = yield* readProviderThreadId;
+          if (
+            restricted &&
+            (input.attachments?.length ||
+              (input.model !== undefined && input.model !== options.model) ||
+              input.serviceTier !== undefined ||
+              input.effort !== undefined ||
+              (input.interactionMode !== undefined && input.interactionMode !== "default"))
+          )
+            return yield* CodexErrors.CodexAppServerRequestError.internalError(
+              "Restricted worker turns accept text only with the sealed launch configuration.",
+              undefined,
+              { method: "turn/start" },
+            );
           if (hasConfiguredMcpServer(options.appServerArgs)) {
             yield* client.request("config/mcpServer/reload", undefined).pipe(
               Effect.catch((cause) =>
@@ -2824,26 +2916,31 @@ export const makeCodexSessionRuntime = (
               ),
             );
           }
-          const normalizedModel = normalizeCodexModelSlug(
-            input.model ?? (yield* Ref.get(sessionRef)).model,
-          );
-          const params = yield* buildTurnStartParams({
-            threadId: providerThreadId,
-            runtimeMode: options.runtimeMode,
-            ...(input.input ? { prompt: input.input } : {}),
-            ...(input.attachments ? { attachments: input.attachments } : {}),
-            ...(normalizedModel ? { model: normalizedModel } : {}),
-            ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
-            ...(input.effort ? { effort: input.effort } : {}),
-            ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
-            // Derived from the session's own credential rather than the
-            // setting, so the prompt describes the tools this turn actually
-            // has even if the setting changed after the session started.
-            browserToolsAvailable: configuredMcpToolAvailability(
-              options.appServerArgs,
-              options.mcpCapabilities,
-            ),
-          });
+          const normalizedModel = restricted
+            ? options.model
+            : normalizeCodexModelSlug(input.model ?? (yield* Ref.get(sessionRef)).model);
+          const params = restricted
+            ? ({
+                threadId: providerThreadId,
+                input: input.input ? [{ type: "text" as const, text: input.input }] : [],
+              } satisfies EffectCodexSchema.V2TurnStartParams)
+            : yield* buildTurnStartParams({
+                threadId: providerThreadId,
+                runtimeMode: options.runtimeMode,
+                ...(input.input ? { prompt: input.input } : {}),
+                ...(input.attachments ? { attachments: input.attachments } : {}),
+                ...(normalizedModel ? { model: normalizedModel } : {}),
+                ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
+                ...(input.effort ? { effort: input.effort } : {}),
+                ...(input.interactionMode ? { interactionMode: input.interactionMode } : {}),
+                // Derived from the session's own credential rather than the
+                // setting, so the prompt describes the tools this turn actually
+                // has even if the setting changed after the session started.
+                browserToolsAvailable: configuredMcpToolAvailability(
+                  options.appServerArgs,
+                  options.mcpCapabilities,
+                ),
+              });
           if (!managedAdmissionOpen() || admissionEpoch !== managedAdmissionEpoch) {
             return yield* CodexErrors.CodexAppServerRequestError.internalError(
               "Turn submission crossed a managed interruption; submit again after termination is confirmed.",
@@ -3265,6 +3362,35 @@ export const makeCodexSessionRuntime = (
             turnId: effectiveTurnId,
           });
         }),
+      readWorkerPolicy: (challenge, prepare) =>
+        Effect.gen(function* () {
+          if (
+            !isWorkerPolicyChallenge(challenge) ||
+            !readWorkerPolicyLaunch(env) ||
+            (yield* Ref.get(closedRef))
+          )
+            return yield* new CodexApprovalDecisionError({ code: "WORKER_POLICY_UNAVAILABLE" });
+          const providerThreadId = yield* readProviderThreadId;
+          const result = yield* client.raw.request("workerPolicy/read", {
+            threadId: providerThreadId,
+            challenge,
+            prepare,
+          });
+          if (!result || typeof result !== "object" || !("attestation" in result))
+            return yield* new CodexApprovalDecisionError({
+              code: "WORKER_POLICY_INVALID_RESPONSE",
+            });
+          // Raw attestation stays opaque: the controller independently verifies
+          // process/config/binding/registry. False coverage is never upgraded.
+          return { attestation: result.attestation, providerThreadId };
+        }).pipe(
+          Effect.timeout("15 seconds"),
+          Effect.mapError((cause) =>
+            Schema.is(CodexApprovalDecisionError)(cause)
+              ? cause
+              : new CodexApprovalDecisionError({ code: "WORKER_POLICY_UNAVAILABLE" }),
+          ),
+        ),
       readThread: Effect.gen(function* () {
         const providerThreadId = yield* readProviderThreadId;
         return yield* readCodexThread(client, providerThreadId);

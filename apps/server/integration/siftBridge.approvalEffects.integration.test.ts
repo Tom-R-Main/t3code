@@ -186,16 +186,22 @@ for (const { scenario, route } of guardedCases) {
                 })),
               );
         const first = yield* decide;
-        NodeAssert.equal(first.ok && first.result.state, "pending");
+        NodeAssert.equal(first.ok && "state" in first.result && first.result.state, "pending");
         yield* Deferred.await(entered);
         const pendingRetry = yield* decide;
-        NodeAssert.equal(pendingRetry.ok && pendingRetry.result.state, "pending");
+        NodeAssert.equal(
+          pendingRetry.ok && "state" in pendingRetry.result && pendingRetry.result.state,
+          "pending",
+        );
         NodeAssert.equal(responseCalls, 1);
         yield* Deferred.succeed(release, undefined);
         yield* harness.drainProviderCommands;
         const settled = yield* decide;
         if (scenario === "success" || scenario === "child-success") {
-          NodeAssert.equal(settled.ok && settled.result.state, "accepted");
+          NodeAssert.equal(
+            settled.ok && "state" in settled.result && settled.result.state,
+            "accepted",
+          );
           yield* waitForCompletedAssistantText(
             harness,
             scenario === "child-success"
@@ -399,7 +405,10 @@ for (const { scenario, route } of commandCases) {
         yield* harness.drainProviderCommands;
         const settled = yield* decide;
         if (scenario === "command-accept") {
-          NodeAssert.equal(settled.ok && settled.result.state, "accepted");
+          NodeAssert.equal(
+            settled.ok && "state" in settled.result && settled.result.state,
+            "accepted",
+          );
           // An accepted response alone is insufficient: wait for the independently
           // executed child command, then inspect its exclusive-create file effect.
           yield* waitForCompletedAssistantText(harness, "Fixture tool effect completed.");
@@ -431,7 +440,7 @@ for (const { scenario, route } of commandCases) {
         );
         if (scenario === "command-accept" && route === "bridge") {
           const stale = yield* harness.siftBridge({ ...request, commandId: "different-decision" });
-          NodeAssert.equal(stale.ok && stale.result.state, "failed");
+          NodeAssert.equal(stale.ok && "state" in stale.result && stale.result.state, "failed");
           NodeAssert.equal(
             responseCalls,
             1,

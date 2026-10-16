@@ -128,9 +128,14 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly hasSession: (threadId: ThreadId) => Effect.Effect<boolean>;
 
-  /**
-   * Read a provider thread snapshot.
-   */
+  /** Private signed-host inspection; no session creation or inference. */
+  readonly readWorkerPolicy?: (
+    threadId: ThreadId,
+    challenge: string,
+    prepare: boolean,
+  ) => Effect.Effect<{ readonly attestation: unknown; readonly providerThreadId: string }, TError>;
+
+  /** Read a provider thread snapshot. */
   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
 
   /**

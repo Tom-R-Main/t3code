@@ -2,6 +2,7 @@ import { ApprovalScope, DeclineFeedback } from "./approvalDecisionContext.ts";
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt } from "./baseSchemas.ts";
 import { ModelSelection, ProviderUserInputAnswers } from "./orchestration.ts";
+import { WorkerBootstrapMaterialization } from "./workerBootstrap.ts";
 
 const SIFT_MANAGED_ACCESS_MAX_TTL_SECONDS = 12 * 60 * 60;
 const Identifier = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128));
@@ -44,6 +45,20 @@ export const SiftBridgeRequest = Schema.Union([
     requestId: Identifier,
     answers: ProviderUserInputAnswers,
   }),
+  // Host-only process attestation: never starts or recovers a provider session.
+  Schema.Struct({
+    ...Base,
+    operation: Schema.Literal("workerPolicy/bootstrap"),
+    threadId: Identifier,
+    materialization: WorkerBootstrapMaterialization,
+  }),
+  Schema.Struct({
+    ...Base,
+    operation: Schema.Literal("workerPolicy/read"),
+    threadId: Identifier,
+    challenge: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+    prepare: Schema.optional(Schema.Boolean),
+  }),
   // Mints a one-time pairing credential for a T3 client limited to this attempt.
   // The server must run with T3_SIFT_MANAGED_ACCESS=1 or the bridge refuses.
   Schema.Struct({
@@ -64,4 +79,5 @@ export const SiftBridgeRequest = Schema.Union([
 ]);
 export type SiftBridgeRequest = typeof SiftBridgeRequest.Type;
 export const SIFT_BRIDGE_MAX_REQUEST_BYTES = 256 * 1024;
+export const SIFT_BRIDGE_MAX_BOOTSTRAP_ENVELOPE_BYTES = 512 * 1024;
 export const SIFT_BRIDGE_MAX_RESPONSE_BYTES = 512 * 1024;

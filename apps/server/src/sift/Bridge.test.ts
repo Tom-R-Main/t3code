@@ -9,15 +9,20 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
-import { CommandId, EventId, ThreadId } from "@t3tools/contracts";
+import { CommandId, EventId, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
 import { ServerConfig } from "../config.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { makeSiftBridge } from "./Bridge.ts";
+import { WorkerBootstrap, burnWorkerBootstrap } from "./WorkerBootstrap.ts";
+import { workerBootstrapFixture } from "../provider/testUtils/workerBootstrapFixture.ts";
 
 const testLayer = (directory: string) =>
   OrchestrationLayerLive.pipe(
@@ -27,6 +32,7 @@ const testLayer = (directory: string) =>
     Layer.provideMerge(ServerConfig.layerTest(directory, { prefix: "sift-bridge-test-" })),
     Layer.provideMerge(NodeServices.layer),
   );
+const encodeStateJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const binding = { runtimeId: "runtime-1", workItemId: "work-1", leaseGeneration: 1 };
 const request = { id: "request-1", binding };
 
@@ -193,8 +199,10 @@ it.effect(
           binding: { ...binding, leaseGeneration: 2 },
           expectedPreviousGeneration: 1,
         });
-        expect(advanced.ok && advanced.result.threadId).toBe(
-          first.accepted.ok && first.accepted.result.threadId,
+        expect(advanced.ok && "threadId" in advanced.result && advanced.result.threadId).toBe(
+          first.accepted.ok &&
+            "threadId" in first.accepted.result &&
+            first.accepted.result.threadId,
         );
         const old = yield* handle({ ...request, operation: "events", afterSequence: 0 });
         expect(!old.ok && old.error.code).toBe("BINDING_CONFLICT");
@@ -235,7 +243,7 @@ it.effect("bounds replay bytes without skipping an oversized event", () =>
         modelSelection: { instanceId: "codex", model: "gpt-5.4" },
         runtimeMode: "approval-required",
       });
-      if (!bound.ok) throw new Error("Binding failed.");
+      if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding failed.");
       const before = yield* engine.latestSequence;
       yield* engine.dispatch({
         type: "thread.activity.append",
@@ -274,7 +282,7 @@ it.effect("resolves each approval request once across clients and restarts", () 
         modelSelection: { instanceId: "codex", model: "gpt-5.4" },
         runtimeMode: "approval-required",
       });
-      if (!bound.ok) throw new Error("Binding failed.");
+      if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding failed.");
       const threadId = ThreadId.make(bound.result.threadId);
       const appendActivity = (id: string, kind: string, payload: Record<string, unknown>) =>
         engine.dispatch({
@@ -297,7 +305,7 @@ it.effect("resolves each approval request once across clients and restarts", () 
         handle({ ...request, operation: "approve", commandId, requestId, decision });
 
       const first = yield* approve("phone", "request-1", "accept");
-      expect(first.ok && first.result.state).toBe("accepted");
+      expect(first.ok && "state" in first.result && first.result.state).toBe("accepted");
       const second = yield* approve("browser", "request-1", "decline");
       expect(second.ok && second.result).toEqual({
         threadId,
@@ -404,7 +412,7 @@ it.effect(
           modelSelection: { instanceId: "codex", model: "gpt-5.4" },
           runtimeMode: "approval-required",
         });
-        if (!bound.ok) throw new Error("Binding failed");
+        if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding failed");
         yield* engine.dispatch({
           type: "thread.activity.append",
           commandId: CommandId.make("fault-approval"),
@@ -444,5 +452,223 @@ it.effect(
           events.result.events.some((event) => event.type === "thread.approval-response-requested"),
         ).toBe(false);
       }).pipe(Effect.provide(testLayer(directory)));
+    }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "forwards worker-policy inspection only to an exact ready assignment without dispatching a turn",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-worker-policy-")),
+        ),
+        (directory) =>
+          Effect.promise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
+      );
+      yield* Effect.gen(function* () {
+        const engine = yield* OrchestrationEngineService;
+        const calls: Array<{ threadId: string; challenge: string; prepare: boolean }> = [];
+        let expired = false;
+        const attestation = {
+          coverageComplete: false,
+          configSha256: null,
+          challenge: "fresh-challenge",
+        };
+        // The bridge reads only this optional private method. No startSession or
+        // sendTurn implementation exists, so an accidental inference call fails.
+        const inspection = {
+          readWorkerPolicy: (threadId: ThreadId, challenge: string, prepare: boolean) =>
+            Effect.sync(() => {
+              calls.push({ threadId, challenge, prepare });
+              if (challenge === "expire") expired = true;
+              return { attestation, providerThreadId: "native-bound-thread" };
+            }),
+        } satisfies Pick<ProviderService["Service"], "readWorkerPolicy">;
+        const handle = yield* makeSiftBridge.pipe(
+          Effect.provide(Layer.mock(ProviderService)(inspection)),
+        );
+        const unbound = yield* handle({
+          ...request,
+          operation: "workerPolicy/read",
+          threadId: "arbitrary",
+          challenge: "fresh-challenge",
+        });
+        expect(!unbound.ok && unbound.error.code).toBe("NOT_BOUND");
+        const bound = yield* handle({
+          ...request,
+          operation: "bind",
+          checkoutPath: directory,
+          modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+          runtimeMode: "approval-required",
+        });
+        if (!bound.ok || !("threadId" in bound.result)) throw new Error("Binding fixture failed");
+        const threadId = bound.result.threadId;
+        const beforeSequence = yield* engine.latestSequence;
+        const input = {
+          ...request,
+          operation: "workerPolicy/read",
+          threadId,
+          challenge: "fresh-challenge",
+          prepare: true,
+        };
+        for (const changed of [
+          { ...input, threadId: "arbitrary" },
+          { ...input, binding: { ...binding, workItemId: "other-work" } },
+          { ...input, challenge: "😀".repeat(65) },
+          { ...input, challenge: "line\nbreak" },
+        ])
+          expect((yield* handle(changed)).ok).toBe(false);
+        expect(calls).toEqual([]);
+        const response = yield* handle(input);
+        expect(response.ok && response.result).toEqual({
+          attestation,
+          providerThreadId: "native-bound-thread",
+        });
+        expect(calls).toEqual([{ threadId, challenge: "fresh-challenge", prepare: true }]);
+        expect(yield* engine.latestSequence).toBe(beforeSequence);
+        const expiredResponse = yield* handle({ ...input, challenge: "expire" }, () => {
+          if (expired) throw new Error("Expired host signature");
+        });
+        expect(!expiredResponse.ok && expiredResponse.error.code).toBe("AUTHORIZATION_FAILED");
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`UPDATE sift_bridge_binding SET ready_generation = 0 WHERE slot = 1`;
+        const notReady = yield* handle(input);
+        expect(!notReady.ok && notReady.error.code).toBe("WORKER_POLICY_BINDING_MISMATCH");
+        expect(calls).toHaveLength(2);
+        expect(yield* engine.latestSequence).toBe(beforeSequence);
+      }).pipe(Effect.provide(testLayer(directory)));
+    }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "starts a signed bound bootstrap without a turn or persisted payload and refuses retained-state replay",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.promise(() => NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "sift-bootstrap-"))),
+        (directory) =>
+          Effect.promise(() => NodeFSP.rm(directory, { recursive: true, force: true })),
+      );
+      const cwd = yield* Effect.promise(() => NodeFSP.realpath(directory));
+      const fixture = workerBootstrapFixture(cwd);
+      const keys = Object.keys(fixture.environment);
+      const previous = keys.map((key) => [key, process.env[key]] as const);
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Object.assign(process.env, fixture.environment)),
+        () =>
+          Effect.sync(() => {
+            for (const [key, value] of previous) {
+              if (value === undefined) delete process.env[key];
+              else process.env[key] = value;
+            }
+          }),
+      );
+      let calls = 0;
+      let threadId: ThreadId | undefined;
+      const bootstrapLayer = Layer.mock(ProviderService)({
+        startSession: (id, input) =>
+          Effect.gen(function* () {
+            calls++;
+            const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
+            if (Option.isNone(sql)) throw new Error("Fixture SQL missing");
+            const burned = yield* sql.value<{
+              count: number;
+            }>`SELECT count(*) AS count FROM sift_worker_consumed_launches`.pipe(Effect.orDie);
+            expect(burned[0]?.count).toBe(1);
+            const capability = yield* Effect.serviceOption(WorkerBootstrap);
+            if (Option.isNone(capability)) throw new Error("Fixture bootstrap capability missing");
+            const bytes = yield* capability.value
+              .consume({
+                ...fixture.target,
+                threadId: id,
+                binaryPath: "/opt/sift/codex",
+                homePath: undefined,
+                environment: fixture.environment,
+                launchArgs: undefined,
+                appServerArgs: undefined,
+                hasResumeCursor: false,
+              })
+              .pipe(Effect.orDie);
+            bytes.fill(0);
+            return {
+              threadId: id,
+              provider: ProviderDriverKind.make("codex"),
+              status: "ready",
+              runtimeMode: input.runtimeMode,
+              cwd,
+              createdAt: "2026-10-16T00:00:00Z",
+              updatedAt: "2026-10-16T00:00:00Z",
+            };
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const handle = yield* makeSiftBridge;
+        const bound = yield* handle({
+          ...request,
+          operation: "bind",
+          checkoutPath: cwd,
+          modelSelection: { instanceId: "codex", model: "fixture-model" },
+          runtimeMode: "approval-required",
+        });
+        if (!bound.ok || !("threadId" in bound.result)) throw new Error("Fixture binding failed");
+        threadId = bound.result.threadId;
+        const input = {
+          ...request,
+          operation: "workerPolicy/bootstrap",
+          threadId,
+          materialization: fixture.materialization,
+        };
+        expect((yield* handle(input)).ok).toBe(false);
+        expect((yield* handle({ ...input, threadId: "other" }, () => {})).ok).toBe(false);
+        const engine = yield* OrchestrationEngineService;
+        const before = yield* engine.latestSequence;
+        const result = yield* handle(input, () => {});
+        expect(result.ok && result.result).toEqual({ threadId, state: "started" });
+        expect(yield* engine.latestSequence).toBe(before);
+        const sql = yield* SqlClient.SqlClient;
+        expect((yield* sql`SELECT * FROM sift_bridge_commands`).length).toBe(0);
+        const state = yield* sql`SELECT * FROM sift_bridge_binding`;
+        expect(yield* encodeStateJson(state)).not.toContain(
+          fixture.materialization.input.authorization,
+        );
+      }).pipe(Effect.provide(bootstrapLayer.pipe(Layer.provideMerge(testLayer(directory)))));
+      // Rebuild layers/bridge against the retained database, without carrying a
+      // capability or payload forward from the previous in-memory bridge.
+      yield* Effect.gen(function* () {
+        const handle = yield* makeSiftBridge;
+        const replay = yield* handle(
+          {
+            ...request,
+            operation: "workerPolicy/bootstrap",
+            threadId,
+            materialization: fixture.materialization,
+          },
+          () => {},
+        );
+        expect(replay.ok).toBe(false);
+        expect(calls).toBe(1);
+        const sql = yield* SqlClient.SqlClient;
+        const rows = yield* sql`SELECT * FROM sift_worker_consumed_launches`;
+        expect(rows).toHaveLength(1);
+        expect(Object.keys(rows[0]!).sort()).toEqual([
+          "binding_sha256",
+          "consumed_at",
+          "incarnation_id",
+          "launch_id",
+          "thread_id",
+        ]);
+        if (!threadId) throw new Error("Fixture bound thread missing");
+        for (const identity of [
+          { ...fixture.launch, launchId: "different-launch" },
+          { ...fixture.launch, incarnationId: "different-incarnation" },
+        ])
+          expect(
+            (yield* burnWorkerBootstrap(sql, { ...identity, threadId, consumedAt: "fixture" }).pipe(
+              Effect.exit,
+            ))._tag,
+          ).toBe("Failure");
+        expect((yield* sql`SELECT * FROM sift_worker_consumed_launches`).length).toBe(1);
+      }).pipe(Effect.provide(bootstrapLayer.pipe(Layer.provideMerge(testLayer(directory)))));
     }).pipe(Effect.scoped),
 );

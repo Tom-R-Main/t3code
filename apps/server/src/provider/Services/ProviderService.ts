@@ -95,9 +95,17 @@ export interface ProviderServiceShape {
    */
   readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderSession>>;
 
-  /**
-   * Read capabilities for the adapter bound to a configured provider instance.
-   */
+  /** Present only in the private Sift bridge; never exposed as a public RPC. */
+  readonly readWorkerPolicy?: (
+    threadId: ThreadId,
+    challenge: string,
+    prepare: boolean,
+  ) => Effect.Effect<
+    { readonly attestation: unknown; readonly providerThreadId: string },
+    ProviderServiceError
+  >;
+
+  /** Read capabilities for the adapter bound to a configured provider instance. */
   readonly getCapabilities: (
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderAdapterCapabilities, ProviderServiceError>;

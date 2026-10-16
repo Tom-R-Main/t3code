@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import {
   SIFT_BRIDGE_MAX_REQUEST_BYTES,
+  SIFT_BRIDGE_MAX_BOOTSTRAP_ENVELOPE_BYTES,
   SIFT_BRIDGE_MAX_RESPONSE_BYTES,
 } from "../../../../packages/contracts/src/siftBridge.ts";
 import * as Schema from "effect/Schema";
@@ -23,7 +24,10 @@ const failure = (code: string, message: string) => ({
 // The socket directory is provisioned by the host, outside the writable checkout.
 // Unix owner permissions limit exposure; signed host requests authorize access.
 // No HTTP routes or T3 pairing scopes are widened by this opt-in transport.
-export async function listenSiftSocket(path: string, handle: (input: unknown) => Promise<unknown>) {
+export async function listenSiftSocket(
+  path: string,
+  handle: (input: unknown, signal: AbortSignal) => Promise<unknown>,
+) {
   if (!NodePath.isAbsolute(path) || Buffer.byteLength(path) > 100)
     throw new Error("Invalid Sift socket path.");
   const directory = await NodeFSP.lstat(NodePath.dirname(path));
@@ -65,11 +69,18 @@ export async function listenSiftSocket(path: string, handle: (input: unknown) =>
     }
     sockets.add(socket);
     socket.on("error", () => socket.destroy());
-    socket.on("close", () => sockets.delete(socket));
+    const controller = new AbortController();
+    socket.on("close", () => {
+      sockets.delete(socket);
+      controller.abort();
+    });
+    // A client that half-closes its request must not leave preflight running.
+    socket.on("end", () => controller.abort());
     socket.setTimeout(30_000, () => socket.destroy());
     let input = Buffer.alloc(0);
     let received = false;
     const reply = (value: unknown) => {
+      if (socket.destroyed || controller.signal.aborted) return;
       const encoded = JSON.stringify(value);
       socket.end(
         (Buffer.byteLength(encoded) > SIFT_BRIDGE_MAX_RESPONSE_BYTES
@@ -79,7 +90,7 @@ export async function listenSiftSocket(path: string, handle: (input: unknown) =>
     };
     socket.on("data", (chunk: Buffer) => {
       if (received) return;
-      if (input.length + chunk.length > SIFT_BRIDGE_MAX_REQUEST_BYTES) {
+      if (input.length + chunk.length > SIFT_BRIDGE_MAX_BOOTSTRAP_ENVELOPE_BYTES) {
         received = true;
         reply(failure("REQUEST_TOO_LARGE", "Request exceeded its bound."));
         return;
@@ -104,7 +115,22 @@ export async function listenSiftSocket(path: string, handle: (input: unknown) =>
         reply(failure("INVALID_REQUEST", "Invalid JSON request."));
         return;
       }
-      void handle(parsed).then(reply, () =>
+      // Only the new signed bootstrap envelope gets additional framing room.
+      // Authentication still precedes execution; ordinary raw byte budgets do
+      // not grow (including whitespace and escaped JSON representation).
+      const bootstrap =
+        parsed !== null &&
+        typeof parsed === "object" &&
+        "request" in parsed &&
+        parsed.request !== null &&
+        typeof parsed.request === "object" &&
+        "operation" in parsed.request &&
+        parsed.request.operation === "workerPolicy/bootstrap";
+      if (!bootstrap && input.length > SIFT_BRIDGE_MAX_REQUEST_BYTES) {
+        reply(failure("REQUEST_TOO_LARGE", "Request exceeded its bound."));
+        return;
+      }
+      void handle(parsed, controller.signal).then(reply, () =>
         reply(failure("INVALID_REQUEST", "Invalid or unavailable bridge request.")),
       );
     });
@@ -136,7 +162,7 @@ export const listenEffectSiftSocket = <E>(
   handle: (input: unknown, authorize?: () => void) => Effect.Effect<unknown, E>,
   publicKey: NodeCrypto.KeyObject,
 ) =>
-  listenSiftSocket(path, async (input) => {
+  listenSiftSocket(path, async (input, signal) => {
     let request: unknown;
     try {
       request = authenticateSiftRequest(input, publicKey);
@@ -147,6 +173,18 @@ export const listenEffectSiftSocket = <E>(
       handle(request, () => {
         authenticateSiftRequest(input, publicKey);
       }),
+      // Cancellation changes only the new read/preparation flow. Existing
+      // effectful commands keep their durable lost-response reconciliation.
+      {
+        signal:
+          request !== null &&
+          typeof request === "object" &&
+          "operation" in request &&
+          (request.operation === "workerPolicy/read" ||
+            request.operation === "workerPolicy/bootstrap")
+            ? signal
+            : undefined,
+      },
     );
   });
 

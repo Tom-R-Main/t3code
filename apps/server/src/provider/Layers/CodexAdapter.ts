@@ -32,6 +32,7 @@ import {
   ProviderSendTurnInput,
 } from "@t3tools/contracts";
 import { isManagedAccessEnabled, priorProcessTreeTerminated } from "../../sift/ManagedAccess.ts";
+import { WorkerBootstrap } from "../../sift/WorkerBootstrap.ts";
 import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
 import * as Crypto from "effect/Crypto";
@@ -2310,6 +2311,37 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           });
         }
 
+        const environment = options?.environment ?? process.env;
+        if (
+          environment.CODEX_RESTRICTED_WORKER === "1" ||
+          environment.CODEX_WORKER_POLICY_V1 !== undefined
+        ) {
+          const bootstrap = yield* Effect.serviceOption(WorkerBootstrap);
+          const refused = () =>
+            new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: "Restricted worker bootstrap unavailable.",
+            });
+          if (
+            Option.isNone(bootstrap) ||
+            input.modelSelection?.instanceId !== boundInstanceId ||
+            input.runtimeMode !== "approval-required" ||
+            input.resumeCursor !== undefined
+          )
+            return yield* refused();
+          yield* bootstrap.value
+            .assertTarget(
+              {
+                threadId: input.threadId,
+                providerInstanceId: boundInstanceId,
+                cwd: input.cwd ?? process.cwd(),
+                model: input.modelSelection.model,
+              },
+              environment,
+            )
+            .pipe(Effect.mapError(refused));
+        }
         const existing = sessions.get(input.threadId);
         if (existing && !existing.stopped) {
           yield* Effect.suspend(() => stopSessionInternal(existing));
@@ -2661,6 +2693,29 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
   });
 
+  const readWorkerPolicy: NonNullable<CodexAdapterShape["readWorkerPolicy"]> = (
+    threadId,
+    challenge,
+    prepare,
+  ) =>
+    Effect.gen(function* () {
+      const session = yield* requireSession(threadId);
+      if (!session.runtime.readWorkerPolicy)
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "workerPolicy/read",
+          issue: "Worker policy inspection is unavailable.",
+        });
+      return yield* session.runtime.readWorkerPolicy(challenge, prepare);
+    }).pipe(
+      Effect.mapError((cause) =>
+        cause._tag === "ProviderAdapterSessionNotFoundError" ||
+        cause._tag === "ProviderAdapterValidationError"
+          ? cause
+          : mapCodexRuntimeError(threadId, "workerPolicy/read", cause),
+      ),
+    );
+
   const readThread: CodexAdapterShape["readThread"] = (threadId) =>
     requireSession(threadId).pipe(
       Effect.flatMap((session) => session.runtime.readThread),
@@ -2841,6 +2896,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     compaction: { type: "native", start: compactThread },
     interruptTurn,
     readThread,
+    readWorkerPolicy,
     rollbackThread,
     uploadFeedback,
     respondToRequest,
