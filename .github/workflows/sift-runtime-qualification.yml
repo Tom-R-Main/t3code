@@ -63,3 +63,125 @@ jobs:
           path: ${{ runner.temp }}/sift-runtime-qualification/
           if-no-files-found: error
           retention-days: 14
+
+  source_format_feedback:
+    if: github.repository == 'Tom-R-Main/t3code'
+    name: Bounded source formatting feedback (not qualification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CI: 'true'
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      # This job owns a separate disposable checkout. Formatting never changes
+      # the workspace whose tests and typechecks provide qualification evidence.
+      - name: Checkout the exact source with preferred-target ancestry
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Set up the same pinned formatting toolchain
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          version: '0.3.3'
+          node-version: '24.13.1'
+          cache: true
+          run-install: |
+            args:
+              - --frozen-lockfile
+              - --filter=@t3tools/monorepo
+              - --filter=t3...
+              - --filter=@t3tools/scripts...
+
+      - name: Collect a bounded formatting patch for changed source only
+        env:
+          SIFT_FORMAT_OUTPUT: ${{ runner.temp }}/sift-source-format-feedback
+        run: |
+          node --input-type=module <<'NODE'
+          import * as NodeAssert from 'node:assert/strict';
+          import * as NodeBuffer from 'node:buffer';
+          import * as NodeCrypto from 'node:crypto';
+          import * as NodeFS from 'node:fs';
+          import * as NodePath from 'node:path';
+          import * as NodeChildProcess from 'node:child_process';
+          const base = '9e66b3d3beb422bd2b3803f7916dee21dbeaf526';
+          const output = process.env.SIFT_FORMAT_OUTPUT;
+          NodeAssert.ok(output && process.env.GITHUB_ACTIONS === 'true');
+          NodeFS.mkdirSync(output, {recursive: true});
+          const metadata = {version: 1, kind: 'source-format-feedback-only', status: 'incomplete',
+            originalHead: process.env.GITHUB_SHA, preferredTarget: base, toolchain: {}, files: []};
+          const save = () => NodeFS.writeFileSync(NodePath.join(output, 'metadata.json'), JSON.stringify(metadata, null, 2));
+          const run = (command, args, timeout = 120000) => NodeChildProcess.execFileSync(command, args,
+            {encoding: 'utf8', timeout, maxBuffer: 1048576, stdio: ['ignore', 'pipe', 'pipe']});
+          const sha256 = bytes => NodeCrypto.createHash('sha256').update(bytes).digest('hex');
+          const explicit = new Set(['knip.jsonc', '.github/scripts/sift-runtime-qualification.mjs',
+            '.github/workflows/sift-runtime-qualification.yml', '.github/workflows/ci.yml',
+            '.github/workflows/mobile-fingerprint-check.yml']);
+          const allowed = file => explicit.has(file) ||
+            /^(apps\/server\/|packages\/contracts\/src\/|packages\/effect-codex-app-server\/src\/)[A-Za-z0-9_./-]+\.ts$/.test(file);
+          try {
+            save();
+            NodeAssert.equal(run('git', ['rev-parse', 'HEAD']).trim(), metadata.originalHead);
+            // Public read only: do not install credentials or write a Git token.
+            run('git', ['fetch', '--no-tags', 'origin', 'codex/sift-runtime-v2']);
+            NodeAssert.equal(run('git', ['rev-parse', 'FETCH_HEAD']).trim(), base);
+            run('git', ['merge-base', '--is-ancestor', base, 'HEAD']);
+            NodeAssert.equal(run('git', ['diff', '--name-only', 'HEAD']).trim(), '');
+            const untracked = run('git', ['ls-files', '--others', '--exclude-standard']);
+            const pkg = JSON.parse(NodeFS.readFileSync('package.json', 'utf8'));
+            const vite = JSON.parse(NodeFS.readFileSync('node_modules/vite-plus/package.json', 'utf8'));
+            NodeAssert.equal(pkg.scripts.fmt, 'vp fmt');
+            NodeAssert.equal(pkg.packageManager, 'pnpm@11.10.0');
+            NodeAssert.equal(process.version, 'v24.13.1');
+            NodeAssert.equal(vite.version, '0.3.3');
+            metadata.toolchain = {node: process.version, packageManager: pkg.packageManager,
+              vitePlus: vite.version, cliVersion: run('vp', ['--version']).trim(),
+              lockSha256: sha256(NodeFS.readFileSync('pnpm-lock.yaml'))};
+            NodeFS.writeFileSync(NodePath.join(output, 'fmt-help.txt'), run('vp', ['fmt', '--help']));
+            const files = run('git', ['diff', '--name-only', '--diff-filter=AM', base, 'HEAD']).trim().split('\n').filter(Boolean);
+            NodeAssert.ok(files.length > 0 && files.length <= 80);
+            for (const file of files) {
+              NodeAssert.ok(allowed(file) && !file.split('/').includes('..'), 'Unexpected source path');
+              NodeAssert.ok(NodeFS.lstatSync(file).isFile(), 'Only tracked regular source files may be formatted');
+              metadata.files.push({path: file, originalSha256: sha256(NodeFS.readFileSync(file))});
+            }
+            save();
+            // File operands are documented by Vite+; use root fmt configuration.
+            NodeFS.writeFileSync(NodePath.join(output, 'formatter.log'), run('vp', ['fmt', ...files], 180000));
+            const changed = run('git', ['diff', '--name-only', 'HEAD']).trim().split('\n').filter(Boolean);
+            NodeAssert.ok(changed.every(file => files.includes(file)), 'Formatter changed an unexpected path');
+            NodeAssert.equal(run('git', ['ls-files', '--others', '--exclude-standard']), untracked, 'Formatter created an unexpected file');
+            NodeAssert.ok(files.every(file => NodeFS.lstatSync(file).isFile()), 'Formatter replaced a regular source file');
+            const patch = run('git', ['diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', '--', ...files]);
+            NodeAssert.ok(NodeBuffer.Buffer.byteLength(patch) <= 1048576, 'Formatting patch exceeds 1 MiB');
+            NodeFS.writeFileSync(NodePath.join(output, 'format.patch'), patch);
+            metadata.patchSha256 = sha256(patch);
+            metadata.patchBytes = NodeBuffer.Buffer.byteLength(patch);
+            metadata.changedFiles = changed;
+            metadata.files = metadata.files.map(file => ({...file, formattedSha256: sha256(NodeFS.readFileSync(file.path))}));
+            metadata.status = 'feedback_collected';
+          } catch (error) {
+            metadata.status = 'failed';
+            const diagnostic = [error?.stdout, error?.stderr].filter(value => typeof value === 'string').join('\n');
+            if (NodeBuffer.Buffer.byteLength(diagnostic) <= 1048576)
+              NodeFS.writeFileSync(NodePath.join(output, 'feedback-error.log'), diagnostic);
+            metadata.failure = {name: error?.name ?? 'Error', code: error?.code ?? null,
+              exitStatus: error?.status ?? null, signal: error?.signal ?? null};
+            process.exitCode = 1;
+          } finally {save();}
+          NODE
+
+      - name: Upload formatting feedback separately from qualification
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sift-source-format-feedback-${{ github.sha }}
+          path: ${{ runner.temp }}/sift-source-format-feedback/
+          if-no-files-found: error
+          retention-days: 14

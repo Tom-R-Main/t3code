@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as Assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { it } from "@effect/vitest";
@@ -47,11 +47,11 @@ it.layer(layer)("Codex feedback protocol peer", (it) => {
             yield* deliverDeclineFeedback(input);
             // This is the only place the caller releases the native response.
             yield* Deferred.succeed(nativeDecision, "decline");
-            Assert.deepEqual(yield* Fiber.join(begun), { events: ["steer", "decline"] });
+            NodeAssert.deepEqual(yield* Fiber.join(begun), { events: ["steer", "decline"] });
             yield* deliverDeclineFeedback({ ...input, journal: makeDeclineFeedbackJournal(sql) });
           } else {
-            Assert.equal((yield* Effect.flip(deliverDeclineFeedback(input))).code, "FEEDBACK_DELIVERY_UNKNOWN");
-            Assert.equal((yield* Effect.flip(deliverDeclineFeedback({
+            NodeAssert.equal((yield* Effect.flip(deliverDeclineFeedback(input))).code, "FEEDBACK_DELIVERY_UNKNOWN");
+            NodeAssert.equal((yield* Effect.flip(deliverDeclineFeedback({
               ...input, journal: makeDeclineFeedbackJournal(sql),
             }))).code, "FEEDBACK_DELIVERY_UNKNOWN");
             yield* Fiber.interrupt(begun);

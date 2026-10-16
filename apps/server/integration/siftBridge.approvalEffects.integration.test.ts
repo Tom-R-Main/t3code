@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as Assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { ApprovalScope, ApprovalRequestId, CommandId, ThreadId, type ProviderApprovalDecision, type ApprovalDecisionContext } from "@t3tools/contracts";
@@ -75,7 +75,7 @@ for (const { scenario, route } of guardedCases) {
       const base = { id: "guarded", binding: { runtimeId: "runtime", workItemId: "work", leaseGeneration: 1 } };
       const bound = yield* harness.siftBridge({ ...base, operation: "bind", checkoutPath: harness.workspaceDir,
         runtimeMode: "approval-required", modelSelection: { instanceId: "codex", model: "gpt-5.4" } });
-      Assert.ok(bound.ok && "threadId" in bound.result);
+      NodeAssert.ok(bound.ok && "threadId" in bound.result);
       const threadId = bound.result.threadId;
       yield* harness.siftBridge({ ...base, operation: "turn", commandId: "turn", text: "Use only the synthetic peer." });
       const events = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
@@ -85,7 +85,7 @@ for (const { scenario, route } of guardedCases) {
       if (!approvalEvent || approvalEvent.type !== "thread.activity-appended") throw new Error("No approval event");
       const approval = yield* Schema.decodeUnknownEffect(ApprovalInfo)(approvalEvent.payload.activity.payload);
       // This peer supplies neither command nor reason. The host remains visible to the human.
-      Assert.equal(approval.detail, "Network target: https example.com");
+      NodeAssert.equal(approval.detail, "Network target: https example.com");
       if (scenario === "child-success" || scenario === "child-stale")
         yield* waitForCompletedAssistantText(harness, "Child turn observation barrier.");
       const request = { ...base, operation: "approve", commandId: "decision", requestId: approval.requestId,
@@ -111,36 +111,36 @@ for (const { scenario, route } of guardedCases) {
           Effect.map((receipt) => ({ id: base.id, ok: true as const, result: { threadId, ...receipt } })),
         );
       const first = yield* decide;
-      Assert.equal(first.ok && first.result.state, "pending");
+      NodeAssert.equal(first.ok && first.result.state, "pending");
       yield* Deferred.await(entered);
       const pendingRetry = yield* decide;
-      Assert.equal(pendingRetry.ok && pendingRetry.result.state, "pending");
-      Assert.equal(responseCalls, 1);
+      NodeAssert.equal(pendingRetry.ok && pendingRetry.result.state, "pending");
+      NodeAssert.equal(responseCalls, 1);
       yield* Deferred.succeed(release, undefined);
       yield* harness.drainProviderCommands;
       const settled = yield* decide;
       if (scenario === "success" || scenario === "child-success") {
-        Assert.equal(settled.ok && settled.result.state, "accepted");
+        NodeAssert.equal(settled.ok && settled.result.state, "accepted");
         yield* waitForCompletedAssistantText(harness,
           scenario === "child-success"
             ? 'Synthetic peer consumed native decline after steering. thread=child-thread turn=child-turn-1 feedback="Use the retained local fixture."'
             : 'Synthetic peer consumed native decline after steering. turn=turn-1 feedback="Use the retained local fixture."');
         const resolved = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
           event.payload.activity.kind === "approval.resolved");
-        Assert.ok(resolved.some((event) => event.type === "thread.activity-appended" &&
+        NodeAssert.ok(resolved.some((event) => event.type === "thread.activity-appended" &&
           event.payload.activity.kind === "approval.resolved" &&
           Schema.is(Schema.Struct({ feedbackDelivered: Schema.Literal(true) }))(event.payload.activity.payload)));
       } else {
         const error = scenario === "scope-mismatch" ? "APPROVAL_SCOPE_MISMATCH" :
           scenario === "child-stale" ? "FEEDBACK_STALE_TURN" : "FEEDBACK_DELIVERY_UNKNOWN";
-        Assert.deepEqual(settled.ok && settled.result, { threadId: bound.ok && bound.result.threadId, state: "failed", error });
+        NodeAssert.deepEqual(settled.ok && settled.result, { threadId: bound.ok && bound.result.threadId, state: "failed", error });
         const failed = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
           event.payload.activity.kind === "provider.approval.respond.failed");
-        Assert.ok(failed.some((event) => event.type === "thread.activity-appended" &&
+        NodeAssert.ok(failed.some((event) => event.type === "thread.activity-appended" &&
           Schema.is(Schema.Struct({ errorCode: Schema.Literal(error) }))(event.payload.activity.payload)));
       }
-      Assert.deepEqual(yield* decide, settled);
-      Assert.equal(responseCalls, 1, "Stable retries must not invoke runtime again");
+      NodeAssert.deepEqual(yield* decide, settled);
+      NodeAssert.equal(responseCalls, 1, "Stable retries must not invoke runtime again");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 }
@@ -185,7 +185,7 @@ for (const { scenario, route } of commandCases) {
       const base = { id: "command-effect", binding: { runtimeId: "runtime-command", workItemId: "work-command", leaseGeneration: 1 } };
       const bound = yield* harness.siftBridge({ ...base, operation: "bind", checkoutPath: harness.workspaceDir,
         runtimeMode: "approval-required", modelSelection: { instanceId: "codex", model: "gpt-5.4" } });
-      Assert.ok(bound.ok && "threadId" in bound.result);
+      NodeAssert.ok(bound.ok && "threadId" in bound.result);
       const threadId = bound.result.threadId;
       yield* harness.siftBridge({ ...base, operation: "turn", commandId: "turn", text: "Use only the synthetic command peer." });
       const events = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
@@ -197,10 +197,10 @@ for (const { scenario, route } of commandCases) {
         requestId: Schema.String, approvalScope: Schema.optional(ApprovalScope),
       }))(event.payload.activity.payload);
       const persistedEvent = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(event);
-      Assert.equal(persistedEvent.includes("siftCommandScope"), false, "Raw argv extension must not reach persisted activity");
-      Assert.equal(yield* fs.exists(effectFile), false, "The peer must wait for approval before executing the fixture");
-      if (scenario !== "command-legacy") Assert.equal(approval.approvalScope?.kind, "command");
-      else Assert.equal(approval.approvalScope, undefined);
+      NodeAssert.equal(persistedEvent.includes("siftCommandScope"), false, "Raw argv extension must not reach persisted activity");
+      NodeAssert.equal(yield* fs.exists(effectFile), false, "The peer must wait for approval before executing the fixture");
+      if (scenario !== "command-legacy") NodeAssert.equal(approval.approvalScope?.kind, "command");
+      else NodeAssert.equal(approval.approvalScope, undefined);
       const expectedScope = scenario === "command-accept" ? approval.approvalScope : {
         version: 1 as const, kind: "command" as const, digest: "0".repeat(64),
       };
@@ -225,28 +225,28 @@ for (const { scenario, route } of commandCases) {
       yield* harness.drainProviderCommands;
       const settled = yield* decide;
       if (scenario === "command-accept") {
-        Assert.equal(settled.ok && settled.result.state, "accepted");
+        NodeAssert.equal(settled.ok && settled.result.state, "accepted");
         // An accepted response alone is insufficient: wait for the independently
         // executed child command, then inspect its exclusive-create file effect.
         yield* waitForCompletedAssistantText(harness, "Fixture tool effect completed.");
         const effect = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Struct({
           effect: Schema.String, argv0: Schema.String,
         })))(yield* fs.readFileString(effectFile));
-        Assert.deepEqual(effect, {
+        NodeAssert.deepEqual(effect, {
           effect: "approved fixture effect", argv0: "fixture-node-zero",
         });
       } else {
-        Assert.deepEqual(settled.ok && settled.result, {
+        NodeAssert.deepEqual(settled.ok && settled.result, {
           threadId: bound.ok && bound.result.threadId, state: "failed", error: "APPROVAL_SCOPE_MISMATCH",
         });
-        Assert.equal(yield* fs.exists(effectFile), false);
+        NodeAssert.equal(yield* fs.exists(effectFile), false);
       }
-      Assert.deepEqual(yield* decide, settled);
-      Assert.equal(responseCalls, 1, "Replaying a decision receipt must not release another command");
+      NodeAssert.deepEqual(yield* decide, settled);
+      NodeAssert.equal(responseCalls, 1, "Replaying a decision receipt must not release another command");
       if (scenario === "command-accept" && route === "bridge") {
         const stale = yield* harness.siftBridge({ ...request, commandId: "different-decision" });
-        Assert.equal(stale.ok && stale.result.state, "failed");
-        Assert.equal(responseCalls, 1, "An old decision ID must never reach the provider twice");
+        NodeAssert.equal(stale.ok && stale.result.state, "failed");
+        NodeAssert.equal(responseCalls, 1, "An old decision ID must never reach the provider twice");
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );

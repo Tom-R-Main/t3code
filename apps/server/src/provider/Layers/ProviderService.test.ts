@@ -4,6 +4,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import type {
+  ApprovalDecisionContext,
   ProviderApprovalDecision,
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
@@ -213,6 +214,7 @@ function makeFakeCodexAdapter(
       _threadId: ThreadId,
       _requestId: string,
       _decision: ProviderApprovalDecision,
+      _decisionContext?: ApprovalDecisionContext,
     ): Effect.Effect<void, ProviderAdapterError> => Effect.void,
   );
 
@@ -1691,8 +1693,33 @@ routing.layer("ProviderServiceLive routing", (it) => {
         requestId: asRequestId("req-1"),
         decision: "accept",
       });
+      const scopedContext: ApprovalDecisionContext = {
+        commandId: "scoped-decision",
+        attemptId: "attempt-1",
+        expectedApprovalScope: { version: 1, kind: "command", digest: "a".repeat(64) },
+        ruleSourceRequestId: "prior-exact-request",
+      };
+      yield* provider.respondToRequest({
+        threadId: session.threadId,
+        requestId: asRequestId("req-scoped"),
+        decision: "accept",
+        decisionContext: scopedContext,
+      });
+      const declineContext: ApprovalDecisionContext = {
+        commandId: "decline-decision",
+        attemptId: "attempt-2",
+        feedback: "Use the approved local fixture.",
+      };
+      yield* provider.respondToRequest({
+        threadId: session.threadId,
+        requestId: asRequestId("req-decline"),
+        decision: "decline",
+        decisionContext: declineContext,
+      });
       assert.deepEqual(routing.codex.respondToRequest.mock.calls, [
-        [session.threadId, asRequestId("req-1"), "accept"],
+        [session.threadId, asRequestId("req-1"), "accept", undefined],
+        [session.threadId, asRequestId("req-scoped"), "accept", scopedContext],
+        [session.threadId, asRequestId("req-decline"), "decline", declineContext],
       ]);
 
       yield* provider.respondToUserInput({

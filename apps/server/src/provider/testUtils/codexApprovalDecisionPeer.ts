@@ -1,5 +1,5 @@
 // A protocol peer for approval tests. It has no provider binary, auth, or model.
-import { createInterface } from "node:readline";
+import * as NodeReadline from "node:readline";
 import * as NodePath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
@@ -46,7 +46,7 @@ const completeAssistant = (itemId: string, text: string) => {
   };
   send({ method: "item/completed", params });
 };
-createInterface({ input: process.stdin }).on("line", (line: string) => {
+NodeReadline.createInterface({ input: process.stdin }).on("line", (line: string) => {
   const message = JSON.parse(line) as {
     id?: string | number; method?: string;
     params?: { threadId?: string; expectedTurnId?: string; input?: ReadonlyArray<{ type: string; text?: string }> }; result?: { decision?: string };

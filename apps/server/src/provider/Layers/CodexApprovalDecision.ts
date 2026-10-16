@@ -1,8 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
-import { domainToASCII } from "node:url";
+import * as NodeURL from "node:url";
 import * as NodePath from "node:path";
-import { Buffer } from "node:buffer";
+import * as NodeBuffer from "node:buffer";
 import { ApprovalDecisionContext, type ApprovalScope } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -24,7 +24,7 @@ function canonicalNetworkHost(host: string): string | undefined {
   // Node's URL-backed IDNA conversion can discard a path/query or decode a
   // percent escape. Reject URL syntax first: this authority is a typed host.
   if (/[\\/:@*?#%\s\u0000-\u001f\u007f]/.test(host)) return undefined;
-  const canonical = domainToASCII(host.toLowerCase().replace(/\.$/, ""));
+  const canonical = NodeURL.domainToASCII(host.toLowerCase().replace(/\.$/, ""));
   return canonical && canonical.length <= 253 && canonical.split(".").every((label) =>
     /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) ? canonical : undefined;
 }
@@ -80,9 +80,9 @@ function authoritativeCommandScope(payload: CommandApprovalPayload): typeof Comm
   }));
   if (malformedUnicode || strings.some((value) => value.includes("\0")) ||
     !NodePath.isAbsolute(scope.program) || !NodePath.isAbsolute(scope.cwd) || scope.argv[0] === "" ||
-    Buffer.byteLength(scope.program) > 4096 || Buffer.byteLength(scope.cwd) > 4096 ||
-    scope.argv.some((arg) => Buffer.byteLength(arg) > 16384) ||
-    strings.reduce((total, value) => total + Buffer.byteLength(value), 0) > 65536) return undefined;
+    NodeBuffer.Buffer.byteLength(scope.program) > 4096 || NodeBuffer.Buffer.byteLength(scope.cwd) > 4096 ||
+    scope.argv.some((arg) => NodeBuffer.Buffer.byteLength(arg) > 16384) ||
+    strings.reduce((total, value) => total + NodeBuffer.Buffer.byteLength(value), 0) > 65536) return undefined;
   return scope;
 }
 
