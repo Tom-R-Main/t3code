@@ -25,6 +25,10 @@
         "scripts/evaluate-thread-titles.ts",
         "scripts/measure-pr-preview.ts",
         "src/provider/testFixtures/*.mjs",
+        // Standalone executable retained for cross-repository bridge fixtures.
+        "integration/siftBridge.fixture.ts",
+        // Approval tests spawn this protocol peer by pathname.
+        "src/provider/testUtils/codexApprovalDecisionPeer.ts",
       ],
       // Keep the transitive Effect runtime pinned for standalone npm installs.
       // The Vite+ web build prerequisite.

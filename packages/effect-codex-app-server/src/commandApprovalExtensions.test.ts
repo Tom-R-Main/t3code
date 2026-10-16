@@ -15,16 +15,22 @@ it("retains the optional fork extension through the typed request decoder", () =
   assert.deepEqual(decode({ ...base, siftCommandScope: "invalid" }).siftCommandScope, "invalid");
 });
 
-
 it.effect("keeps malformed-envelope errors free of raw command scope operands", () =>
   Effect.gen(function* () {
     const marker = "fixture-private-operand";
-    const error = yield* Effect.flip(Schema.decodeUnknownEffect(CommandApprovalParams)({
-      threadId: "thread", turnId: "turn", itemId: null, startedAtMs: 1,
-      siftCommandScope: { version: 1, program: marker, argv: [marker], cwd: "/workspace" },
-    }));
+    const error = yield* Effect.flip(
+      Schema.decodeUnknownEffect(CommandApprovalParams)({
+        threadId: "thread",
+        turnId: "turn",
+        itemId: null,
+        startedAtMs: 1,
+        siftCommandScope: { version: 1, program: marker, argv: [marker], cwd: "/workspace" },
+      }),
+    );
     const response = CodexAppServerRequestError.invalidPayload(
-      "item/commandExecution/requestApproval", "decode-payload", error,
+      "item/commandExecution/requestApproval",
+      "decode-payload",
+      error,
     ).toProtocolError();
     assert.equal(response.code, -32602);
     const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(response);

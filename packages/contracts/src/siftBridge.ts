@@ -3,7 +3,7 @@ import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt } from "./baseSchemas.ts";
 import { ModelSelection, ProviderUserInputAnswers } from "./orchestration.ts";
 
-export const SIFT_MANAGED_ACCESS_MAX_TTL_SECONDS = 12 * 60 * 60;
+const SIFT_MANAGED_ACCESS_MAX_TTL_SECONDS = 12 * 60 * 60;
 const Identifier = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128));
 export const SiftBinding = Schema.Struct({
   runtimeId: Identifier,

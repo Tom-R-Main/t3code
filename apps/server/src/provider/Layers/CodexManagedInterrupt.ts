@@ -124,7 +124,7 @@ export const terminateLoadedThreadTerminals = (client: Client) =>
   );
 
 /** Every background terminal the provider reports for one thread, all pages. */
-export const listBackgroundTerminals = (client: Client, threadId: string) =>
+const listBackgroundTerminals = (client: Client, threadId: string) =>
   Effect.gen(function* () {
     let cursor: string | null = null;
     const seen = new Set<string>();

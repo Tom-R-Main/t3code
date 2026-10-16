@@ -69,15 +69,21 @@ describe("runtimeEventToActivities approval details", () => {
   });
 });
 
-
 it("exports exact scope and supported feedback without copying raw approval args", () => {
   const approvalScope = { version: 1, kind: "network", digest: "a".repeat(64) } as const;
   const [activity] = runtimeEventToActivities({
-    type: "request.opened", eventId: EventId.make("scope-event"),
-    provider: ProviderDriverKind.make("codex"), createdAt: "2026-10-15T00:00:00.000Z",
-    threadId: ThreadId.make("thread-1"), requestId: RuntimeRequestId.make("scope-request"),
-    payload: { requestType: "command_execution_approval", approvalScope, feedbackSupported: true,
-      args: { command: ["tool", "sensitive-argument"] } },
+    type: "request.opened",
+    eventId: EventId.make("scope-event"),
+    provider: ProviderDriverKind.make("codex"),
+    createdAt: "2026-10-15T00:00:00.000Z",
+    threadId: ThreadId.make("thread-1"),
+    requestId: RuntimeRequestId.make("scope-request"),
+    payload: {
+      requestType: "command_execution_approval",
+      approvalScope,
+      feedbackSupported: true,
+      args: { command: ["tool", "sensitive-argument"] },
+    },
   });
   expect(activity?.payload).toMatchObject({ approvalScope, feedbackSupported: true });
   expect(JSON.stringify(activity)).not.toContain("sensitive-argument");

@@ -32,7 +32,15 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
-import { approvalEffectErrorCode, beginApprovalEffect, ensureApprovalEffects, finishApprovalEffect, recoverApprovalEffects, reserveApprovalEffect, type ApprovalEffectErrorCode } from "../../sift/ApprovalEffects.ts";
+import {
+  approvalEffectErrorCode,
+  beginApprovalEffect,
+  ensureApprovalEffects,
+  finishApprovalEffect,
+  recoverApprovalEffects,
+  reserveApprovalEffect,
+  type ApprovalEffectErrorCode,
+} from "../../sift/ApprovalEffects.ts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -1627,28 +1635,45 @@ const make = Effect.gen(function* () {
     event: Extract<ProviderIntentEvent, { type: "thread.approval-response-requested" }>,
   ) {
     const context = event.payload.decisionContext;
-    const guarded = context !== undefined && Boolean(
-      context.expectedApprovalScope || context.feedback !== undefined || context.ruleSourceRequestId,
-    );
+    const guarded =
+      context !== undefined &&
+      Boolean(
+        context.expectedApprovalScope ||
+        context.feedback !== undefined ||
+        context.ruleSourceRequestId,
+      );
     const effectId = guarded ? event.commandId : null;
     if (guarded) {
       if (!effectId) return;
       // HTTP and WebSocket dispatchers reach this shared reactor without the
       // private bridge's pre-dispatch reservation. Reserve from the durable
       // event before claiming; existing terminal/uncertain receipts stay closed.
-      yield* reserveApprovalEffect(approvalSql, effectId, event.payload.requestId, context?.feedback !== undefined);
+      yield* reserveApprovalEffect(
+        approvalSql,
+        effectId,
+        event.payload.requestId,
+        context?.feedback !== undefined,
+      );
       if (!(yield* beginApprovalEffect(approvalSql, effectId))) return;
     }
-    const failure = (detail: string, errorCode: ApprovalEffectErrorCode) => Effect.gen(function* () {
-      if (effectId) yield* finishApprovalEffect(approvalSql, effectId, errorCode).pipe(Effect.uninterruptible);
-      yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId, kind: "provider.approval.respond.failed",
-        summary: "Provider approval response failed", detail,
-        ...(guarded ? { errorCode } : {}),
-        turnId: null, createdAt: event.payload.createdAt, requestId: event.payload.requestId,
-        ...(context ? { decisionCommandId: context.commandId } : {}),
+    const failure = (detail: string, errorCode: ApprovalEffectErrorCode) =>
+      Effect.gen(function* () {
+        if (effectId)
+          yield* finishApprovalEffect(approvalSql, effectId, errorCode).pipe(
+            Effect.uninterruptible,
+          );
+        yield* appendProviderFailureActivity({
+          threadId: event.payload.threadId,
+          kind: "provider.approval.respond.failed",
+          summary: "Provider approval response failed",
+          detail,
+          ...(guarded ? { errorCode } : {}),
+          turnId: null,
+          createdAt: event.payload.createdAt,
+          requestId: event.payload.requestId,
+          ...(context ? { decisionCommandId: context.commandId } : {}),
+        });
       });
-    });
     yield* Effect.gen(function* () {
       // Every failure after claiming the effect must leave a terminal receipt,
       // including a shell lookup failure before the provider call is reached.
@@ -1656,23 +1681,31 @@ const make = Effect.gen(function* () {
       if (!thread && !guarded) return;
       const hasSession = thread?.session && thread.session.status !== "stopped";
       if (!hasSession) {
-        return yield* failure("No active provider session is bound to this thread.", "PROVIDER_SESSION_UNAVAILABLE");
+        return yield* failure(
+          "No active provider session is bound to this thread.",
+          "PROVIDER_SESSION_UNAVAILABLE",
+        );
       }
       yield* providerService.respondToRequest({
-        threadId: event.payload.threadId, requestId: event.payload.requestId,
+        threadId: event.payload.threadId,
+        requestId: event.payload.requestId,
         decision: event.payload.decision,
         ...(context ? { decisionContext: context } : {}),
       });
       if (effectId) yield* finishApprovalEffect(approvalSql, effectId);
     }).pipe(
-      Effect.catchCause((cause) => failure(
-        isUnknownPendingApprovalRequestError(cause)
-          ? stalePendingRequestDetail("approval", event.payload.requestId)
-          : Cause.pretty(cause),
-        guarded && Cause.hasInterruptsOnly(cause)
-          ? context?.feedback !== undefined ? "FEEDBACK_DELIVERY_UNKNOWN" : "APPROVAL_EFFECT_UNKNOWN"
-          : approvalEffectErrorCode(cause),
-      )),
+      Effect.catchCause((cause) =>
+        failure(
+          isUnknownPendingApprovalRequestError(cause)
+            ? stalePendingRequestDetail("approval", event.payload.requestId)
+            : Cause.pretty(cause),
+          guarded && Cause.hasInterruptsOnly(cause)
+            ? context?.feedback !== undefined
+              ? "FEEDBACK_DELIVERY_UNKNOWN"
+              : "APPROVAL_EFFECT_UNKNOWN"
+            : approvalEffectErrorCode(cause),
+        ),
+      ),
     );
   });
 

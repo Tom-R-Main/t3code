@@ -10,8 +10,9 @@ export const ApprovalScope = Schema.Struct({
 });
 export type ApprovalScope = typeof ApprovalScope.Type;
 
-export const DeclineFeedback = Schema.String.check(Schema.makeFilter((value: string) =>
-  value.trim().length > 0 && Array.from(value).length <= 4000));
+export const DeclineFeedback = Schema.String.check(
+  Schema.makeFilter((value: string) => value.trim().length > 0 && Array.from(value).length <= 4000),
+);
 
 export const ApprovalDecisionContext = Schema.Struct({
   commandId: Identifier,
