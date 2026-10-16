@@ -101,10 +101,22 @@ try {
   for (const lane of lanes) {
     const item = { package: lane.cwd, status: "failed" };
     summary.typechecks.push(item); record();
-    try { checked(join(root, "node_modules/.bin/tsc"), ["--noEmit"], join(root, lane.cwd), `${lane.name}-typecheck`); item.status = "passed"; }
-    catch (error) { item.error = String(error); failed = true; }
+    const { result } = run(join(root, "node_modules/.bin/tsc"), ["--noEmit"], join(root, lane.cwd), `${lane.name}-typecheck`);
+    item.exitCode = result.status;
+    if (result.error || result.signal !== null || !Number.isInteger(result.status) || result.status < 0) {
+      // Spawn failure, timeout and signal termination leave cleanup uncertain.
+      // Never start another compiler after an abnormal process outcome.
+      item.processOutcome = "abnormal_exit";
+      item.error = String(result.error ?? result.signal ?? "Unknown compiler process outcome");
+      record();
+      throw new Error("Compiler process did not exit normally; remaining qualification was not run");
+    }
+    item.processOutcome = "normal_exit";
+    if (result.status === 0) item.status = "passed";
+    else { item.error = `Compiler exited with status ${result.status}`; failed = true; }
+    // A completed nonzero compiler run is a failed gate, but its diagnostics
+    // do not hide the other two scoped compiler results.
     record();
-    assert(!failed, "Typecheck failed; remaining qualification was not run");
   }
   assert(!failed, "One or more scoped qualification lanes failed; see retained evidence");
   summary.status = "passed";
