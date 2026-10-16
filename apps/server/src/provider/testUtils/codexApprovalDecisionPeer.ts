@@ -2,6 +2,7 @@
 import { createInterface } from "node:readline";
 import { spawnSync } from "node:child_process";
 import { dirname } from "node:path";
+import type * as CodexSchema from "effect-codex-app-server/schema";
 
 const scenario = process.argv[2];
 const effectFile = process.argv[3];
@@ -13,6 +14,18 @@ const events: string[] = [];
 let steeredFeedback: string | undefined;
 let beginId: string | number | undefined;
 const send = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
+const completeAssistant = (itemId: string, text: string) => {
+  send({ method: "item/agentMessage/delta", params: {
+    threadId: "provider-thread", turnId: "turn-1", itemId, delta: text,
+  } });
+  // The production ingestion path buffers paragraph text until a real item
+  // lifecycle boundary. A delta alone is not a completed peer continuation.
+  const params: CodexSchema.V2ItemCompletedNotification = {
+    completedAtMs: 2, threadId: "provider-thread", turnId: "turn-1",
+    item: { type: "agentMessage", id: itemId, text },
+  };
+  send({ method: "item/completed", params });
+};
 createInterface({ input: process.stdin }).on("line", (line: string) => {
   const message = JSON.parse(line) as {
     id?: string | number; method?: string;
@@ -65,13 +78,11 @@ createInterface({ input: process.stdin }).on("line", (line: string) => {
         cwd: commandScope.cwd, argv0: commandScope.argv[0], stdio: "pipe", timeout: 5000,
       });
       if (result.status !== 0) throw new Error("Fixture command did not complete");
-      send({ method: "item/agentMessage/delta", params: { threadId: "provider-thread", turnId: "turn-1",
-        itemId: "fixture-effect", delta: "Fixture tool effect completed." } });
+      completeAssistant("fixture-effect", "Fixture tool effect completed.");
     }
-    if (message.result.decision === "decline") send({ method: "item/agentMessage/delta", params: {
-      threadId: "provider-thread", turnId: "turn-1", itemId: "continuation",
-      delta: `Synthetic peer consumed native decline after steering. turn=turn-1 feedback=${JSON.stringify(steeredFeedback)}`,
-    } });
+    if (message.result.decision === "decline") completeAssistant("continuation",
+      `Synthetic peer consumed native decline after steering. turn=turn-1 feedback=${JSON.stringify(steeredFeedback)}`,
+    );
     if (beginId !== undefined) send({ jsonrpc: "2.0", id: beginId, result: { events } });
   }
 });

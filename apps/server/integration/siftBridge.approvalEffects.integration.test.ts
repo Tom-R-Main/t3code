@@ -11,7 +11,22 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { makeCodexSessionRuntime } from "../src/provider/Layers/CodexSessionRuntime.ts";
-import { makeOrchestrationIntegrationHarness } from "./OrchestrationEngineHarness.integration.ts";
+import { makeOrchestrationIntegrationHarness, type OrchestrationIntegrationHarness } from "./OrchestrationEngineHarness.integration.ts";
+
+const waitForCompletedAssistantText = (
+  harness: OrchestrationIntegrationHarness,
+  expected: string,
+) => Effect.gen(function* () {
+  const events = yield* harness.waitForDomainEvent((event) => event.type === "thread.message-sent" &&
+    event.payload.role === "assistant" && event.payload.text === expected);
+  const message = events.find((event) => event.type === "thread.message-sent" &&
+    event.payload.role === "assistant" && event.payload.text === expected);
+  if (!message || message.type !== "thread.message-sent") throw new Error("Missing expected peer text");
+  // Observe the normal finalization boundary as well as the streamed text.
+  // Neither the approval receipt nor an unflushed peer delta satisfies this.
+  yield* harness.waitForDomainEvent((event) => event.type === "thread.message-sent" &&
+    event.payload.messageId === message.payload.messageId && event.payload.streaming === false);
+});
 
 const ApprovalInfo = Schema.Struct({
   requestId: Schema.String, detail: Schema.String, approvalScope: ApprovalScope,
@@ -77,8 +92,8 @@ for (const scenario of ["success", "stale-turn", "lost-reply", "scope-mismatch"]
       const settled = yield* harness.siftBridge(request);
       if (scenario === "success") {
         Assert.equal(settled.ok && settled.result.state, "accepted");
-        yield* harness.waitForDomainEvent((event) => event.type === "thread.message-sent" &&
-          event.payload.role === "assistant" && event.payload.text.includes('consumed native decline after steering. turn=turn-1 feedback="Use the retained local fixture."'));
+        yield* waitForCompletedAssistantText(harness,
+          'Synthetic peer consumed native decline after steering. turn=turn-1 feedback="Use the retained local fixture."');
         const resolved = yield* harness.waitForDomainEvent((event) => event.type === "thread.activity-appended" &&
           event.payload.activity.kind === "approval.resolved");
         Assert.ok(resolved.some((event) => event.type === "thread.activity-appended" &&
@@ -160,8 +175,7 @@ for (const scenario of ["command-accept", "command-scope-mismatch", "command-leg
         Assert.equal(settled.ok && settled.result.state, "accepted");
         // An accepted response alone is insufficient: wait for the independently
         // executed child command, then inspect its exclusive-create file effect.
-        yield* harness.waitForDomainEvent((item) => item.type === "thread.message-sent" &&
-          item.payload.role === "assistant" && item.payload.text.includes("Fixture tool effect completed."));
+        yield* waitForCompletedAssistantText(harness, "Fixture tool effect completed.");
         Assert.deepEqual(JSON.parse(yield* fs.readFileString(effectFile)), {
           effect: "approved fixture effect", argv0: "fixture-node-zero",
         });
