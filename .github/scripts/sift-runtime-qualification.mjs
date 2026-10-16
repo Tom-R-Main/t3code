@@ -1,19 +1,19 @@
-import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import * as NodeAssert from "node:assert/strict";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeURL from "node:url";
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const root = NodePath.resolve(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "../..");
 const output = process.env.SIFT_QUALIFICATION_OUTPUT;
-assert(
+NodeAssert.ok(
   output && process.env.GITHUB_ACTIONS === "true",
   "Run only in the isolated qualification job",
 );
 const branches = ["codex/uix-c3a-exact-decisions", "codex/uix-c4-executor-bridge"];
-assert(branches.includes(process.env.GITHUB_REF_NAME), "Unsupported qualification branch");
-mkdirSync(output, { recursive: true });
+NodeAssert.ok(branches.includes(process.env.GITHUB_REF_NAME), "Unsupported qualification branch");
+NodeFS.mkdirSync(output, { recursive: true });
 const summary = {
   version: 1,
   head: process.env.GITHUB_SHA,
@@ -24,10 +24,12 @@ const summary = {
   lanes: [],
   typechecks: [],
 };
-const record = () => writeFileSync(join(output, "summary.json"), JSON.stringify(summary, null, 2));
-const hash = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+const record = () =>
+  NodeFS.writeFileSync(NodePath.join(output, "summary.json"), JSON.stringify(summary, null, 2));
+const hash = (path) =>
+  NodeCrypto.createHash("sha256").update(NodeFS.readFileSync(path)).digest("hex");
 function run(command, args, cwd, label, timeout = 300_000) {
-  const result = spawnSync(command, args, {
+  const result = NodeChildProcess.spawnSync(command, args, {
     cwd,
     encoding: "utf8",
     timeout,
@@ -35,13 +37,13 @@ function run(command, args, cwd, label, timeout = 300_000) {
     env: process.env,
   });
   const log = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-  writeFileSync(join(output, `${label}.log`), log);
+  NodeFS.writeFileSync(NodePath.join(output, `${label}.log`), log);
   process.stdout.write(log);
   return { result, log };
 }
 function checked(command, args, cwd, label) {
   const { result, log } = run(command, args, cwd, label);
-  assert(
+  NodeAssert.ok(
     !result.error && result.status === 0 && result.signal === null,
     `${label} failed or timed out`,
   );
@@ -49,25 +51,28 @@ function checked(command, args, cwd, label) {
 }
 try {
   record();
-  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-  assert.equal(pkg.packageManager, "pnpm@11.10.0");
-  assert.equal(process.version, "v24.13.1");
+  const pkg = JSON.parse(NodeFS.readFileSync(NodePath.join(root, "package.json"), "utf8"));
+  NodeAssert.equal(pkg.packageManager, "pnpm@11.10.0");
+  NodeAssert.equal(process.version, "v24.13.1");
   const vitePackage = JSON.parse(
-    readFileSync(join(root, "node_modules/vite-plus/package.json"), "utf8"),
+    NodeFS.readFileSync(NodePath.join(root, "node_modules/vite-plus/package.json"), "utf8"),
   );
   const tsPackage = JSON.parse(
-    readFileSync(join(root, "node_modules/typescript/package.json"), "utf8"),
+    NodeFS.readFileSync(NodePath.join(root, "node_modules/typescript/package.json"), "utf8"),
   );
-  assert.equal(vitePackage.version, "0.3.3");
-  assert.equal(tsPackage.version, "7.0.2");
+  NodeAssert.equal(vitePackage.version, "0.3.3");
+  NodeAssert.equal(tsPackage.version, "7.0.2");
   summary.toolchain = {
     node: process.version,
     packageManager: pkg.packageManager,
     vitePlus: vitePackage.version,
     typescript: tsPackage.version,
-    lockSha256: hash(join(root, "pnpm-lock.yaml")),
+    lockSha256: hash(NodePath.join(root, "pnpm-lock.yaml")),
   };
-  assert.equal(checked("git", ["rev-parse", "HEAD"], root, "checked-head").trim(), summary.head);
+  NodeAssert.equal(
+    checked("git", ["rev-parse", "HEAD"], root, "checked-head").trim(),
+    summary.head,
+  );
   checked(
     "git",
     [
@@ -85,7 +90,7 @@ try {
   checked("vp", ["--version"], root, "vp-version");
   const help = checked("vp", ["test", "--help"], root, "vp-test-help");
   for (const flag of ["reporter", "outputFile", "maxWorkers", "fileParallelism"])
-    assert(
+    NodeAssert.ok(
       help.replace(/[-_]/g, "").toLowerCase().includes(flag.toLowerCase()),
       `Installed test CLI does not advertise ${flag}`,
     );
@@ -131,8 +136,8 @@ try {
   });
   let failed = false;
   for (const lane of lanes) {
-    const cwd = join(root, lane.cwd),
-      reportPath = join(output, `${lane.name}.json`);
+    const cwd = NodePath.join(root, lane.cwd),
+      reportPath = NodePath.join(output, `${lane.name}.json`);
     const item = {
       name: lane.name,
       package: lane.cwd,
@@ -144,9 +149,12 @@ try {
     summary.lanes.push(item);
     record();
     try {
-      assert(!existsSync(reportPath), "Fresh test report path required");
+      NodeAssert.ok(!NodeFS.existsSync(reportPath), "Fresh test report path required");
       for (const file of lane.files)
-        assert(existsSync(join(cwd, file)), `Required test missing: ${file}`);
+        NodeAssert.ok(
+          NodeFS.existsSync(NodePath.join(cwd, file)),
+          `Required test missing: ${file}`,
+        );
       const { result } = run(
         "vp",
         [
@@ -163,15 +171,15 @@ try {
         lane.name,
         600_000,
       );
-      const report = JSON.parse(readFileSync(reportPath, "utf8"));
+      const report = JSON.parse(NodeFS.readFileSync(reportPath, "utf8"));
       item.total = report.numTotalTests;
       item.passed = report.numPassedTests;
-      assert(
+      NodeAssert.ok(
         !result.error && result.status === 0 && result.signal === null,
         "Test process failed or timed out",
       );
-      assert.equal(report.success, true);
-      assert(
+      NodeAssert.equal(report.success, true);
+      NodeAssert.ok(
         Number.isSafeInteger(item.total) && item.total > 0 && item.passed === item.total,
         "No positive complete test count",
       );
@@ -182,20 +190,20 @@ try {
         "numPendingTestSuites",
         "numTodoTests",
       ])
-        assert.equal(report[key], 0, `Nonpassing count: ${key}`);
-      assert.deepEqual(
-        report.testResults.map((file) => resolve(file.name)).sort(),
-        lane.files.map((file) => join(cwd, file)).sort(),
+        NodeAssert.equal(report[key], 0, `Nonpassing count: ${key}`);
+      NodeAssert.deepEqual(
+        report.testResults.map((file) => NodePath.resolve(file.name)).sort(),
+        lane.files.map((file) => NodePath.join(cwd, file)).sort(),
       );
       let actualCount = 0;
       for (const file of report.testResults) {
-        assert.equal(file.status, "passed");
-        assert(file.assertionResults.length > 0, `No tests executed: ${file.name}`);
+        NodeAssert.equal(file.status, "passed");
+        NodeAssert.ok(file.assertionResults.length > 0, `No tests executed: ${file.name}`);
         for (const test of file.assertionResults)
-          assert.equal(test.status, "passed", `Test did not pass: ${test.fullName}`);
+          NodeAssert.equal(test.status, "passed", `Test did not pass: ${test.fullName}`);
         actualCount += file.assertionResults.length;
       }
-      assert.equal(actualCount, item.total);
+      NodeAssert.equal(actualCount, item.total);
       item.status = "passed";
     } catch (error) {
       item.error = String(error);
@@ -204,7 +212,7 @@ try {
     record();
     // A timed-out runner may have uncertain child cleanup. Start no later lane
     // after any failure; the hosted job retains evidence and tears down.
-    assert(!failed, "Test lane failed; remaining qualification was not run");
+    NodeAssert.ok(!failed, "Test lane failed; remaining qualification was not run");
   }
   // Package scripts resolve the pinned compiler; one scoped invocation at a time.
   // Regression suites share the server package and must not duplicate its check.
@@ -213,9 +221,9 @@ try {
     summary.typechecks.push(item);
     record();
     const { result } = run(
-      join(root, "node_modules/.bin/tsc"),
+      NodePath.join(root, "node_modules/.bin/tsc"),
       ["--noEmit"],
-      join(root, lane.cwd),
+      NodePath.join(root, lane.cwd),
       `${lane.name}-typecheck`,
     );
     item.exitCode = result.status;
@@ -244,7 +252,7 @@ try {
     // do not hide the other two scoped compiler results.
     record();
   }
-  assert(!failed, "One or more scoped qualification lanes failed; see retained evidence");
+  NodeAssert.ok(!failed, "One or more scoped qualification lanes failed; see retained evidence");
   summary.status = "passed";
 } catch (error) {
   summary.status = "failed";
