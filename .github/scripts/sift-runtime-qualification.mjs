@@ -63,6 +63,13 @@ try {
       ] : []),
     ] },
   ];
+  // These existing model-free regression suites construct the driver/reactor
+  // layers whose required durable SQL context changed with approval effects.
+  // Keep their runtime counts separate from the original focused 40-test lane.
+  lanes.push({ name: "server-regressions", cwd: "apps/server", typecheck: false, files: [
+    "src/provider/Layers/ProviderRegistry.test.ts",
+    "src/project/AgentSessionImporter.test.ts",
+  ] });
   let failed = false;
   for (const lane of lanes) {
     const cwd = join(root, lane.cwd), reportPath = join(output, `${lane.name}.json`);
@@ -98,7 +105,8 @@ try {
     assert(!failed, "Test lane failed; remaining qualification was not run");
   }
   // Package scripts resolve the pinned compiler; one scoped invocation at a time.
-  for (const lane of lanes) {
+  // Regression suites share the server package and must not duplicate its check.
+  for (const lane of lanes.filter((lane) => lane.typecheck !== false)) {
     const item = { package: lane.cwd, status: "failed" };
     summary.typechecks.push(item); record();
     const { result } = run(join(root, "node_modules/.bin/tsc"), ["--noEmit"], join(root, lane.cwd), `${lane.name}-typecheck`);
