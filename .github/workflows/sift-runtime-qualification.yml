@@ -43,6 +43,7 @@ jobs:
               - --frozen-lockfile
               - --filter=@t3tools/monorepo
               - --filter=t3...
+              - --filter=@t3tools/scripts...
 
       # These commands use only protocol peers, temporary SQLite/files/git and
       # private sockets. They never launch a real provider or a model turn.

@@ -3,7 +3,7 @@ import * as NodeCrypto from "node:crypto";
 import { domainToASCII } from "node:url";
 import * as NodePath from "node:path";
 import { Buffer } from "node:buffer";
-import type { ApprovalDecisionContext, ApprovalScope } from "@t3tools/contracts";
+import { ApprovalDecisionContext, type ApprovalScope } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -151,7 +151,8 @@ export function makeDeclineFeedbackJournal(sql: SqlClient.SqlClient): DeclineFee
         request_id TEXT PRIMARY KEY, command_id TEXT NOT NULL,
         payload_digest TEXT NOT NULL, phase TEXT NOT NULL CHECK (phase IN ('delivery_unknown', 'delivered'))
       )`;
-      const payloadDigest = digest(JSON.stringify(context));
+      const payload = yield* Schema.encodeEffect(Schema.fromJsonString(ApprovalDecisionContext))(context);
+      const payloadDigest = digest(payload);
       const inserted = yield* sql<{ request_id: string }>`INSERT INTO sift_decline_feedback
         (request_id, command_id, payload_digest, phase)
         VALUES (${requestId}, ${context.commandId}, ${payloadDigest}, 'delivery_unknown')
@@ -164,7 +165,7 @@ export function makeDeclineFeedbackJournal(sql: SqlClient.SqlClient): DeclineFee
         return yield* failure("FEEDBACK_COMMAND_CONFLICT");
       if (row.phase !== "delivered") return yield* failure("FEEDBACK_DELIVERY_UNKNOWN");
       return "delivered" as const;
-    }).pipe(Effect.mapError((error) => error instanceof CodexApprovalDecisionError
+    }).pipe(Effect.mapError((error) => Schema.is(CodexApprovalDecisionError)(error)
       ? error : failure("FEEDBACK_JOURNAL_FAILED"))),
     delivered: (requestId) => sql`UPDATE sift_decline_feedback SET phase = 'delivered'
       WHERE request_id = ${requestId}`.pipe(

@@ -1,15 +1,32 @@
 // A protocol peer for approval tests. It has no provider binary, auth, or model.
 import { createInterface } from "node:readline";
-import { spawnSync } from "node:child_process";
-import { dirname } from "node:path";
+import * as NodePath from "@effect/platform-node/NodePath";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Effect from "effect/Effect";
+import * as Path from "effect/Path";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 
+const path = await Effect.runPromise(Path.Path.pipe(Effect.provide(NodePath.layer)));
 const scenario = process.argv[2];
 const effectFile = process.argv[3];
 const fixtureScript = "require('node:fs').writeFileSync(process.argv[1], JSON.stringify({effect:'approved fixture effect',argv0:process.argv0}), {flag:'wx'});";
 const commandScope = effectFile ? {
-  version: 1, program: process.argv[4] ?? process.execPath, argv: ["fixture-node-zero", "-e", fixtureScript, effectFile], cwd: dirname(effectFile),
+  version: 1, program: process.argv[4] ?? process.execPath, argv: ["fixture-node-zero", "-e", fixtureScript, effectFile] as const, cwd: path.dirname(effectFile),
 } : undefined;
+// The pinned Effect spawner has no argv0 option. This fixed Bash adapter
+// passes each operand as a positional argument to execve without parsing it.
+// The child observes and writes the independently chosen native argv[0].
+const executeFixture = (scope: NonNullable<typeof commandScope>) => Effect.gen(function* () {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const child = yield* spawner.spawn(ChildProcess.make("/bin/bash", [
+    "-c", 'exec -a "$1" "$2" "${@:3}"', "c3a-native-exec",
+    scope.argv[0], scope.program, ...scope.argv.slice(1),
+  ], { cwd: scope.cwd, shell: false, detached: false,
+    stdin: "ignore", stdout: "ignore", stderr: "ignore" }));
+  if (Number(yield* child.exitCode) !== 0) return yield* Effect.die(new Error("Fixture command did not complete"));
+}).pipe(Effect.timeout("5 seconds"), Effect.scoped, Effect.provide(NodeServices.layer));
+
 const events: string[] = [];
 let steeredFeedback: string | undefined;
 let beginId: string | number | undefined;
@@ -74,11 +91,15 @@ createInterface({ input: process.stdin }).on("line", (line: string) => {
     if (commandScope && message.result.decision === "accept") {
       // Execute exactly the vector whose typed scope was sent above. This child
       // is a model-free fixture with one exclusive-create effect in a test tempdir.
-      const result = spawnSync(commandScope.program, commandScope.argv.slice(1), {
-        cwd: commandScope.cwd, argv0: commandScope.argv[0], stdio: "pipe", timeout: 5000,
+      void Effect.runPromise(executeFixture(commandScope)).then(() => {
+        completeAssistant("fixture-effect", "Fixture tool effect completed.");
+        if (beginId !== undefined) send({ jsonrpc: "2.0", id: beginId, result: { events } });
+      }).catch(() => {
+        process.stderr.write("Fixture command did not complete\n");
+        process.exitCode = 1;
+        process.stdin.destroy();
       });
-      if (result.status !== 0) throw new Error("Fixture command did not complete");
-      completeAssistant("fixture-effect", "Fixture tool effect completed.");
+      return;
     }
     if (message.result.decision === "decline") completeAssistant("continuation",
       `Synthetic peer consumed native decline after steering. turn=turn-1 feedback=${JSON.stringify(steeredFeedback)}`,

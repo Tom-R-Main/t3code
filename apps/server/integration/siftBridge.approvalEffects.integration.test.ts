@@ -72,7 +72,7 @@ for (const scenario of ["success", "stale-turn", "lost-reply", "scope-mismatch"]
       const approvalEvent = events.find((event) => event.type === "thread.activity-appended" &&
         event.payload.activity.kind === "approval.requested");
       if (!approvalEvent || approvalEvent.type !== "thread.activity-appended") throw new Error("No approval event");
-      const approval = Schema.decodeUnknownSync(ApprovalInfo)(approvalEvent.payload.activity.payload);
+      const approval = yield* Schema.decodeUnknownEffect(ApprovalInfo)(approvalEvent.payload.activity.payload);
       // This peer supplies neither command nor reason. The host remains visible to the human.
       Assert.equal(approval.detail, "Network target: https example.com");
       const request = { ...base, operation: "approve", commandId: "decision", requestId: approval.requestId,
@@ -154,10 +154,11 @@ for (const scenario of ["command-accept", "command-scope-mismatch", "command-leg
       const event = events.find((item) => item.type === "thread.activity-appended" &&
         item.payload.activity.kind === "approval.requested");
       if (!event || event.type !== "thread.activity-appended") throw new Error("No command approval event");
-      const approval = Schema.decodeUnknownSync(Schema.Struct({
+      const approval = yield* Schema.decodeUnknownEffect(Schema.Struct({
         requestId: Schema.String, approvalScope: Schema.optional(ApprovalScope),
       }))(event.payload.activity.payload);
-      Assert.equal(JSON.stringify(event).includes("siftCommandScope"), false, "Raw argv extension must not reach persisted activity");
+      const persistedEvent = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(event);
+      Assert.equal(persistedEvent.includes("siftCommandScope"), false, "Raw argv extension must not reach persisted activity");
       Assert.equal(yield* fs.exists(effectFile), false, "The peer must wait for approval before executing the fixture");
       if (scenario !== "command-legacy") Assert.equal(approval.approvalScope?.kind, "command");
       else Assert.equal(approval.approvalScope, undefined);
@@ -176,7 +177,10 @@ for (const scenario of ["command-accept", "command-scope-mismatch", "command-leg
         // An accepted response alone is insufficient: wait for the independently
         // executed child command, then inspect its exclusive-create file effect.
         yield* waitForCompletedAssistantText(harness, "Fixture tool effect completed.");
-        Assert.deepEqual(JSON.parse(yield* fs.readFileString(effectFile)), {
+        const effect = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Struct({
+          effect: Schema.String, argv0: Schema.String,
+        })))(yield* fs.readFileString(effectFile));
+        Assert.deepEqual(effect, {
           effect: "approved fixture effect", argv0: "fixture-node-zero",
         });
       } else {
