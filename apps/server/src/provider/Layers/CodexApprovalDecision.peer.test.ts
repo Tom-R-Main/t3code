@@ -23,7 +23,10 @@ it.layer(layer)("Codex feedback protocol peer", (it) => {
         const path = yield* Path.Path;
         const peer = path.join(import.meta.dirname, "../testUtils/codexApprovalDecisionPeer.ts");
         const handle = yield* spawner.spawn(ChildProcess.make(process.execPath, [peer, scenario]));
-        const clientContext = yield* Layer.buildWithScope(CodexClient.layerChildProcess(handle), yield* Scope.Scope);
+        const clientContext = yield* Layer.buildWithScope(
+          CodexClient.layerChildProcess(handle),
+          yield* Scope.Scope,
+        );
         yield* Effect.gen(function* () {
           const client = yield* CodexClient.CodexAppServerClient;
           const pending = yield* Deferred.make<void>();
@@ -38,10 +41,17 @@ it.layer(layer)("Codex feedback protocol peer", (it) => {
           yield* Deferred.await(pending);
           const sql = yield* SqlClient.SqlClient;
           const input = {
-            client, journal: makeDeclineFeedbackJournal(sql), requestId: `peer-${scenario}`,
-            providerThreadId: "provider-thread", pendingTurnId: "turn-1",
+            client,
+            journal: makeDeclineFeedbackJournal(sql),
+            requestId: `peer-${scenario}`,
+            providerThreadId: "provider-thread",
+            pendingTurnId: "turn-1",
             activeTurnId: Effect.succeed("turn-1"),
-            context: { commandId: `command-${scenario}`, attemptId: "attempt-1", feedback: "Use the local fixture." },
+            context: {
+              commandId: `command-${scenario}`,
+              attemptId: "attempt-1",
+              feedback: "Use the local fixture.",
+            },
           };
           if (scenario === "success") {
             yield* deliverDeclineFeedback(input);
@@ -50,10 +60,19 @@ it.layer(layer)("Codex feedback protocol peer", (it) => {
             NodeAssert.deepEqual(yield* Fiber.join(begun), { events: ["steer", "decline"] });
             yield* deliverDeclineFeedback({ ...input, journal: makeDeclineFeedbackJournal(sql) });
           } else {
-            NodeAssert.equal((yield* Effect.flip(deliverDeclineFeedback(input))).code, "FEEDBACK_DELIVERY_UNKNOWN");
-            NodeAssert.equal((yield* Effect.flip(deliverDeclineFeedback({
-              ...input, journal: makeDeclineFeedbackJournal(sql),
-            }))).code, "FEEDBACK_DELIVERY_UNKNOWN");
+            NodeAssert.equal(
+              (yield* Effect.flip(deliverDeclineFeedback(input))).code,
+              "FEEDBACK_DELIVERY_UNKNOWN",
+            );
+            NodeAssert.equal(
+              (yield* Effect.flip(
+                deliverDeclineFeedback({
+                  ...input,
+                  journal: makeDeclineFeedbackJournal(sql),
+                }),
+              )).code,
+              "FEEDBACK_DELIVERY_UNKNOWN",
+            );
             yield* Fiber.interrupt(begun);
           }
         }).pipe(Effect.provide(clientContext));

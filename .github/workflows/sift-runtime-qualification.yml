@@ -19,9 +19,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      CI: 'true'
-      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      CI: "true"
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
     steps:
       - name: Checkout the exact pushed revision
         uses: actions/checkout@v6
@@ -35,8 +35,8 @@ jobs:
       - name: Set up pinned Vite+, Node and locked scoped dependencies
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
-          version: '0.3.3'
-          node-version: '24.13.1'
+          version: "0.3.3"
+          node-version: "24.13.1"
           cache: true
           run-install: |
             args:
@@ -70,9 +70,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      CI: 'true'
-      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      CI: "true"
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
     steps:
       # This job owns a separate disposable checkout. Formatting never changes
       # the workspace whose tests and typechecks provide qualification evidence.
@@ -89,8 +89,8 @@ jobs:
       - name: Set up the same pinned formatting toolchain
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
-          version: '0.3.3'
-          node-version: '24.13.1'
+          version: "0.3.3"
+          node-version: "24.13.1"
           cache: true
           run-install: |
             args:

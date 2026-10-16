@@ -534,7 +534,9 @@ export function runtimeEventToActivities(
             requestType: event.payload.requestType,
             ...(event.payload.decision ? { decision: event.payload.decision } : {}),
             ...(event.payload.feedbackDelivered ? { feedbackDelivered: true } : {}),
-            ...(event.payload.ruleSourceRequestId ? { ruleSourceRequestId: event.payload.ruleSourceRequestId } : {}),
+            ...(event.payload.ruleSourceRequestId
+              ? { ruleSourceRequestId: event.payload.ruleSourceRequestId }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,

@@ -50,7 +50,7 @@ export const isManagedAccessEnabled = (env: NodeJS.ProcessEnv = process.env): bo
  * the provider protocol can reveal processes the previous app-server left.
  * Unset or malformed, a managed resume stays refused until Stop.
  */
-export const PRIOR_PROCESS_TREE_TERMINATED_ENV = "T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED";
+const PRIOR_PROCESS_TREE_TERMINATED_ENV = "T3_SIFT_PRIOR_PROCESS_TREE_TERMINATED";
 export const priorProcessTreeTerminated = (env: NodeJS.ProcessEnv = process.env): boolean => {
   const value = env[PRIOR_PROCESS_TREE_TERMINATED_ENV];
   return value !== undefined && /^[1-9][0-9]{0,9}$/.test(value) && Number(value) <= 2_147_483_647;
@@ -134,7 +134,7 @@ export const ensureManagedAccessTables = Effect.gen(function* () {
   yield* sql`CREATE TABLE IF NOT EXISTS sift_managed_access_grants (credential_hash TEXT PRIMARY KEY, subject TEXT NOT NULL, session_id TEXT UNIQUE, created_at TEXT NOT NULL)`;
 });
 
-export const credentialHash = (credential: string) =>
+const credentialHash = (credential: string) =>
   digest(`sift-managed-credential:${credential}`);
 
 /** Records a bridge-issued credential; called by the bridge under its mutex. */
@@ -204,7 +204,7 @@ const StoredBinding = Schema.Struct({
 const decodeStoredBinding = Schema.decodeUnknownEffect(Schema.fromJsonString(StoredBinding));
 
 /** The ready attempt recorded by the bridge, or none while unbound or mid-rebind. */
-export const readCurrentAttempt: Effect.Effect<
+const readCurrentAttempt: Effect.Effect<
   Option.Option<ManagedAttempt>,
   never,
   SqlClient.SqlClient

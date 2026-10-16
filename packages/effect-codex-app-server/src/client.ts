@@ -20,7 +20,8 @@ import {
 import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
 
 type ServerRequestParamsByMethod = Omit<
-  CodexRpc.ServerRequestParamsByMethod, "item/commandExecution/requestApproval"
+  CodexRpc.ServerRequestParamsByMethod,
+  "item/commandExecution/requestApproval"
 > & { readonly "item/commandExecution/requestApproval": CommandApprovalParams };
 
 export interface CodexAppServerClientOptions {
@@ -105,10 +106,10 @@ const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make")(func
 
   const getServerRequestParamSchema = <M extends CodexRpc.ServerRequestMethod>(
     method: M,
-  ):
-    | Schema.Codec<ServerRequestParamsByMethod[M], ServerRequestParamsByMethod[M]>
-    | undefined => (method === "item/commandExecution/requestApproval"
-      ? CommandApprovalParams : CodexRpc.SERVER_REQUEST_PARAMS[method]) as never;
+  ): Schema.Codec<ServerRequestParamsByMethod[M], ServerRequestParamsByMethod[M]> | undefined =>
+    (method === "item/commandExecution/requestApproval"
+      ? CommandApprovalParams
+      : CodexRpc.SERVER_REQUEST_PARAMS[method]) as never;
 
   const getServerRequestResponseSchema = <M extends CodexRpc.ServerRequestMethod>(
     method: M,

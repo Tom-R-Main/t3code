@@ -2395,9 +2395,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         );
         const createRuntime = options?.makeRuntime ?? makeCodexSessionRuntime;
         const runtimeEffect = createRuntime(runtimeInput);
-        const runtime = yield* (Option.isSome(feedbackSql)
-          ? runtimeEffect.pipe(Effect.provideService(SqlClient.SqlClient, feedbackSql.value))
-          : runtimeEffect).pipe(
+        const runtime = yield* (
+          Option.isSome(feedbackSql)
+            ? runtimeEffect.pipe(Effect.provideService(SqlClient.SqlClient, feedbackSql.value))
+            : runtimeEffect
+        ).pipe(
           Effect.provideService(Scope.Scope, sessionScope),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
           Effect.provideService(Crypto.Crypto, crypto),
@@ -2719,9 +2721,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       ),
     );
 
-  const respondToRequest: CodexAdapterShape["respondToRequest"] = (threadId, requestId, decision, decisionContext) =>
+  const respondToRequest: CodexAdapterShape["respondToRequest"] = (
+    threadId,
+    requestId,
+    decision,
+    decisionContext,
+  ) =>
     requireSession(threadId).pipe(
-      Effect.flatMap((session) => session.runtime.respondToRequest(requestId, decision, decisionContext)),
+      Effect.flatMap((session) =>
+        session.runtime.respondToRequest(requestId, decision, decisionContext),
+      ),
       Effect.mapError((cause) =>
         cause._tag === "ProviderAdapterSessionNotFoundError"
           ? cause

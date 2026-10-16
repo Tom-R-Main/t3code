@@ -40,7 +40,10 @@ import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSes
 import { ServerSettingsService } from "../src/serverSettings.ts";
 import * as StorageCleanup from "../src/storageCleanup.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
-import { makeCodexAdapter, type CodexAdapterLiveOptions } from "../src/provider/Layers/CodexAdapter.ts";
+import {
+  makeCodexAdapter,
+  type CodexAdapterLiveOptions,
+} from "../src/provider/Layers/CodexAdapter.ts";
 import {
   NoOpProviderEventLoggers,
   ProviderEventLoggers,
@@ -185,9 +188,9 @@ const tryRuntimePromise = <A>(operation: string, run: () => Promise<A>) =>
 
 export interface OrchestrationIntegrationHarness {
   readonly siftBridge: Effect.Success<typeof makeSiftBridge>;
-  readonly readApprovalEffect: (commandId: string) => Effect.Effect<
-    Effect.Success<ReturnType<typeof readApprovalEffect>>, never
-  >;
+  readonly readApprovalEffect: (
+    commandId: string,
+  ) => Effect.Effect<Effect.Success<ReturnType<typeof readApprovalEffect>>, never>;
   readonly rootDir: string;
   readonly workspaceDir: string;
   readonly dbPath: string;
@@ -617,9 +620,12 @@ export const makeOrchestrationIntegrationHarness = (
 
     return {
       siftBridge,
-      readApprovalEffect: (commandId) => tryRuntimePromise("read guarded approval receipt", () =>
-        runtime.runPromise(Effect.flatMap(SqlClient.SqlClient, (sql) => readApprovalEffect(sql, commandId))),
-      ).pipe(Effect.orDie),
+      readApprovalEffect: (commandId) =>
+        tryRuntimePromise("read guarded approval receipt", () =>
+          runtime.runPromise(
+            Effect.flatMap(SqlClient.SqlClient, (sql) => readApprovalEffect(sql, commandId)),
+          ),
+        ).pipe(Effect.orDie),
       rootDir,
       workspaceDir,
       dbPath,

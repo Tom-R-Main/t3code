@@ -1357,9 +1357,13 @@ export const makeCodexSessionRuntime = (
     const feedbackJournal = Option.isSome(sql) ? makeDeclineFeedbackJournal(sql.value) : undefined;
     // A resumed provider thread still gets a fresh process/session authority.
     const sessionIncarnation = yield* crypto.randomUUIDv4.pipe(
-      Effect.mapError((cause) => new CodexErrors.CodexAppServerIdentifierGenerationError({
-        purpose: "provider-event", cause,
-      })),
+      Effect.mapError(
+        (cause) =>
+          new CodexErrors.CodexAppServerIdentifierGenerationError({
+            purpose: "provider-event",
+            cause,
+          }),
+      ),
     );
     const pendingApprovalsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingApproval>());
     const approvalCorrelationsRef = yield* Ref.make(new Map<string, ApprovalCorrelation>());
@@ -2236,7 +2240,8 @@ export const makeCodexSessionRuntime = (
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4("command-approval-request"));
         const turnId = TurnId.make(payload.turnId);
         const itemId = ProviderItemId.make(payload.itemId);
-        const approvalScope = codexNetworkApprovalScope(sessionIncarnation, payload) ??
+        const approvalScope =
+          codexNetworkApprovalScope(sessionIncarnation, payload) ??
           codexCommandApprovalScope(sessionIncarnation, payload);
         const feedbackSupported = feedbackJournal !== undefined;
         const decision = yield* Deferred.make<ProviderApprovalDecision>();
@@ -3297,20 +3302,39 @@ export const makeCodexSessionRuntime = (
               requestId,
             });
           }
-          if (decisionContext && decision !== "accept" && decision !== "decline" && decision !== "cancel")
-            return yield* new CodexApprovalDecisionError({ code: "GUARDED_DECISION_MUST_BE_ONE_TIME" });
+          if (
+            decisionContext &&
+            decision !== "accept" &&
+            decision !== "decline" &&
+            decision !== "cancel"
+          )
+            return yield* new CodexApprovalDecisionError({
+              code: "GUARDED_DECISION_MUST_BE_ONE_TIME",
+            });
           yield* Effect.try({
-            try: () => assertApprovalScope(decisionContext?.expectedApprovalScope, pending.approvalScope),
+            try: () =>
+              assertApprovalScope(decisionContext?.expectedApprovalScope, pending.approvalScope),
             catch: () => new CodexApprovalDecisionError({ code: "APPROVAL_SCOPE_MISMATCH" }),
           });
-          if (decisionContext?.ruleSourceRequestId && (!decisionContext.expectedApprovalScope || decision !== "accept"))
+          if (
+            decisionContext?.ruleSourceRequestId &&
+            (!decisionContext.expectedApprovalScope || decision !== "accept")
+          )
             return yield* new CodexApprovalDecisionError({ code: "INVALID_RULE_APPLICATION" });
           if (decisionContext?.feedback !== undefined) {
-            if (decision !== "decline" || !feedbackJournal || !pending.feedbackSupported || !pending.turnId || !pending.providerThreadId)
+            if (
+              decision !== "decline" ||
+              !feedbackJournal ||
+              !pending.feedbackSupported ||
+              !pending.turnId ||
+              !pending.providerThreadId
+            )
               return yield* new CodexApprovalDecisionError({ code: "FEEDBACK_UNSUPPORTED" });
             const requestingProviderThreadId = pending.providerThreadId;
             yield* deliverDeclineFeedback({
-              client, journal: feedbackJournal, requestId,
+              client,
+              journal: feedbackJournal,
+              requestId,
               providerThreadId: requestingProviderThreadId,
               pendingTurnId: pending.turnId,
               activeTurnId: Effect.gen(function* () {
@@ -3330,13 +3354,18 @@ export const makeCodexSessionRuntime = (
             return next;
           });
           const released = yield* Deferred.succeed(pending.decision, decision);
-          if (!released) return yield* new CodexApprovalDecisionError({ code: "APPROVAL_ALREADY_RELEASED" });
+          if (!released)
+            return yield* new CodexApprovalDecisionError({ code: "APPROVAL_ALREADY_RELEASED" });
           yield* emitEvent({
             kind: "notification",
             threadId: options.threadId,
             method: "item/requestApproval/decision",
-            ...(decisionContext?.feedback !== undefined ? { feedbackDelivered: true as const } : {}),
-            ...(decisionContext?.ruleSourceRequestId ? { ruleSourceRequestId: decisionContext.ruleSourceRequestId } : {}),
+            ...(decisionContext?.feedback !== undefined
+              ? { feedbackDelivered: true as const }
+              : {}),
+            ...(decisionContext?.ruleSourceRequestId
+              ? { ruleSourceRequestId: decisionContext.ruleSourceRequestId }
+              : {}),
             requestId: pending.requestId,
             requestKind: pending.requestKind,
             ...(pending.turnId ? { turnId: pending.turnId } : {}),

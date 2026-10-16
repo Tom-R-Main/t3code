@@ -41,7 +41,12 @@ import {
   redirectingGitVariables,
 } from "./ManagedAccess.ts";
 
-import { ensureApprovalEffects, reserveApprovalEffect, readApprovalEffect, failQueuedApprovalEffect } from "./ApprovalEffects.ts";
+import {
+  ensureApprovalEffects,
+  reserveApprovalEffect,
+  readApprovalEffect,
+  failQueuedApprovalEffect,
+} from "./ApprovalEffects.ts";
 
 const decodeRequest = Schema.decodeUnknownEffect(SiftBridgeRequest);
 const StoredBinding = Schema.Struct({
@@ -327,16 +332,32 @@ export const makeSiftBridge = Effect.gen(function* () {
     const commandId = CommandId.make(`${prefix}-${digest(request.commandId)}`);
     const { id: _id, ...content } = request;
     const payload = canonical(content);
-    const guardedApproval = request.operation === "approve" && Boolean(
-      request.expectedApprovalScope || request.feedback !== undefined || request.ruleSourceRequestId,
-    );
+    const guardedApproval =
+      request.operation === "approve" &&
+      Boolean(
+        request.expectedApprovalScope ||
+        request.feedback !== undefined ||
+        request.ruleSourceRequestId,
+      );
     if (request.operation === "approve") {
-      if ((request.expectedApprovalScope || request.feedback || request.ruleSourceRequestId) && !request.attemptId)
+      if (
+        (request.expectedApprovalScope || request.feedback || request.ruleSourceRequestId) &&
+        !request.attemptId
+      )
         return yield* fail("INVALID_REQUEST", "Guarded decisions require an attempt identity.");
-      if (request.feedback !== undefined && (request.decision !== "decline" || request.feedback.trim().length === 0))
+      if (
+        request.feedback !== undefined &&
+        (request.decision !== "decline" || request.feedback.trim().length === 0)
+      )
         return yield* fail("INVALID_REQUEST", "Feedback requires a nonempty decline response.");
-      if (request.ruleSourceRequestId && (!request.expectedApprovalScope || request.decision !== "accept"))
-        return yield* fail("INVALID_REQUEST", "Rule application requires a scoped one-time accept.");
+      if (
+        request.ruleSourceRequestId &&
+        (!request.expectedApprovalScope || request.decision !== "accept")
+      )
+        return yield* fail(
+          "INVALID_REQUEST",
+          "Rule application requires a scoped one-time accept.",
+        );
       const prior = yield* sql<{
         command_id: string;
       }>`SELECT command_id FROM sift_bridge_commands WHERE command_id = ${commandId}`;
@@ -373,7 +394,12 @@ export const makeSiftBridge = Effect.gen(function* () {
       );
     if (guardedApproval && request.operation === "approve") {
       yield* ensureApprovalEffects(sql);
-      const reserved = yield* reserveApprovalEffect(sql, commandId, request.requestId, request.feedback !== undefined);
+      const reserved = yield* reserveApprovalEffect(
+        sql,
+        commandId,
+        request.requestId,
+        request.feedback !== undefined,
+      );
       if (!reserved) return { threadId, ...(yield* readApprovalEffect(sql, commandId)) };
     }
     const base = { commandId, threadId, createdAt: stored.created_at };
@@ -405,13 +431,21 @@ export const makeSiftBridge = Effect.gen(function* () {
           type: "thread.approval.respond",
           requestId: ApprovalRequestId.make(request.requestId),
           decision: request.decision,
-          ...(request.attemptId ? { decisionContext: {
-            commandId: request.commandId,
-            attemptId: request.attemptId,
-            ...(request.expectedApprovalScope ? { expectedApprovalScope: request.expectedApprovalScope } : {}),
-            ...(request.ruleSourceRequestId ? { ruleSourceRequestId: request.ruleSourceRequestId } : {}),
-            ...(request.feedback !== undefined ? { feedback: request.feedback } : {}),
-          } } : {}),
+          ...(request.attemptId
+            ? {
+                decisionContext: {
+                  commandId: request.commandId,
+                  attemptId: request.attemptId,
+                  ...(request.expectedApprovalScope
+                    ? { expectedApprovalScope: request.expectedApprovalScope }
+                    : {}),
+                  ...(request.ruleSourceRequestId
+                    ? { ruleSourceRequestId: request.ruleSourceRequestId }
+                    : {}),
+                  ...(request.feedback !== undefined ? { feedback: request.feedback } : {}),
+                },
+              }
+            : {}),
         };
         break;
       case "answer":
@@ -423,10 +457,14 @@ export const makeSiftBridge = Effect.gen(function* () {
         };
         break;
     }
-    const receipt = yield* dispatch(command).pipe(Effect.catchCause((cause) =>
-      (guardedApproval ? failQueuedApprovalEffect(sql, commandId).pipe(Effect.uninterruptible, Effect.ignore) : Effect.void)
-        .pipe(Effect.andThen(Effect.failCause(cause))),
-    ));
+    const receipt = yield* dispatch(command).pipe(
+      Effect.catchCause((cause) =>
+        (guardedApproval
+          ? failQueuedApprovalEffect(sql, commandId).pipe(Effect.uninterruptible, Effect.ignore)
+          : Effect.void
+        ).pipe(Effect.andThen(Effect.failCause(cause))),
+      ),
+    );
     if (guardedApproval) {
       yield* sql`UPDATE sift_approval_effects SET sequence = ${receipt.sequence} WHERE command_id = ${commandId}`;
       return { threadId, ...(yield* readApprovalEffect(sql, commandId)) };

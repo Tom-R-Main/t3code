@@ -227,7 +227,7 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
     prefix: "provider-instance-registry-test",
   }).pipe(
     Layer.provideMerge(NodeServices.layer),
-  Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+    Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
     Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
     Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(TestHttpClientLive),
