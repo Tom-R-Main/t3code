@@ -1,4 +1,5 @@
 import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
+import * as ProjectWorkService from "../projectWork/ProjectWorkService.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -387,6 +388,7 @@ export const layer = Layer.mergeAll(
 );
 
 export const layerProduction = Layer.mergeAll(
+  ProjectWorkService.layer,
   WorktreeBranchSync.layer.pipe(
     Layer.provide(Layer.merge(layerThreadManagementProvided, ProjectionStore.layer)),
   ),
