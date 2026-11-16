@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema";
 import { McpSchema, McpServer } from "effect/ai";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as Sqlite from "../persistence/Sqlite.ts";
+import { ManagedProjectFolders } from "../project/ManagedProjectFolders.ts";
 import * as ProjectWorkService from "../projectWork/ProjectWorkService.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -24,11 +25,14 @@ const owner = ThreadId.make("thread:owner");
 const foreign = ThreadId.make("thread:foreign");
 const ended = ThreadId.make("thread:ended");
 const linked = ThreadId.make("thread:linked");
+const scratch = ThreadId.make("thread:scratch");
 const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
   getThreadShell: (id) =>
     Effect.succeed({
       ...liveThreadShell(id, { activeRunId: id === ended ? null : RunId.make(`run:${id}`) }),
-      projectId: ProjectId.make(id === foreign ? "project:foreign" : "project:work"),
+      projectId: ProjectId.make(
+        id === foreign ? "project:foreign" : id === scratch ? "project:scratch" : "project:work",
+      ),
       ...(id === linked
         ? { linkOrigin: { sessionId: "link", label: "peer", access: "approval-required" as const } }
         : {}),
@@ -37,6 +41,11 @@ const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
 const layer = McpHttpServer.toolkitRegistration(WorkToolkit, WorkHandlers.layer).pipe(
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
   Layer.provide(threads),
+  Layer.provide(
+    Layer.mock(ManagedProjectFolders)({
+      isScratchProject: (id) => Effect.succeed(id === "project:scratch"),
+    }),
+  ),
   Layer.provide(ProjectWorkService.layer.pipe(Layer.provide(Sqlite.layerMemory))),
 );
 const scope = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
@@ -133,7 +142,7 @@ it.effect(
 );
 
 it.effect(
-  "refuses outside, inactive, stale-provider, missing-capability and fenced-link writes",
+  "refuses outside, inactive, scratch, stale-provider, missing-capability and fenced-link writes",
   () =>
     Effect.gen(function* () {
       const outside: McpInvocationContext.McpInvocationScope = {
@@ -154,7 +163,13 @@ it.effect(
         "_tag",
         "InvalidParams",
       );
-      for (const caller of [scope(ended), staleProvider, noCapability, scope(linked)]) {
+      for (const caller of [
+        scope(ended),
+        scope(scratch),
+        staleProvider,
+        noCapability,
+        scope(linked),
+      ]) {
         const refused = yield* call("t3_work", caller, create);
         assert.isTrue("code" in refused);
       }

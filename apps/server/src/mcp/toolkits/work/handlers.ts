@@ -1,6 +1,7 @@
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as ProjectWorkService from "../../../projectWork/ProjectWorkService.ts";
+import { ManagedProjectFolders } from "../../../project/ManagedProjectFolders.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { assertLiveCaller, readCaller } from "../../threadAccess.ts";
 import { assertNotLinked } from "../../linkOrigin.ts";
@@ -42,6 +43,16 @@ export const layer = McpToolAccess.toLayer(WorkToolkit, {
         return yield* new OrchestratorMcpFailure({
           code: "parent_not_active",
           message: "Project work changes require an active T3 run.",
+        });
+      }
+      if (
+        input.operation.action === "create" &&
+        (yield* (yield* ManagedProjectFolders).isScratchProject(context.caller.projectId))
+      ) {
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message:
+            'Durable work requires a project. Ask the user to promote this "No project" thread before creating work.',
         });
       }
       const work = yield* ProjectWorkService.ProjectWorkService;

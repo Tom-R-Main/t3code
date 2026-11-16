@@ -4,6 +4,10 @@ This fork's project work tools keep an outcome and its accepted requirements in 
 T3 database. Use them when work spans runs, owners, or dependencies. A small edit
 that fits in one turn does not need a work record.
 
+Create work in a registered project. A "No project" thread must first be promoted
+to a project; creating durable work there is refused because scratch promotion
+does not migrate work records.
+
 The conversation still carries the user's intent and authorization. A work record
 does not grant new permissions. It makes the selected requirements, assignment and
 evidence available when a run ends or a different agent continues the work.

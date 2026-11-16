@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import { McpSchema, Tool, Toolkit } from "effect/ai";
 import * as ProjectWorkService from "../../../projectWork/ProjectWorkService.ts";
+import { ManagedProjectFolders } from "../../../project/ManagedProjectFolders.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
@@ -32,6 +33,7 @@ const read = Tool.make("t3_work_read", {
 
 const mutate = Tool.make("t3_work", {
   ...common,
+  dependencies: [...common.dependencies, ManagedProjectFolders],
   description:
     "Persist work in this thread's project. Retry a lost reply with identical requestId/input; receipt is the original result, not current state. create/revise stores full selected context and criteria. claim binds the exact packet to your active run; it does not launch an agent. Delegate with existing tools, then child claims. Mutations need expectedVersion. Only creator thread may revise/release/cancel/reopen; release fences the assignment but does not stop its agent. Stop/reconcile its run separately. Evidence is attributed agent reporting, not verified truth or independent review. complete needs passing evidence for every criterion at artifactRevision. Required human acceptance remains pending; agents cannot satisfy it. wait records a release condition. resume records resolution and binds a new run of the same thread; reattest evidence after rebinding. Neither schedules a wake.",
   parameters: ProjectWorkMutation,
