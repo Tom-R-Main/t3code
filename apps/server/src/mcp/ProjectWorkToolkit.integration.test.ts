@@ -43,6 +43,7 @@ const layer = McpHttpServer.toolkitRegistration(WorkToolkit, WorkHandlers.layer)
   Layer.provide(threads),
   Layer.provide(
     Layer.mock(ManagedProjectFolders)({
+      namedProjectsRoot: "/projects",
       isScratchProject: (id) => Effect.succeed(id === "project:scratch"),
     }),
   ),
