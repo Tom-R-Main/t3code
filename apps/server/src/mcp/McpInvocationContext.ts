@@ -16,6 +16,7 @@ import type * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import { formatThreadLink, hostedThreadLink } from "@t3tools/shared/threadLinks";
+import type { McpToolExposureMode } from "@t3tools/provider-core/server/mcpSession";
 
 const ALL_MCP_CAPABILITIES = [
   "preview",
@@ -168,6 +169,8 @@ export interface McpInvocationScope {
   readonly origin?: string | undefined;
   /** False when the calling thread's project is on no forge T3 reads; `/mcp` reads it per request. */
   readonly forge?: boolean;
+  /** Server-side tool exposure mode for this session (`"full"`, `"deferred"`, or `"deferred-proxy"`). */
+  readonly toolExposure?: McpToolExposureMode | undefined;
 }
 
 /**

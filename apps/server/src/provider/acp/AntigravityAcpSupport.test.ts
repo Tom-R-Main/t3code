@@ -148,7 +148,17 @@ describe("Antigravity Auto", () => {
       });
       for (const t3Call of [
         request("Run mcp_t3-code_t3_thread_list?"),
+        request("Run mcp_t3-code_tool_search?", { query: "preview" }),
+        request("Run mcp_t3-code_tool_call?", {
+          name: "preview_open",
+          arguments: { url: "http://localhost" },
+        }),
         request("MCP Tool delegate_task", { ServerName: "t3-code", ToolName: "delegate_task" }),
+        request("MCP Tool tool_call", {
+          ServerName: "t3-code",
+          ToolName: "tool_call",
+          Arguments: { name: "preview_open", arguments: { url: "http://localhost" } },
+        }),
       ]) {
         expect(antigravityPermissionDisposition(policy, t3Call)).toBe("allow");
         expect(
@@ -168,6 +178,16 @@ describe("Antigravity Auto", () => {
         request("MCP Tool preview_status", { ServerName: "other", ToolName: "preview_status" }),
         request("Run mcp_t3-code_preview_status", {
           CommandLine: "Run mcp_t3-code_preview_status",
+        }),
+        // tool_call must name a valid non-recursive T3 tool.
+        request("Run mcp_t3-code_tool_call?"),
+        request("Run mcp_t3-code_tool_call?", { name: "tool_call" }),
+        request("Run mcp_t3-code_tool_call?", { name: "tool_search" }),
+        request("Run mcp_t3-code_tool_call?", { name: "unknown_tool" }),
+        request("MCP Tool tool_call", {
+          ServerName: "t3-code",
+          ToolName: "tool_call",
+          Arguments: { name: "unknown_tool" },
         }),
         // A directly called tool's rawInput is its own arguments, whatever their names.
         request("Run mcp_github_create_issue", {

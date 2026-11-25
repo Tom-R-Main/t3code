@@ -97,4 +97,36 @@ describe("T3 device instructions", () => {
     );
     assert.notInclude(t3AcpPromptWithInstructions({ prompt: "Hi.", state }), "## T3 Code devices");
   });
+
+  it("adds deferred-proxy guidance only when mcpToolExposure is deferred-proxy", () => {
+    const fullState = {
+      interactionMode: "default",
+      hasT3Mcp: true,
+      hasDeviceTools: false,
+    } as const;
+    const proxyState = { ...fullState, mcpToolExposure: "deferred-proxy" } as const;
+    assert.notInclude(
+      t3AcpPromptWithInstructions({ prompt: "Hi.", state: fullState }),
+      "tool_call",
+    );
+    const withProxy = t3AcpPromptWithInstructions({ prompt: "Hi.", state: proxyState });
+    assert.include(withProxy, "tool_search");
+    assert.include(withProxy, "tool_call");
+    assert.equal(
+      t3AcpPromptWithInstructions({
+        prompt: "Next.",
+        state: proxyState,
+        previousState: proxyState,
+      }),
+      "Next.",
+    );
+    assert.include(
+      t3AcpPromptWithInstructions({
+        prompt: "Switched.",
+        state: proxyState,
+        previousState: fullState,
+      }),
+      "tool_call",
+    );
+  });
 });

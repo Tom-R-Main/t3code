@@ -69,5 +69,8 @@ describe("resolveT3McpSummaryAction", () => {
       "schedule-update",
     );
     expect(resolveT3McpSummaryAction("delegate_task", { task: "x" })).toBe("delegate");
+    expect(resolveT3McpSummaryAction("tool_search", { query: "preview" })).toBe("tool-search");
+    expect(T3_MCP_TOOL_NAMES.has("tool_search")).toBe(true);
+    expect(T3_MCP_TOOL_NAMES.has("tool_call")).toBe(false);
   });
 });

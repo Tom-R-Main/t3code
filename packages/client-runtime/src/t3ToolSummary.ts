@@ -850,6 +850,23 @@ export function summarizeT3ToolCalls(
           );
       break;
     }
+    case "tool-search": {
+      const count = selected.length;
+      label = done
+        ? resolve(
+            msg(
+              "{count, plural, one {Searched T3 tools {count} time} other {Searched T3 tools {count} times}}",
+              { count },
+            ),
+          )
+        : resolve(
+            msg(
+              "{count, plural, one {Tried to search T3 tools {count} time} other {Tried to search T3 tools {count} times}}",
+              { count },
+            ),
+          );
+      break;
+    }
     case "thread-list": {
       const count = selected.length;
       label = done

@@ -20,6 +20,7 @@ export interface McpCredentialRequest {
   readonly browserToolsAvailable?: boolean;
   readonly capabilities?: ReadonlySet<McpInvocationContext.McpCapability>;
   readonly subagent?: boolean;
+  readonly toolExposure?: McpProviderSession.McpToolExposureMode | undefined;
 }
 
 export interface McpIssuedCredential {
@@ -143,6 +144,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           ...(request.capabilities ?? (browserToolsAvailable ? (["preview"] as const) : [])),
         ]),
         issuedAt: issuedAlive.wallMs,
+        ...(request.toolExposure === undefined ? {} : { toolExposure: request.toolExposure }),
       };
       yield* SynchronizedRef.update(state, ({ records }) => {
         const next = new Map(records);

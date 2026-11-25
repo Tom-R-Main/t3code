@@ -1,4 +1,5 @@
 import type { ProviderInteractionMode } from "@t3tools/contracts";
+import type { McpToolExposureMode } from "./mcpSession.ts";
 
 // Codex truncates entries over 4,000 bytes; keep each section self-contained and below that limit.
 export const T3_CODE_ORCHESTRATION_SECTIONS: ReadonlyArray<string> = [
@@ -67,10 +68,13 @@ const T3_CODE_ACP_PLAN_MODE_INSTRUCTIONS = `## T3 Code interaction mode: Plan
 
 Investigate with read-only actions and do not edit files or otherwise execute the implementation. Resolve discoverable facts before asking questions. When the requirements are decision complete, return a concrete implementation plan and do not start implementing it. Treat this mode as active until T3 Code supplies a different interaction-mode instruction.`;
 
+const T3_CODE_ACP_MCP_PROXY_INSTRUCTIONS = `Other T3 tools: call \`tool_search\` with a tool name or topic to get its schema, then invoke it via \`tool_call({ name, arguments })\`.`;
+
 export interface T3AcpInstructionState {
   readonly interactionMode: ProviderInteractionMode;
   readonly hasT3Mcp: boolean;
   readonly hasDeviceTools: boolean;
+  readonly mcpToolExposure?: McpToolExposureMode | undefined;
 }
 
 /** ACP lacks system/developer fields; inject context on first prompt and tool/mode changes. */
@@ -84,7 +88,8 @@ export function t3AcpPromptWithInstructions(input: {
   if (
     input.previousState?.interactionMode === input.state.interactionMode &&
     input.previousState.hasT3Mcp === input.state.hasT3Mcp &&
-    input.previousState.hasDeviceTools === input.state.hasDeviceTools
+    input.previousState.hasDeviceTools === input.state.hasDeviceTools &&
+    input.previousState.mcpToolExposure === input.state.mcpToolExposure
   ) {
     return input.prompt;
   }
@@ -97,6 +102,9 @@ export function t3AcpPromptWithInstructions(input: {
           T3_CODE_BROWSER_TOOL_INSTRUCTIONS.trim(),
           ...(input.state.hasDeviceTools ? [T3_CODE_DEVICE_TOOL_INSTRUCTIONS] : []),
           T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim(),
+          ...(input.state.mcpToolExposure === "deferred-proxy"
+            ? [T3_CODE_ACP_MCP_PROXY_INSTRUCTIONS]
+            : []),
           T3_CODE_ACP_MCP_FALLBACK_INSTRUCTIONS,
         ]
       : []),

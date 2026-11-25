@@ -465,8 +465,8 @@ export interface AcpAdapterV2Flavor {
     EffectAcpSchema.InitializeRequest["clientCapabilities"]
   >["_meta"];
   readonly mcpOverHttp?: boolean;
-  /** The agent has no tool search of its own, so T3 lists optional tools on demand. */
-  readonly deferMcpTools?: boolean;
+  /** How T3's MCP server exposes tools (`"deferred"` via list_changed, `"deferred-proxy"` via tool_call). */
+  readonly mcpToolExposure?: McpProviderSession.McpToolExposureMode;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => EffectAcpSchema.SessionNotification;
@@ -1107,7 +1107,7 @@ function acpMcpContext(
   session: McpProviderSession.McpProviderSessionConfig | undefined,
   self: SelfInvocation,
   mcpOverHttp: boolean | undefined,
-  deferMcpTools: boolean | undefined,
+  mcpToolExposure: McpProviderSession.McpToolExposureMode | undefined,
   callLauncher: string | undefined,
 ): AcpMcpContext {
   if (session === undefined) {
@@ -1137,8 +1137,8 @@ function acpMcpContext(
               url: session.endpoint,
               headers: [
                 { name: "Authorization", value: session.authorizationHeader },
-                ...(deferMcpTools === true
-                  ? [{ name: McpProviderSession.MCP_TOOL_EXPOSURE_HEADER, value: "deferred" }]
+                ...(mcpToolExposure === "deferred" || mcpToolExposure === "deferred-proxy"
+                  ? [{ name: McpProviderSession.MCP_TOOL_EXPOSURE_HEADER, value: mcpToolExposure }]
                   : []),
               ],
             },
@@ -2108,13 +2108,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
   const readMcpContext = (threadId: ThreadId | null) =>
     threadId === null
       ? Effect.succeed(
-          acpMcpContext(undefined, self, flavor.mcpOverHttp, flavor.deferMcpTools, callLauncher),
+          acpMcpContext(undefined, self, flavor.mcpOverHttp, flavor.mcpToolExposure, callLauncher),
         )
       : mcpSessions
           .read(threadId)
           .pipe(
             Effect.map((session) =>
-              acpMcpContext(session, self, flavor.mcpOverHttp, flavor.deferMcpTools, callLauncher),
+              acpMcpContext(
+                session,
+                self,
+                flavor.mcpOverHttp,
+                flavor.mcpToolExposure,
+                callLauncher,
+              ),
             ),
           );
   const driver = flavor.driver;
@@ -2135,6 +2141,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
     instanceId: options.instanceId,
     driver,
     checksVersionAtHandshake: flavor.checksVersionAtHandshake === true,
+    ...(flavor.mcpToolExposure === undefined ? {} : { mcpToolExposure: flavor.mcpToolExposure }),
     getCapabilities: Effect.fn("AcpAdapter.getCapabilities")(function* () {
       return yield* readCapabilities;
     }),
@@ -9329,6 +9336,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             interactionMode: turnInput.runtimePolicy.interactionMode,
             hasT3Mcp: mcpSession !== undefined,
             hasDeviceTools: mcpSession?.capabilities?.has("device") === true,
+            ...(flavor.mcpToolExposure === undefined
+              ? {}
+              : { mcpToolExposure: flavor.mcpToolExposure }),
           } satisfies T3AcpInstructionState;
           const userText =
             flavor.rewriteUserText === undefined

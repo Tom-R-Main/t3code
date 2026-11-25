@@ -1,6 +1,9 @@
 import type { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 
+/** How T3's MCP server lists tools: full upfront, deferred via list_changed, or fixed 5-tool proxy. */
+export type McpToolExposureMode = "full" | "deferred" | "deferred-proxy";
+
 /**
  * Sent by MCP clients that cannot defer tools themselves. The T3 MCP server then
  * lists only a core set plus `tool_search`, which lists the rest on demand.

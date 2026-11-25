@@ -1768,6 +1768,63 @@ describe("extractMcpToolCallIdentity", () => {
 
     expect(extractMcpToolCallIdentity(toolCall)).toBeUndefined();
   });
+
+  it("unwraps t3-code tool_call invocations in both direct and call_mcp_tool shapes", () => {
+    const direct = toolCallFromUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "proxy-1",
+      kind: "other",
+      title: "Run mcp_t3-code_tool_call",
+      status: "in_progress",
+      rawInput: { name: "preview_open", arguments: { url: "http://localhost:3000" } },
+    });
+    expect(extractMcpToolCallIdentity(direct)).toEqual({
+      server: "t3-code",
+      tool: "preview_open",
+      input: { url: "http://localhost:3000" },
+    });
+
+    const wrapped = toolCallFromUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "proxy-2",
+      kind: "execute",
+      title: "MCP Tool tool_call",
+      status: "in_progress",
+      rawInput: {
+        ServerName: "t3-code",
+        ToolName: "tool_call",
+        Arguments: { name: "preview_status" },
+      },
+    });
+    expect(extractMcpToolCallIdentity(wrapped)).toEqual({
+      server: "t3-code",
+      tool: "preview_status",
+      input: {},
+    });
+
+    const recursive = toolCallFromUpdate({
+      sessionUpdate: "tool_call",
+      toolCallId: "proxy-3",
+      kind: "other",
+      title: "Run mcp_t3-code_tool_call",
+      status: "in_progress",
+      rawInput: { name: "tool_call", arguments: {} },
+    });
+    expect(extractMcpToolCallIdentity(recursive)).toBeUndefined();
+
+    const permission = parsePermissionRequest({
+      sessionId: "session-1",
+      toolCall: {
+        toolCallId: "proxy-4",
+        title: "Run mcp_t3-code_tool_call?",
+        kind: "execute",
+        rawInput: { name: "preview_open", arguments: { url: "http://localhost:3000" } },
+      },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+    });
+    expect(permission.detail).toContain("preview_open");
+    expect(permission.detail).toContain("http://localhost:3000");
+  });
 });
 
 describe("embeddedTerminalIdsFromSessionUpdate", () => {

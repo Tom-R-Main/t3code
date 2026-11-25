@@ -43,6 +43,7 @@ import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
+import type { McpToolExposureMode } from "./mcpSession.ts";
 import type {
   ProviderSelectionTransitionInput,
   ProviderSelectionTransitionPlan,
@@ -897,6 +898,8 @@ export class ProviderAdapterV2 extends Context.Service<
      * skips its own check, which only knows the version from the last status probe.
      */
     readonly checksVersionAtHandshake?: boolean;
+    /** How the T3 MCP server should expose tools to sessions opened by this adapter. */
+    readonly mcpToolExposure?: McpToolExposureMode;
     readonly getCapabilities: () => Effect.Effect<
       OrchestrationV2ProviderCapabilities,
       ProviderAdapterV2Error

@@ -388,9 +388,34 @@ function stripAntigravityToolSummary(value: unknown): unknown {
     const { toolSummary: _toolSummary, ...rest } = next;
     next = rest;
   }
-  if (Predicate.isObject(next.Arguments) && "toolSummary" in next.Arguments) {
-    const { toolSummary: _toolSummary, ...args } = next.Arguments;
-    next = { ...next, Arguments: args };
+  if (
+    Predicate.isObject(next.arguments) &&
+    !Array.isArray(next.arguments) &&
+    "toolSummary" in next.arguments
+  ) {
+    const { toolSummary: _toolSummary, ...args } = next.arguments;
+    next = { ...next, arguments: args };
+  }
+  if (Predicate.isObject(next.Arguments) && !Array.isArray(next.Arguments)) {
+    let args = next.Arguments as Record<string, unknown>;
+    let changed = false;
+    if ("toolSummary" in args) {
+      const { toolSummary: _toolSummary, ...rest } = args;
+      args = rest;
+      changed = true;
+    }
+    if (
+      Predicate.isObject(args.arguments) &&
+      !Array.isArray(args.arguments) &&
+      "toolSummary" in args.arguments
+    ) {
+      const { toolSummary: _toolSummary, ...innerArgs } = args.arguments;
+      args = { ...args, arguments: innerArgs };
+      changed = true;
+    }
+    if (changed) {
+      next = { ...next, Arguments: args };
+    }
   }
   return next;
 }

@@ -631,14 +631,23 @@ export const layerWithOptions = (
                 >(["orchestration", "worktree", "pull-requests", "issues"]);
                 if (browserToolsAvailable) capabilities.add("preview");
                 if (deviceToolsAvailable) capabilities.add("device");
-                const backgroundWait = yield* registry.get(providerInstanceId).pipe(
-                  Effect.flatMap((adapter) => adapter.getCapabilities()),
-                  Effect.map((adapter) => adapter.tools.supportsBackgroundWait === true),
+                const adapterInfo = yield* registry.get(providerInstanceId).pipe(
+                  Effect.flatMap((adapter) =>
+                    adapter.getCapabilities().pipe(
+                      Effect.map((caps) => ({
+                        backgroundWait: caps.tools.supportsBackgroundWait === true,
+                        toolExposure: adapter.mcpToolExposure,
+                      })),
+                    ),
+                  ),
                   Effect.option,
                 );
-                if (Option.getOrElse(backgroundWait, () => false)) {
+                if (Option.isSome(adapterInfo) && adapterInfo.value.backgroundWait) {
                   capabilities.add("background-wait");
                 }
+                const toolExposure = Option.isSome(adapterInfo)
+                  ? adapterInfo.value.toolExposure
+                  : undefined;
                 const subagent = yield* projectionStore.getThread(threadId).pipe(
                   Effect.map((thread) => thread.lineage.relationshipToParent === "subagent"),
                   Effect.orElseSucceed(() => false),
@@ -665,8 +674,11 @@ export const layerWithOptions = (
                     resolved.capabilities.has("preview") === browserToolsAvailable &&
                     resolved.capabilities.has("device") === deviceToolsAvailable &&
                     // A failed capability read cannot tell that the live credential is wrong.
-                    (Option.isNone(backgroundWait) ||
-                      resolved.capabilities.has("background-wait") === backgroundWait.value) &&
+                    (Option.isNone(adapterInfo) ||
+                      (resolved.capabilities.has("background-wait") ===
+                        adapterInfo.value.backgroundWait &&
+                        (resolved.toolExposure ?? "full") ===
+                          (adapterInfo.value.toolExposure ?? "full"))) &&
                     // A credential issued while the lineage read failed is replaced once it works.
                     (resolved.thread.subagent === true) === subagent
                   ) {
@@ -681,6 +693,7 @@ export const layerWithOptions = (
                   browserToolsAvailable,
                   capabilities,
                   subagent,
+                  ...(toolExposure === undefined ? {} : { toolExposure }),
                 });
                 yield* mcpSessions.set({
                   ...credential.config,

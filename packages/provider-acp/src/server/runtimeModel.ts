@@ -10,7 +10,10 @@ import {
   deriveToolActivityPresentation,
   mergeToolActivityData,
 } from "@t3tools/shared/toolActivity";
-import { T3_MCP_TOOL_NAMES } from "@t3tools/shared/t3McpToolPresentation";
+import {
+  resolveT3McpToolPresentation,
+  T3_MCP_TOOL_NAMES,
+} from "@t3tools/shared/t3McpToolPresentation";
 import type {
   OrchestrationV2ProviderThreadNativeMetadata,
   ThreadTokenUsageSnapshot,
@@ -1128,6 +1131,31 @@ const T3_MCP_BARE_TITLE_CALL = /^(?<tool>[A-Za-z0-9_]+)(?::\s*\{|$)/;
 // Antigravity titles calls "Running <tool>" or, from agy 1.5.8, "Run mcp_<server>_<tool>"; prompts end in "?".
 const ANTIGRAVITY_TOOL_TITLE = /^Run(?:ning)? (?<name>[^\s?]+)\??$/;
 
+function isT3McpServerAlias(server: string): boolean {
+  return /^(?:t3[-_ ]?code|t3[-_ ]?code[-_ ]?direct)$/i.test(server.trim());
+}
+
+function unwrapT3McpProxyIdentity(
+  identity: AcpMcpToolCallIdentity,
+  rawInput: Record<string, unknown> | undefined,
+): AcpMcpToolCallIdentity | undefined {
+  if (!isT3McpServerAlias(identity.server) || identity.tool !== "tool_call") {
+    return identity;
+  }
+  const proxyArgs = identity.input ?? rawInput;
+  const target = typeof proxyArgs?.name === "string" ? proxyArgs.name.trim() : "";
+  if (
+    target.length === 0 ||
+    target === "tool_call" ||
+    target === "tool_search" ||
+    !T3_MCP_TOOL_NAMES.has(target)
+  ) {
+    return undefined;
+  }
+  const innerArgs = isRecord(proxyArgs?.arguments) ? proxyArgs.arguments : {};
+  return { server: "t3-code", tool: target, input: innerArgs };
+}
+
 /** ACP lacks typed MCP calls; recognize provider metadata and terminal fallback commands. */
 export function extractMcpToolCallIdentity(
   toolCall: AcpToolCallState,
@@ -1140,7 +1168,7 @@ export function extractMcpToolCallIdentity(
   const server = typeof rawInput?.server === "string" ? rawInput.server.trim() : "";
   const tool = typeof rawInput?.tool === "string" ? rawInput.tool.trim() : "";
   if (meta?.is_mcp_tool_call === true && server.length > 0 && tool.length > 0) {
-    return { server, tool };
+    return unwrapT3McpProxyIdentity({ server, tool }, rawInput);
   }
   // Antigravity reaches MCP tools its context budget left out through call_mcp_tool, an execute
   // call titled "MCP Tool <tool>" whose rawInput names the server, tool, and arguments.
@@ -1148,7 +1176,10 @@ export function extractMcpToolCallIdentity(
   const proxiedTool = typeof rawInput?.ToolName === "string" ? rawInput.ToolName.trim() : "";
   if (proxiedServer.length > 0 && proxiedTool.length > 0) {
     const input = isRecord(rawInput?.Arguments) ? rawInput.Arguments : undefined;
-    return { server: proxiedServer, tool: proxiedTool, ...(input === undefined ? {} : { input }) };
+    return unwrapT3McpProxyIdentity(
+      { server: proxiedServer, tool: proxiedTool, ...(input === undefined ? {} : { input }) },
+      rawInput,
+    );
   }
   // Kiro names the server in `_meta.kiro.serverName` and the call in `rawInput.tool_id`
   // ("<server>::<tool>"), with the tool's own input under `rawInput.arguments`.
@@ -1171,6 +1202,13 @@ export function extractMcpToolCallIdentity(
   const metaServerId = typeof meta?.serverId === "string" ? meta.serverId.trim() : "";
   const metaToolName = typeof meta?.toolName === "string" ? meta.toolName.trim() : "";
   if (/^t3[-_ ]?code$/i.test(metaServerId) && metaToolName.length > 0) {
+    if (metaToolName === "tool_call" || metaToolName.endsWith("_tool_call")) {
+      const unwrapped = unwrapT3McpProxyIdentity(
+        { server: "t3-code", tool: "tool_call" },
+        rawInput,
+      );
+      if (unwrapped !== undefined) return unwrapped;
+    }
     for (const knownTool of T3_MCP_TOOL_NAMES) {
       const boundary = metaToolName.length - knownTool.length - 1;
       if (
@@ -1228,10 +1266,15 @@ export function extractMcpToolCallIdentity(
     if (qualified?.[1] && qualified[2] && !/^t3[-_ ]?code$/i.test(qualified[1]))
       return { server: qualified[1], tool: qualified[2] };
     const name = ANTIGRAVITY_TOOL_TITLE.exec(trimmed)?.groups?.name ?? trimmed;
-    const match =
-      T3_MCP_TITLE_CALL.exec(name) ??
-      T3_MCP_TITLE_SUFFIX_CALL.exec(name) ??
-      T3_MCP_BARE_TITLE_CALL.exec(name);
+    const prefixedMatch = T3_MCP_TITLE_CALL.exec(name) ?? T3_MCP_TITLE_SUFFIX_CALL.exec(name);
+    if (prefixedMatch?.groups?.tool === "tool_call") {
+      const unwrapped = unwrapT3McpProxyIdentity(
+        { server: "t3-code", tool: "tool_call" },
+        rawInput,
+      );
+      if (unwrapped !== undefined) return unwrapped;
+    }
+    const match = prefixedMatch ?? T3_MCP_BARE_TITLE_CALL.exec(name);
     const candidateTool = match?.groups?.tool;
     if (candidateTool !== undefined && T3_MCP_TOOL_NAMES.has(candidateTool)) {
       return { server: "t3-code", tool: candidateTool };
@@ -1247,7 +1290,10 @@ export function extractMcpToolCallIdentity(
     const match = ACP_MCP_FALLBACK_CALL.exec(command);
     if (match?.[1] !== undefined) {
       const input = acpMcpFallbackInput(match[2]);
-      return { server: "t3-code", tool: match[1], ...(input === undefined ? {} : { input }) };
+      return unwrapT3McpProxyIdentity(
+        { server: "t3-code", tool: match[1], ...(input === undefined ? {} : { input }) },
+        rawInput,
+      );
     }
   }
   return undefined;
@@ -1290,6 +1336,25 @@ export function withTrackedPermissionToolCall(
   };
 }
 
+function proxiedT3McpPermissionDetail(toolCall: AcpToolCallState): string | undefined {
+  const title = toolCall.data.title;
+  const rawInput = isRecord(toolCall.data.rawInput) ? toolCall.data.rawInput : undefined;
+  const isDirectToolCall =
+    typeof title === "string" &&
+    /(?:^|[\s._:-])t3[-_ ]?code(?:__|[-_.:/ ])tool_call\??$/i.test(title.trim());
+  const isWrappedToolCall = rawInput?.ServerName === "t3-code" && rawInput.ToolName === "tool_call";
+  if (!isDirectToolCall && !isWrappedToolCall) return undefined;
+  const unwrapped = extractMcpToolCallIdentity(toolCall);
+  if (unwrapped === undefined || unwrapped.server !== "t3-code") return undefined;
+  const presentation = resolveT3McpToolPresentation(`t3-code.${unwrapped.tool}`, unwrapped.input);
+  const label = presentation ? `${presentation.displayName} (${unwrapped.tool})` : unwrapped.tool;
+  const args = unwrapped.input;
+  if (!args || Object.keys(args).length === 0) return label;
+  const serialized = JSON.stringify(args);
+  const bounded = serialized.length > 240 ? `${serialized.slice(0, 237)}...` : serialized;
+  return `${label}: ${bounded}`;
+}
+
 export function parsePermissionRequest(
   params: EffectAcpSchema.RequestPermissionRequest,
 ): AcpPermissionRequest {
@@ -1307,7 +1372,9 @@ export function parsePermissionRequest(
     { fallbackStatus: "pending" },
   );
   const kind = normalizeToolKind(params.toolCall.kind) ?? "unknown";
+  const proxiedDetail = toolCall ? proxiedT3McpPermissionDetail(toolCall) : undefined;
   const detail =
+    proxiedDetail ??
     toolCall?.command ??
     toolCall?.title ??
     toolCall?.detail ??

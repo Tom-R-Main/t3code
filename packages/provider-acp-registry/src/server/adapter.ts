@@ -333,7 +333,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
       ? {}
       : {
           clientCapabilitiesMeta: copilotClientCapabilitiesMeta,
-          deferMcpTools: true,
+          mcpToolExposure: "deferred" as const,
           registerExtensions: copilotRouting.registerExtensions,
           normalizeSessionUpdate: copilotRouting.normalizeSessionUpdate,
           extractSubagentUpdate: extractCopilotSubagentUpdate,

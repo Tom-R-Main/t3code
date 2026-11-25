@@ -2244,3 +2244,230 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
+
+it.effect(
+  "exposes deferred-proxy tools server-side, preserves raw images, and enforces EnabledWhen",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const scopeFor = (
+          token: string,
+          options?: {
+            readonly toolExposure?: "full" | "deferred" | "deferred-proxy";
+            readonly subagent?: boolean;
+          },
+        ): McpInvocationContext.McpThreadInvocationScope => ({
+          environmentId,
+          requestNamespace: token,
+          thread: {
+            threadId: ThreadId.make(`thread-${token}`),
+            providerSessionId: token,
+            providerInstanceId: ProviderInstanceId.make("antigravity"),
+            ...(options?.subagent ? { subagent: true } : {}),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration", "preview"]),
+          issuedAt: 1,
+          ...(options?.toolExposure === undefined ? {} : { toolExposure: options.toolExposure }),
+        });
+        const scopes = new Map([
+          ["proxyToken", scopeFor("proxyToken", { toolExposure: "deferred-proxy" })],
+          [
+            "subagentProxyToken",
+            scopeFor("subagentProxyToken", { toolExposure: "deferred-proxy", subagent: true }),
+          ],
+          ["deferredToken", scopeFor("deferredToken", { toolExposure: "deferred" })],
+          ["fullToken", scopeFor("fullToken")],
+        ]);
+        const DelegateTool = Tool.make("delegate_task", {
+          description: "Delegates a task.",
+          success: Schema.Struct({}),
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        });
+        const ParentOnlyTool = Tool.make("parent_only_tool", {
+          description: "Only top-level threads can call this.",
+          parameters: Schema.Struct({ label: Schema.optional(Schema.String) }),
+          success: Schema.Struct({ label: Schema.String }),
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        }).annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromSubagents);
+        const OversizedSchemaTool = Tool.make("oversized_schema_tool", {
+          description: "Has a huge schema description.",
+          parameters: Schema.Struct({
+            huge: Schema.String.annotate({ description: "x".repeat(9_000) }),
+          }),
+          success: Schema.Struct({}),
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        });
+        const ProxyToolkit = Toolkit.make(DelegateTool, ParentOnlyTool, OversizedSchemaTool);
+        const layerRawImageTool = Layer.effectDiscard(
+          Effect.gen(function* () {
+            const server = yield* McpServer.McpServer;
+            // oxlint-disable-next-line t3code/no-raw-mcp-registration -- fixture testing raw PNG image passthrough
+            yield* server.addTool({
+              tool: new McpSchema.Tool({
+                name: "raw_image_tool",
+                description: "Returns a raw PNG image block.",
+                inputSchema: { type: "object", properties: {} },
+              }),
+              annotations: Context.empty(),
+              handle: () =>
+                Effect.succeed(
+                  new McpSchema.CallToolResult({
+                    content: [
+                      {
+                        type: "image",
+                        data: new Uint8Array(Buffer.from("iVBORw0KGgo=", "base64")),
+                        mimeType: "image/png",
+                      },
+                    ],
+                    isError: false,
+                  }),
+                ),
+            });
+          }),
+        );
+        const serverLayer = McpHttpServer.layerMcpTransport(
+          Layer.mergeAll(
+            McpHttpServer.toolkitRegistration(
+              ProxyToolkit,
+              McpToolAccess.toLayer(ProxyToolkit, {
+                delegate_task: McpToolAccess.reads(() => Effect.succeed({})),
+                parent_only_tool: McpToolAccess.reads(({ label }) =>
+                  Effect.succeed({ label: label ?? "default" }),
+                ),
+                oversized_schema_tool: McpToolAccess.reads(() => Effect.succeed({})),
+              }),
+            ),
+            layerRawImageTool,
+            McpHttpServer.layerToolSearch,
+          ),
+        ).pipe(
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: (token) => Effect.succeed(scopes.get(token)),
+            }),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const httpClient = yield* HttpClient.HttpClient;
+        const session = (token: string) =>
+          Effect.gen(function* () {
+            const headers = {
+              accept: "application/json, text/event-stream",
+              authorization: `Bearer ${token}`,
+            };
+            const initialize = yield* httpClient.post("/mcp", {
+              headers,
+              body: HttpBody.text(
+                `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+                "application/json",
+              ),
+            });
+            const rpc = (method: string, params: object) =>
+              httpClient
+                .post("/mcp", {
+                  headers: {
+                    ...headers,
+                    "mcp-session-id": initialize.headers["mcp-session-id"]!,
+                    "mcp-protocol-version": "2025-06-18",
+                  },
+                  body: HttpBody.text(
+                    JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+                    "application/json",
+                  ),
+                })
+                .pipe(
+                  Effect.flatMap((response) => response.text),
+                  Effect.map((text): Record<string, unknown> => {
+                    const parsed = text
+                      .split("\n")
+                      .filter((line) => line.startsWith("data: ") || line.startsWith("{"))
+                      .map(
+                        (line) =>
+                          JSON.parse(line.replace(/^data: /u, "")) as Record<string, unknown>,
+                      );
+                    return parsed.find((message) => message.id === 2) ?? {};
+                  }),
+                );
+            return {
+              listed: rpc("tools/list", {}).pipe(
+                Effect.map((body) =>
+                  (body.result as { tools: ReadonlyArray<{ name: string }> }).tools
+                    .map((listed) => listed.name)
+                    .sort(),
+                ),
+              ),
+              callRaw: (name: string, args: object) => rpc("tools/call", { name, arguments: args }),
+            };
+          });
+
+        const proxy = yield* session("proxyToken");
+        const subagentProxy = yield* session("subagentProxyToken");
+        const deferred = yield* session("deferredToken");
+        const full = yield* session("fullToken");
+
+        // Server-side scope.toolExposure governs listing without any HTTP exposure header.
+        expect(yield* proxy.listed).toEqual(["delegate_task", "tool_call", "tool_search"]);
+        expect(yield* deferred.listed).toEqual(["delegate_task", "tool_search"]);
+        expect(yield* full.listed).toEqual([
+          "delegate_task",
+          "oversized_schema_tool",
+          "parent_only_tool",
+          "raw_image_tool",
+        ]);
+
+        // tool_search returns inputSchema in deferred-proxy mode without expanding tools/list.
+        const searchResult = (yield* proxy.callRaw("tool_search", { query: "parent_only_tool" }))
+          .result as {
+          structuredContent: { tools: ReadonlyArray<{ name: string; inputSchema?: unknown }> };
+        };
+        expect(searchResult.structuredContent.tools).toHaveLength(1);
+        expect(searchResult.structuredContent.tools[0]?.name).toBe("parent_only_tool");
+        expect(searchResult.structuredContent.tools[0]?.inputSchema).toBeDefined();
+        expect(yield* proxy.listed).toEqual(["delegate_task", "tool_call", "tool_search"]);
+
+        // Oversized first schema is omitted rather than exceeding MAX_PROXY_SCHEMA_BYTES.
+        const oversized = (yield* proxy.callRaw("tool_search", { query: "oversized_schema_tool" }))
+          .result as {
+          structuredContent: { tools: ReadonlyArray<{ name: string; inputSchema?: unknown }> };
+        };
+        expect(oversized.structuredContent.tools[0]?.name).toBe("oversized_schema_tool");
+        expect(oversized.structuredContent.tools[0]?.inputSchema).toBeUndefined();
+
+        // tool_call invokes unlisted tools with omitted arguments defaulted to {}.
+        const invoked = (yield* proxy.callRaw("tool_call", { name: "parent_only_tool" }))
+          .result as {
+          structuredContent: { label: string };
+        };
+        expect(invoked.structuredContent).toEqual({ label: "default" });
+
+        // tool_call preserves raw PNG image content verbatim.
+        const imageCall = (yield* proxy.callRaw("tool_call", { name: "raw_image_tool" }))
+          .result as {
+          content: ReadonlyArray<{ type: string; mimeType?: string; data?: string }>;
+        };
+        expect(imageCall.content).toEqual([
+          { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" },
+        ]);
+
+        // tool_call rejects recursion and enforces EnabledWhen (subagents cannot call parent_only_tool).
+        expect(
+          (yield* proxy.callRaw("tool_call", { name: "tool_call", arguments: {} })).error,
+        ).toBeDefined();
+        expect(
+          (yield* proxy.callRaw("tool_call", { name: "tool_search", arguments: { query: "x" } }))
+            .error,
+        ).toBeDefined();
+        expect(
+          (yield* subagentProxy.callRaw("tool_call", { name: "parent_only_tool" })).error,
+        ).toBeDefined();
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
