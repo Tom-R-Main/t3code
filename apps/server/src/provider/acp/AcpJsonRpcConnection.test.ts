@@ -643,6 +643,48 @@ describe("AcpSessionRuntime", () => {
     );
   });
 
+  it.effect("appends extraMcpServers orthogonally after selecting T3 MCP transport", () => {
+    const requestEvents: Array<AcpSessionRuntime.AcpSessionRequestLogEvent> = [];
+    return Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const created = requestEvents.find(
+        (event) => event.method === "session/new" && event.status === "started",
+      );
+      expect(created?.payload).toMatchObject({
+        mcpServers: [
+          { type: "acp", name: "t3-code", serverId: "t3-code" },
+          { type: "stdio", name: "extra-tool", command: "/usr/bin/extra", args: [] },
+        ],
+      });
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: { T3_ACP_MCP_ACP: "1" },
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+          mcpServers: [{ type: "stdio", name: "t3-code", command: "/usr/bin/node", args: [] }],
+          acpMcpServers: [{ type: "acp", name: "t3-code", serverId: "t3-code" }],
+          extraMcpServers: [
+            { type: "stdio", name: "extra-tool", command: "/usr/bin/extra", args: [] },
+          ],
+          requestLogger: (event) =>
+            Effect.sync(() => {
+              requestEvents.push(event);
+            }),
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+    );
+  });
+
   it.effect("supports v2 session deletion and secret-safe provider management", () => {
     const requestEvents: Array<AcpSessionRuntime.AcpSessionRequestLogEvent> = [];
     return Effect.gen(function* () {

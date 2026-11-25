@@ -467,6 +467,12 @@ export interface AcpAdapterV2Flavor {
   readonly mcpOverHttp?: boolean;
   /** How T3's MCP server exposes tools (`"deferred"` via list_changed, `"deferred-proxy"` via tool_call). */
   readonly mcpToolExposure?: McpProviderSession.McpToolExposureMode;
+  /** Runs once per fresh runtime process right before its first prompt. */
+  readonly beforeFirstPrompt?: (input: {
+    readonly runtime: AcpSessionRuntime.AcpSessionRuntime["Service"];
+    readonly cwd: string | null;
+    readonly reportStartupPhase: (phase: string | undefined) => Effect.Effect<void>;
+  }) => Effect.Effect<void>;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => EffectAcpSchema.SessionNotification;
@@ -2494,6 +2500,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const runtimeRestartRequired = yield* Ref.make(false);
         const runtimeTeardownState = yield* Ref.make<AcpRuntimeTeardownState>({ _tag: "Idle" });
         const runtimeCallbackGeneration = yield* Ref.make(0);
+        const preparedFirstPromptGeneration = yield* Ref.make<number | undefined>(undefined);
         const runtimeCallbackGenerationCounter = yield* Ref.make(0);
         const allocateRuntimeCallbackGeneration = Ref.updateAndGet(
           runtimeCallbackGenerationCounter,
@@ -10135,13 +10142,32 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     sequence: ++context.appContextSequence,
                   }
                 : undefined;
+            const runBeforeFirstPrompt =
+              flavor.beforeFirstPrompt === undefined
+                ? Effect.void
+                : Effect.gen(function* () {
+                    if ((yield* Ref.get(preparedFirstPromptGeneration)) === promptGeneration) {
+                      return;
+                    }
+                    yield* flavor.beforeFirstPrompt!({
+                      runtime,
+                      cwd: turnInput.runtimePolicy.cwd,
+                      reportStartupPhase,
+                    }).pipe(Effect.ensuring(Effect.suspend(() => reportStartupPhase(undefined))));
+                    yield* Ref.set(preparedFirstPromptGeneration, promptGeneration);
+                  });
             yield* followPrompt(
               context,
               (superseded) =>
                 compactSession === undefined
                   ? sendPromptWhenIdle(
                       context,
-                      () => runtime.prompt({ prompt: promptParts!.prompt }, promptOptions),
+                      () =>
+                        runBeforeFirstPrompt.pipe(
+                          Effect.andThen(
+                            runtime.prompt({ prompt: promptParts!.prompt }, promptOptions),
+                          ),
+                        ),
                       superseded,
                     )
                   : Deferred.succeed(context.promptDispatched, undefined).pipe(

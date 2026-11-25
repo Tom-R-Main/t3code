@@ -37,6 +37,11 @@ import {
   readAntigravityPendingReply,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
+import {
+  snapshotAntigravityMcpCache,
+  waitForAntigravityExternalMcpReadiness,
+  type AntigravityMcpCacheSnapshot,
+} from "../../provider/acp/AntigravityMcpReadiness.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
@@ -151,10 +156,24 @@ export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
+  const mcpSnapshots = new WeakMap<
+    AcpSessionRuntime.AcpSessionRuntime["Service"],
+    AntigravityMcpCacheSnapshot
+  >();
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
+      const mcpSnapshot =
+        profileDirectory === undefined
+          ? undefined
+          : yield* snapshotAntigravityMcpCache({
+              profileDirectory,
+              cwd: input.cwd,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+              Effect.provideService(Path.Path, options.path),
+            );
       const scope = yield* Scope.fork(yield* Effect.scope);
       const runtime = yield* options
         .withProcess(
@@ -172,7 +191,7 @@ export function makeAntigravityAcpAdapterFlavor(
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
-      return {
+      const wrappedRuntime = {
         ...runtime,
         handleReadTextFile: (handler) =>
           runtime.handleReadTextFile((request, context) =>
@@ -216,6 +235,10 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
       } satisfies typeof runtime;
+      if (mcpSnapshot !== undefined) {
+        mcpSnapshots.set(wrappedRuntime, mcpSnapshot);
+      }
+      return wrappedRuntime;
     },
     Effect.provideService(SecureRandom.SecureRandom, options.random),
     Effect.mapError((cause): EffectAcpErrors.AcpError =>
@@ -314,6 +337,21 @@ export function makeAntigravityAcpAdapterFlavor(
     ...(profileDirectory === undefined
       ? {}
       : {
+          beforeFirstPrompt: ({ runtime, reportStartupPhase }) => {
+            const snapshot = mcpSnapshots.get(runtime);
+            if (snapshot === undefined || snapshot.expectedServers.length === 0) {
+              return Effect.void;
+            }
+            return waitForAntigravityExternalMcpReadiness({
+              profileDirectory,
+              snapshot,
+              reportStartupPhase,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+              Effect.provideService(Path.Path, options.path),
+              Effect.asVoid,
+            );
+          },
           watchPromptOutcome: (sessionId: string) =>
             watchAntigravityPromptOutcome(profileDirectory, sessionId),
           subagentsOutlivingPrompt: ({ sessionId, nativeTaskIds }) =>
