@@ -12,6 +12,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -981,6 +982,126 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
           "antigravity-acp",
         ]);
         expect(spawn.env?.GEMINI_HOME).toBe(expectedHelper);
+      }),
+  );
+
+  it.effect(
+    "links enabled user plugins individually, prunes disabled links, syncs overrides, and guards legacy symlinked plugins dirs",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(temporaryDirectory, "home");
+        const userConfigDir = path.join(userHome, ".gemini", "config");
+        const userPluginsDir = path.join(userConfigDir, "plugins");
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+
+        // User has 3 global plugins: notion (manifest disabled:true, enabled in config.json),
+        // tools (default enabled), and disabled_one (disabled in config.json).
+        yield* fs.makeDirectory(path.join(userPluginsDir, "notion"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(userPluginsDir, "notion", "plugin.json"),
+          JSON.stringify({ name: "notion", disabled: true }),
+        );
+        yield* fs.makeDirectory(path.join(userPluginsDir, "tools"), { recursive: true });
+        yield* fs.makeDirectory(path.join(userPluginsDir, "disabled_one"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(userConfigDir, "config.json"),
+          JSON.stringify({
+            plugins: {
+              notion: { enabled: true },
+              disabled_one: { enabled: false },
+            },
+          }),
+        );
+        // Profile already has a local plugin with the same name as 'tools' — must be preserved!
+        yield* fs.makeDirectory(path.join(profileDirectory, "config", "plugins", "tools"), {
+          recursive: true,
+        });
+        yield* fs.writeFileString(
+          path.join(profileDirectory, "config", "plugins", "tools", "local.txt"),
+          "keep-me",
+        );
+
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          runtimeExecutablePath: process.execPath,
+        });
+
+        expect(yield* fs.readLink(path.join(profileDirectory, "config", "plugins", "notion"))).toBe(
+          path.join(userPluginsDir, "notion"),
+        );
+        expect(
+          yield* fs.exists(path.join(profileDirectory, "config", "plugins", "disabled_one")),
+        ).toBe(false);
+        expect(
+          yield* fs.readFileString(
+            path.join(profileDirectory, "config", "plugins", "tools", "local.txt"),
+          ),
+        ).toBe("keep-me");
+        const profileConfig = decodeJson(
+          yield* fs.readFileString(path.join(profileDirectory, "config", "config.json")),
+        ) as { plugins?: Record<string, { enabled?: boolean }> };
+        expect(profileConfig.plugins?.notion?.enabled).toBe(true);
+
+        // Disable notion globally -> next prepare prunes the symlink and removes T3's override.
+        yield* fs.writeFileString(
+          path.join(userConfigDir, "config.json"),
+          JSON.stringify({ plugins: { notion: { enabled: false } } }),
+        );
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          runtimeExecutablePath: process.execPath,
+        });
+        expect(yield* fs.exists(path.join(profileDirectory, "config", "plugins", "notion"))).toBe(
+          false,
+        );
+        const updatedProfileConfig = decodeJson(
+          yield* fs.readFileString(path.join(profileDirectory, "config", "config.json")),
+        ) as { plugins?: Record<string, { enabled?: boolean }> };
+        expect(updatedProfileConfig.plugins?.notion).toBeUndefined();
+
+        // Guard: if <profile>/config/plugins is itself a legacy symlink, never mutate inside it.
+        const legacyProfile = path.join(temporaryDirectory, "legacy-profile");
+        yield* fs.makeDirectory(path.join(legacyProfile, "config"), { recursive: true });
+        yield* fs.symlink(userPluginsDir, path.join(legacyProfile, "config", "plugins"));
+        yield* fs.writeFileString(
+          path.join(userConfigDir, "config.json"),
+          JSON.stringify({ plugins: { notion: { enabled: true } } }),
+        );
+        yield* prepareAntigravityProfile({
+          profileDirectory: legacyProfile,
+          userHome,
+          runtimeExecutablePath: process.execPath,
+        });
+        expect(yield* fs.readLink(path.join(legacyProfile, "config", "plugins"))).toBe(
+          userPluginsDir,
+        );
+      }),
+  );
+
+  it.effect(
+    "logs a deduped sanitized warning when browser helper intercepts a non-Google URL",
+    () =>
+      Effect.gen(function* () {
+        const logged: Array<string> = [];
+        const captureLogger = Logger.make((options) => {
+          logged.push(JSON.stringify(options.message));
+        });
+        const handler = makeAntigravityStderrHandler();
+        const rawUrl =
+          "https://mcp.notion.com/oauth/authorize?client_id=abc&state=secret-token-123";
+        const line = `${ANTIGRAVITY_AUTH_BROWSER_MARKER}${JSON.stringify(rawUrl)}\n`;
+        // Must not fail, must log once with origin+pathname only (no query/token leakage).
+        yield* handler(line).pipe(Effect.provide(Logger.layer([captureLogger])));
+        yield* handler(line).pipe(Effect.provide(Logger.layer([captureLogger])));
+        expect(logged).toHaveLength(1);
+        expect(logged[0]).toContain("https://mcp.notion.com/oauth/authorize");
+        expect(logged[0]).not.toContain("secret-token-123");
+        expect(logged[0]).not.toContain("client_id");
       }),
   );
 });

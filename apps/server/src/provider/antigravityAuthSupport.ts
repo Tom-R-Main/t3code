@@ -22,6 +22,7 @@ import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStr
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import {
   antigravityUserSkillDirectories,
+  readAntigravityPlugins,
   resolveAntigravityUserHome,
 } from "./Drivers/AntigravitySkills.ts";
 
@@ -342,6 +343,230 @@ const RuleCopiesJson = Schema.fromJsonString(Schema.Record(Schema.String, Schema
 const decodeRuleCopies = Schema.decodeUnknownOption(RuleCopiesJson);
 const encodeRuleCopies = Schema.encodeSync(RuleCopiesJson);
 
+const PluginLinkManifestJson = Schema.fromJsonString(
+  Schema.Struct({
+    linkedPlugins: Schema.Array(Schema.String),
+    enabledOverrides: Schema.Array(Schema.String),
+  }),
+);
+const decodePluginLinkManifest = Schema.decodeUnknownOption(PluginLinkManifestJson);
+const encodePluginLinkManifest = Schema.encodeSync(PluginLinkManifestJson);
+const GenericJsonObject = Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown));
+const decodeGenericJsonObject = Schema.decodeUnknownOption(GenericJsonObject);
+const encodeGenericJsonObject = Schema.encodeSync(GenericJsonObject);
+
+const lstatOrUndefined = (targetPath: string) =>
+  Effect.tryPromise({
+    try: () => NodeFSP.lstat(targetPath),
+    catch: (cause) => new AntigravitySkillLinkError({ link: targetPath, cause }),
+  }).pipe(Effect.orElseSucceed(() => undefined));
+
+/**
+ * Links enabled global user plugins individually into `<profile>/config/plugins/<name>` while
+ * preserving profile-local plugins, pruning stale T3-owned links, and syncing `enabled: true`
+ * overrides for manifests that ship `disabled: true`.
+ */
+const linkAntigravityUserPlugins = Effect.fn("linkAntigravityUserPlugins")(function* (input: {
+  readonly profileDirectory: string;
+  readonly userHome: string;
+  readonly platform: NodeJS.Platform;
+}): Effect.fn.Return<void, never, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const profileConfigDir = path.join(input.profileDirectory, "config");
+  const profilePluginsDir = path.join(profileConfigDir, "plugins");
+  const pluginsDirStat = yield* lstatOrUndefined(profilePluginsDir);
+  if (pluginsDirStat?.isSymbolicLink()) {
+    yield* Effect.logWarning(
+      "Skipping Antigravity plugin linking because the profile plugins directory is itself a symlink.",
+      { profilePluginsDir },
+    );
+    return;
+  }
+  if (pluginsDirStat !== undefined && !pluginsDirStat.isDirectory()) {
+    yield* Effect.logWarning(
+      "Skipping Antigravity plugin linking because the profile plugins path is not a directory.",
+      { profilePluginsDir },
+    );
+    return;
+  }
+
+  const resolved = yield* readAntigravityPlugins({
+    userHome: input.userHome,
+    profileDirectory: input.profileDirectory,
+  }).pipe(
+    Effect.catch((error) =>
+      Effect.logWarning("Could not read Antigravity user plugins.", { error }).pipe(
+        Effect.as(undefined),
+      ),
+    ),
+  );
+  if (resolved === undefined) return;
+
+  const manifestPath = path.join(input.profileDirectory, ".t3-plugin-links.json");
+  const previousText = yield* fs
+    .readFileString(manifestPath)
+    .pipe(Effect.orElseSucceed((): string | undefined => undefined));
+  const previous = Option.getOrElse(decodePluginLinkManifest(previousText), () => ({
+    linkedPlugins: [] as ReadonlyArray<string>,
+    enabledOverrides: [] as ReadonlyArray<string>,
+  }));
+  const previousLinked = new Set(previous.linkedPlugins);
+  const previousOverrides = new Set(previous.enabledOverrides);
+  const desiredByName = new Map(resolved.userPlugins.map((plugin) => [plugin.name, plugin]));
+  const directoryType = input.platform === "win32" ? "junction" : "dir";
+
+  for (const staleName of previousLinked) {
+    if (desiredByName.has(staleName)) continue;
+    const staleLink = path.join(profilePluginsDir, staleName);
+    const stat = yield* lstatOrUndefined(staleLink);
+    if (stat?.isSymbolicLink()) {
+      yield* fs.remove(staleLink).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Could not prune stale Antigravity plugin link.", {
+            staleLink,
+            error,
+          }),
+        ),
+      );
+    }
+  }
+
+  const nextLinked = new Set<string>();
+  const nextOverrides = new Set<string>();
+  for (const [name, plugin] of desiredByName) {
+    const linkPath = path.join(profilePluginsDir, name);
+    const stat = yield* lstatOrUndefined(linkPath);
+    if (stat === undefined) {
+      yield* Effect.gen(function* () {
+        yield* fs.makeDirectory(profilePluginsDir, { recursive: true });
+        yield* Effect.tryPromise({
+          try: () => NodeFSP.symlink(plugin.directory, linkPath, directoryType),
+          catch: (cause) => new AntigravitySkillLinkError({ link: linkPath, cause }),
+        });
+        nextLinked.add(name);
+      }).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Antigravity user plugin is not linked into the profile.", {
+            link: linkPath,
+            target: plugin.directory,
+            error,
+          }),
+        ),
+      );
+    } else if (stat.isSymbolicLink()) {
+      const existingTarget = yield* fs.readLink(linkPath).pipe(
+        Effect.map((value) => path.resolve(path.dirname(linkPath), value)),
+        Effect.orElseSucceed((): string | undefined => undefined),
+      );
+      if (existingTarget === plugin.directory) {
+        nextLinked.add(name);
+      } else if (previousLinked.has(name)) {
+        yield* Effect.gen(function* () {
+          yield* fs.remove(linkPath);
+          yield* Effect.tryPromise({
+            try: () => NodeFSP.symlink(plugin.directory, linkPath, directoryType),
+            catch: (cause) => new AntigravitySkillLinkError({ link: linkPath, cause }),
+          });
+          nextLinked.add(name);
+        }).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not refresh Antigravity user plugin link.", {
+              link: linkPath,
+              target: plugin.directory,
+              error,
+            }),
+          ),
+        );
+      }
+    }
+    if (nextLinked.has(name) && plugin.manifestDisabled && plugin.userExplicitlyEnabled) {
+      nextOverrides.add(name);
+    }
+  }
+
+  const overridesToRemove = [...previousOverrides].filter((name) => !nextOverrides.has(name));
+  if (nextOverrides.size > 0 || overridesToRemove.length > 0) {
+    const profileConfigPath = path.join(profileConfigDir, "config.json");
+    yield* Effect.gen(function* () {
+      const rawConfig = yield* fs
+        .readFileString(profileConfigPath)
+        .pipe(Effect.orElseSucceed((): string | undefined => undefined));
+      const root: Record<string, unknown> =
+        rawConfig === undefined
+          ? {}
+          : { ...Option.getOrElse(decodeGenericJsonObject(rawConfig), () => ({})) };
+      const existingPlugins =
+        typeof root.plugins === "object" && root.plugins !== null && !Array.isArray(root.plugins)
+          ? { ...(root.plugins as Record<string, unknown>) }
+          : {};
+      let changed = false;
+      for (const name of overridesToRemove) {
+        const entry = existingPlugins[name];
+        if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
+          const copy = { ...(entry as Record<string, unknown>) };
+          if (copy.enabled === true) {
+            delete copy.enabled;
+            changed = true;
+            if (Object.keys(copy).length === 0) {
+              delete existingPlugins[name];
+            } else {
+              existingPlugins[name] = copy;
+            }
+          }
+        }
+      }
+      for (const name of nextOverrides) {
+        const entry = existingPlugins[name];
+        const copy =
+          typeof entry === "object" && entry !== null && !Array.isArray(entry)
+            ? { ...(entry as Record<string, unknown>) }
+            : {};
+        if (copy.enabled !== true) {
+          copy.enabled = true;
+          existingPlugins[name] = copy;
+          changed = true;
+        }
+      }
+      if (!changed) return;
+      if (Object.keys(existingPlugins).length === 0) {
+        delete root.plugins;
+      } else {
+        root.plugins = existingPlugins;
+      }
+      yield* fs.makeDirectory(profileConfigDir, { recursive: true });
+      yield* writeFileStringAtomically({
+        filePath: profileConfigPath,
+        contents: `${encodeGenericJsonObject(root)}\n`,
+      });
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Could not sync Antigravity profile plugin overrides.", { error }),
+      ),
+    );
+  }
+
+  const nextManifest = {
+    linkedPlugins: [...nextLinked].toSorted(),
+    enabledOverrides: [...nextOverrides].toSorted(),
+  };
+  const manifestChanged =
+    nextManifest.linkedPlugins.length !== previous.linkedPlugins.length ||
+    nextManifest.enabledOverrides.length !== previous.enabledOverrides.length ||
+    nextManifest.linkedPlugins.some((name, index) => name !== previous.linkedPlugins[index]) ||
+    nextManifest.enabledOverrides.some((name, index) => name !== previous.enabledOverrides[index]);
+  if (manifestChanged || (previousText !== undefined && nextManifest.linkedPlugins.length > 0)) {
+    yield* writeFileStringAtomically({
+      filePath: manifestPath,
+      contents: `${encodePluginLinkManifest(nextManifest)}\n`,
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Antigravity plugin link record could not be written.", { error }),
+      ),
+    );
+  }
+});
+
 /** Copies refresh each launch; the recorded copy keeps a file the profile owns or edited untouched. */
 const copyAntigravityUserConfigFiles = Effect.fn("copyAntigravityUserConfigFiles")(
   function* (input: {
@@ -567,6 +792,11 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
       yield* HostProcess.HomeDirectory,
     );
   yield* linkAntigravityUserConfig({
+    profileDirectory: profile.geminiHome,
+    userHome,
+    platform,
+  });
+  yield* linkAntigravityUserPlugins({
     profileDirectory: profile.geminiHome,
     userHome,
     platform,
@@ -878,20 +1108,38 @@ export function makeAntigravityStderrHandler(
   } = {},
 ) {
   let pending = "";
+  const seenExternalAuthUrls = new Set<string>();
+  const logExternalBrowserUrl = Effect.fn("antigravityAuthSupport.logExternalBrowserUrl")(
+    function* (rawUrl: string) {
+      const parsed = URL.parse(rawUrl);
+      if (parsed === null || (parsed.protocol !== "https:" && parsed.protocol !== "http:")) {
+        return;
+      }
+      const sanitized = `${parsed.origin}${parsed.pathname}`;
+      if (seenExternalAuthUrls.has(sanitized)) return;
+      if (seenExternalAuthUrls.size < 32) seenExternalAuthUrls.add(sanitized);
+      yield* Effect.logWarning(
+        "Antigravity tried to open an external sign-in URL; authenticate plugins via 'agy /plugin' or the Antigravity app.",
+        { url: sanitized },
+      );
+    },
+  );
   // Untraced: this runs for every stderr line.
   const handleLine = Effect.fnUntraced(function* (line: string) {
     const message = line.endsWith("\r") ? line.slice(0, -1) : line;
     if (message.length > maxBrowserHelperLineLength) return;
+    const isBrowserHelperLine = message.startsWith(ANTIGRAVITY_AUTH_BROWSER_MARKER);
     const url = message.startsWith(ANTIGRAVITY_AUTH_STDOUT_PREFIX)
       ? Effect.succeed(message.slice(ANTIGRAVITY_AUTH_STDOUT_PREFIX.length))
-      : message.startsWith(ANTIGRAVITY_AUTH_BROWSER_MARKER)
+      : isBrowserHelperLine
         ? decodeBrowserHelperUrl(message.slice(ANTIGRAVITY_AUTH_BROWSER_MARKER.length))
         : undefined;
     if (url === undefined) return;
-    yield* url.pipe(
-      Effect.flatMap(parseAntigravityAuthorizationUrl),
+    const rawUrl = yield* url.pipe(Effect.orElseSucceed((): string | undefined => undefined));
+    if (rawUrl === undefined) return;
+    yield* parseAntigravityAuthorizationUrl(rawUrl).pipe(
       Effect.matchEffect({
-        onFailure: () => Effect.void,
+        onFailure: () => (isBrowserHelperLine ? logExternalBrowserUrl(rawUrl) : Effect.void),
         onSuccess: (request) =>
           input.onAuthorizationUrl
             ? input.onAuthorizationUrl(request.authorizationUrl)

@@ -65,7 +65,8 @@ your profile and existing runtime available if the new release fails validation.
 T3 needs Antigravity 1.5 or newer and recommends 1.5.12 or newer. Sessions do not
 start on an older runtime: update the managed runtime here, or update the executable
 a custom binary path or `PATH` points at. You may need to sign in again after
-updating from a runtime older than 1.5. Threads already running finish with their
+updating from a runtime older than 1.5, or once after updating to 1.5.16 or newer
+so your Google sign-in stays inside T3's profile storage. Threads already running finish with their
 original runtime; new sessions use the updated release. Custom binary paths keep
 using the executable you selected.
 
@@ -110,6 +111,19 @@ honoring `inherits`, `include_only`, and `exclude`.
 Antigravity receives images and audio directly, and reads PDFs and text files as
 documents. Other attachments, including videos, are passed as a saved file path for
 the agent to inspect with its tools.
+
+### Plugins and MCP
+
+Enabled plugins from `~/.gemini/config/plugins` are linked into T3's Antigravity
+profile automatically on session start, and disabled or removed plugins are unlinked
+on the next launch. Profile-local plugins and `~/.gemini/config/mcp_config.json`
+remain separate by default.
+
+Hosted plugin credentials (such as Notion) are stored per OS user by Antigravity
+(`antigravity.plugins` in macOS Keychain, or `~/.config/antigravity/plugin-secrets.json`
+on Linux) rather than per T3 provider instance. T3 suppresses automatic browser
+popups during agent runs; connect, reconnect, or revoke hosted plugins through
+`agy /plugin` or the Antigravity app.
 
 ### Subagents
 

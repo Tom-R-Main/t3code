@@ -488,4 +488,54 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
         ]);
       }),
   );
+
+  it.effect(
+    "discovers enabled global user plugins before profile linking and respects disabled manifests and overrides",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const input = yield* makeWorkspace();
+        const userConfigDir = path.join(input.userHome, ".gemini", "config");
+        const userPluginsDir = path.join(userConfigDir, "plugins");
+
+        yield* writeSkill(
+          path.join(userPluginsDir, "notion", "skills", "notion-search"),
+          "---\nname: notion-search\ndescription: Search Notion.\n---\n",
+        );
+        yield* fileSystem.writeFileString(
+          path.join(userPluginsDir, "notion", "plugin.json"),
+          JSON.stringify({ name: "notion", disabled: true }),
+        );
+        yield* writeSkill(
+          path.join(userPluginsDir, "off-default", "skills", "hidden-skill"),
+          "---\nname: hidden-skill\n---\n",
+        );
+        yield* fileSystem.writeFileString(
+          path.join(userPluginsDir, "off-default", "plugin.json"),
+          JSON.stringify({ name: "off-default", disabled: true }),
+        );
+        yield* writeSkill(
+          path.join(userPluginsDir, "explicit-off", "skills", "muted-skill"),
+          "---\nname: muted-skill\n---\n",
+        );
+        yield* fileSystem.writeFileString(
+          path.join(userConfigDir, "config.json"),
+          JSON.stringify({
+            plugins: {
+              notion: { enabled: true },
+              "explicit-off": { enabled: false },
+            },
+          }),
+        );
+
+        assert.deepEqual(
+          (yield* discoverAntigravitySkills(input)).map(({ name, displayName }) => ({
+            name,
+            displayName,
+          })),
+          [{ name: "notion-search", displayName: "notion:notion-search" }],
+        );
+      }),
+  );
 });
