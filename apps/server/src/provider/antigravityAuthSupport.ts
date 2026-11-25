@@ -842,7 +842,7 @@ export const prepareAntigravityHelperProfile = Effect.fn("prepareAntigravityHelp
     const existingAcpStat = yield* lstatOrUndefined(helperAcpDirectory);
     if (existingAcpStat?.isSymbolicLink()) {
       yield* fs
-        .remove(helperAcpDirectory)
+        .remove(helperAcpDirectory, { force: true })
         .pipe(
           Effect.mapError(() =>
             authSupportError("The legacy Antigravity helper auth link could not be replaced."),
@@ -906,12 +906,12 @@ export const prepareAntigravityHelperProfile = Effect.fn("prepareAntigravityHelp
             ),
           );
       } else {
-        const existingLink = targetStat?.isSymbolicLink()
-          ? yield* fs.readLink(targetPath).pipe(
-              Effect.map((value) => path.resolve(path.dirname(targetPath), value)),
-              Effect.orElseSucceed((): string | undefined => undefined),
-            )
-          : undefined;
+        const readResolvedLink = () =>
+          fs.readLink(targetPath).pipe(
+            Effect.map((value) => path.resolve(path.dirname(targetPath), value)),
+            Effect.orElseSucceed((): string | undefined => undefined),
+          );
+        const existingLink = targetStat?.isSymbolicLink() ? yield* readResolvedLink() : undefined;
         if (existingLink !== sourcePath) {
           if (targetStat !== undefined) {
             yield* fs
@@ -924,8 +924,25 @@ export const prepareAntigravityHelperProfile = Effect.fn("prepareAntigravityHelp
           }
           yield* Effect.tryPromise({
             try: () => NodeFSP.symlink(sourcePath, targetPath, "file"),
-            catch: () => authSupportError("The Antigravity helper auth file could not be linked."),
-          });
+            catch: (cause) => new AntigravitySkillLinkError({ link: targetPath, cause }),
+          }).pipe(
+            Effect.catch(({ cause }) =>
+              Effect.gen(function* () {
+                if (
+                  typeof cause === "object" &&
+                  cause !== null &&
+                  "code" in cause &&
+                  cause.code === "EEXIST" &&
+                  (yield* readResolvedLink()) === sourcePath
+                ) {
+                  return;
+                }
+                return yield* authSupportError(
+                  "The Antigravity helper auth file could not be linked.",
+                );
+              }),
+            ),
+          );
         }
       }
     }
